@@ -97,7 +97,7 @@ Launcher options: `--host HOST` (default `0.0.0.0`), `--port PORT` (8765), `--db
 ## Agents on other machines
 
 Give the agent this one line. `./tasks.sh --bg` and `./tasks.sh --status` print it with the board's
-address filled in:
+address filled in (when the board listens on the LAN, i.e. not with `--host 127.0.0.1`):
 
 ```
 Run `curl -fsS --noproxy '*' --connect-timeout 5 http://<board-host>:8765/api/usage` and follow it.

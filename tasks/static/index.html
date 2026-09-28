@@ -891,11 +891,11 @@ body.offline .fill { animation: none !important; }
 
         $('quickstart').textContent =
             '# create a request with two planned tasks (the reply holds its id and page url)\n' +
-            'curl -sS --connect-timeout 5 -X POST ' + location.origin + '/api/requests \\\n' +
+            "curl -sS --noproxy '*' --connect-timeout 5 -X POST " + location.origin + '/api/requests \\\n' +
             "    -H 'Content-Type: application/json' \\\n" +
             '    -d \'{"title": "My request", "tasks": ["step one", "step two"]}\'\n\n' +
             '# full instructions for agents: the API, the taskctl CLI, the skill and the CLAUDE.md rule\n' +
-            'curl -sS --connect-timeout 5 ' + location.origin + '/api/usage';
+            "curl -sS --noproxy '*' --connect-timeout 5 " + location.origin + '/api/usage';
 
         const finished = $('group-finished');
         try {
