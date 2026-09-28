@@ -1,0 +1,2 @@
+BAKED_URL = "{{BASE_URL}}"
+print(BAKED_URL)
