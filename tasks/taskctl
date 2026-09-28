@@ -1,0 +1,56 @@
+#!/bin/sh
+# taskctl: task-status board CLI. Runs taskctl.py (next to this file) with the first Python 3.8+
+# found. Without one it warns and exits 0, because status reporting must never break real work.
+
+self=$0
+# Follow symlinks so a link to this file (e.g. from ~/bin) still finds taskctl.py beside the real one.
+while [ -h "$self" ]; do
+    link=$(readlink "$self") || break
+    case $link in
+        /*) self=$link ;;
+        *) self=$(dirname -- "$self")/$link ;;
+    esac
+done
+# CDPATH is cleared for this cd: when it is exported, cd prints the directory it chose into $here.
+here=$(CDPATH= cd -- "$(dirname -- "$self")" >/dev/null 2>&1 && pwd) || here=$(dirname -- "$self")
+
+for py in python3 python "py -3"; do
+    # $py is unquoted on purpose: "py -3" (the Windows launcher) must split into command and flag.
+    if $py -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
+        exec $py "$here/taskctl.py" "$@"
+    fi
+done
+
+echo "taskctl: warning: no Python 3.8+ found; status reporting disabled" >&2
+
+# Find the subcommand (global options may come first) and how many IDs new/add would have printed,
+# so scripts that capture them get one `offline` per ID, just as taskctl.py does.
+sub= ids=0
+while [ $# -gt 0 ]; do
+    arg=$1
+    shift
+    case $arg in
+        --url|--timeout) [ $# -gt 0 ] && shift; continue ;;
+        --strict|--start|--url=*|--timeout=*) continue ;;
+        --)
+            # run still runs its command, just without reporting.
+            if [ "$sub" = run ] && [ $# -gt 0 ]; then exec "$@"; fi
+            continue ;;
+    esac
+    if [ -z "$sub" ]; then sub=$arg; continue; fi
+    case $sub:$arg in
+        new:-t|new:--task) ids=$((ids + 1)); [ $# -gt 0 ] && shift ;;
+        new:-t?*|new:--task=*) ids=$((ids + 1)) ;;
+        add:*|task:*) ids=$((ids + 1)) ;;
+    esac
+done
+case $sub in
+    new) ids=$((ids + 1)) ;;
+    add|task) ids=$((ids - 1)) ;;  # the first positional is the request ID
+    *) ids=0 ;;
+esac
+while [ "$ids" -gt 0 ]; do
+    echo offline
+    ids=$((ids - 1))
+done
+exit 0

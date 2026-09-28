@@ -1,0 +1,9 @@
+# Runtime state: SQLite DB (+ -wal/-shm) and pidfiles.
+tasks/data/
+
+# Server logs written by tasks.sh --bg.
+.logs/
+
+# Python bytecode cache.
+__pycache__/
+*.pyc

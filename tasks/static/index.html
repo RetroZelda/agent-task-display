@@ -1,0 +1,948 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Task Status</title>
+<link id="favicon" rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%238b949e' stroke-width='6'/%3E%3C/svg%3E">
+<!--
+  Task Status board UI: one file, no external resources, no build step. Served by tasks/server.py for
+  GET / and GET /r/<rid>; the view is picked from location.pathname. The wire contract lives in the
+  server.py docstring. Every agent-supplied string reaches the page through textContent or
+  setAttribute only; structure comes from the <template>s below.
+-->
+<style>
+:root {
+    color-scheme: light dark;
+    --bg: #f5f6f8; --surface: #fff; --surface-2: #f0f2f5; --text: #1c2128; --muted: #5f6b76;
+    --border: #dde2e7; --track: #e6e9ed;
+    --running: #2563eb; --done: #15803d; --failed: #dc2626; --stale: #b45309; --pending: #6b7280;
+    --cancelled: #6e7781; --warn: #b45309;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, "Noto Sans", sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #0e1116; --surface: #161b22; --surface-2: #1c222b; --text: #e6edf3; --muted: #8b949e;
+        --border: #2b323b; --track: #262c35;
+        --running: #58a6ff; --done: #3fb950; --failed: #f85149; --stale: #d29922; --pending: #8b949e;
+        --cancelled: #8b949e; --warn: #d29922;
+    }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; }
+body { --c: var(--pending); margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 var(--sans); }
+a { color: inherit; }
+code, pre, .mono { font-family: var(--mono); }
+.wrap { max-width: 960px; margin: 0 auto; padding: 0 16px; }
+
+/* Top bar and connection banner */
+.top { background: var(--surface); border-bottom: 1px solid var(--border); }
+.top .wrap { display: flex; align-items: center; gap: 12px; min-height: 50px; }
+.brand { font-weight: 700; font-size: 16px; text-decoration: none; white-space: nowrap; }
+.conn { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); white-space: nowrap; }
+.conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--pending); }
+.conn[data-state=live] .dot { background: var(--done); }
+.conn[data-state=reconnecting] .dot { background: var(--stale); }
+.conn[data-state=offline] .dot { background: var(--failed); }
+.spacer { flex: 1; }
+.setup { font-size: 13px; color: var(--muted); text-decoration: none; border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; white-space: nowrap; }
+.setup:hover { color: var(--text); border-color: var(--muted); }
+#banner { background: color-mix(in srgb, var(--failed) 13%, var(--surface));
+    border-bottom: 1px solid color-mix(in srgb, var(--failed) 40%, transparent); }
+#banner .wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding-top: 8px; padding-bottom: 8px; font-size: 14px; }
+#banner-text { flex: 1; min-width: 12em; }
+main { padding: 12px 0 48px; }
+body.offline main { opacity: .6; }
+.loading { color: var(--muted); padding: 24px 0; }
+
+/* Section headings, summary, empty states */
+.summary { margin: 6px 0 4px; font-size: 14px; }
+.summary span[data-status] { color: var(--c); font-weight: 600; }
+.section { display: flex; align-items: baseline; gap: 8px; margin: 18px 0 8px; font-size: 13px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.count { font-family: var(--mono); font-weight: 400; letter-spacing: 0; text-transform: none; }
+summary.section { cursor: pointer; list-style: none; user-select: none; }
+summary.section::-webkit-details-marker { display: none; }
+/* Two glyphs rather than a rotated one: a rotated triangle sits above the text baseline. */
+summary.section::before { content: "\25B8"; display: inline-block; width: 1em; margin-right: -4px; }
+details[open] > summary.section::before { content: "\25BE"; }
+summary.section .btn { margin-left: auto; text-transform: none; letter-spacing: 0; }
+.none { color: var(--muted); font-size: 14px; margin: 4px 0; }
+.empty { text-align: center; color: var(--muted); padding: 32px 0; }
+.empty .big { font-size: 18px; color: var(--text); font-weight: 600; margin: 0 0 6px; }
+.empty pre { text-align: left; margin: 16px auto 0; max-width: 820px; padding: 12px 14px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 12.5px; line-height: 1.55;
+    white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* Rows (list requests and detail tasks share these) */
+.rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.row { display: block; min-width: 0; background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--c); border-radius: 8px; padding: 10px 14px 10px 12px; text-decoration: none; color: inherit;
+    scroll-margin: 80px 0; }
+a.row:hover { background: var(--surface-2); }
+a:focus-visible, button:focus-visible, .row:focus-visible { outline: 2px solid var(--running); outline-offset: 2px; }
+[data-status=running] { --c: var(--running); }
+[data-status=stale] { --c: var(--stale); }
+[data-status=done] { --c: var(--done); }
+[data-status=failed] { --c: var(--failed); }
+[data-status=pending] { --c: var(--pending); }
+[data-status=cancelled] { --c: var(--cancelled); }
+.row[data-status=cancelled] { opacity: .7; }
+.row[data-status=cancelled] .title { color: var(--muted); }
+.line1 { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.title { flex: 1; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.req .title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+.badge { flex: none; position: relative; top: -1px; padding: 3px 7px; border-radius: 999px; font: 600 11px/1.2 var(--sans);
+    text-transform: uppercase; letter-spacing: .04em; color: var(--c); background: color-mix(in srgb, var(--c) 14%, transparent); }
+.pct { flex: none; font: 600 14px var(--mono); font-variant-numeric: tabular-nums; color: var(--c); min-width: 3.5ch; text-align: right; }
+.seq { flex: none; font: 13px var(--mono); color: var(--muted); text-decoration: none; }
+.seq:hover { color: var(--text); text-decoration: underline; }
+.bar { height: 8px; margin: 8px 0 6px; background: var(--track); border-radius: 4px; overflow: hidden; }
+.fill { height: 100%; width: 0; background-color: var(--c); border-radius: inherit; transition: width .6s ease, background-color .3s; }
+[data-status=running] > .bar > .fill, .bar.indeterminate > .fill {
+    background-image: linear-gradient(45deg, rgba(255,255,255,.22) 25%, transparent 25%, transparent 50%,
+        rgba(255,255,255,.22) 50%, rgba(255,255,255,.22) 75%, transparent 75%, transparent);
+    background-size: 16px 16px; animation: stripes 1s linear infinite; }
+.bar.indeterminate > .fill { width: 100% !important; opacity: .35; }
+[data-status=stale] > .bar > .fill { animation: none; }
+@keyframes stripes { from { background-position: 0 0; } to { background-position: 16px 0; } }
+body.offline .fill { animation: none !important; }
+.hint { margin: 0 0 3px; font-size: 13.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hint .ht { color: var(--text); font-weight: 500; }
+.hint .ht:not(:empty) + .hm:not(:empty)::before { content: " \2014  "; }
+.msg { margin: 0 0 4px; font-size: 13.5px; white-space: pre-line; overflow-wrap: anywhere; cursor: pointer;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+.msg.expanded { display: block; -webkit-line-clamp: none; }
+/* Meta lines wrap on narrow screens. Every part carries a leading "·" in a --sep wide left padding; the
+   line is pulled left by --sep and clipped there, so the "·" that starts each wrapped line is hidden
+   instead of dangling. Long unbroken parts (an origin) wrap anywhere rather than overflow the card. */
+.meta { --sep: calc(1ch + .5em); display: flex; flex-wrap: wrap; column-gap: .5em; row-gap: 1px;
+    margin-left: calc(-1 * var(--sep)); clip-path: inset(0 0 0 var(--sep));
+    font: 12.5px/1.45 var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); }
+.meta > * { position: relative; min-width: 0; padding-left: var(--sep); overflow-wrap: anywhere; }
+.meta > *::before { content: "\00B7"; position: absolute; left: 0; color: var(--muted); font-weight: 400; }
+.dots { display: flex; flex-wrap: wrap; column-gap: .5em; }
+.dots > :not([hidden]) ~ :not([hidden])::before { content: "\00B7"; margin-right: .5em; color: var(--muted); font-weight: 400; }
+.meta .warn { color: var(--warn); }
+.meta .bad { color: var(--failed); }
+.row.target { box-shadow: 0 0 0 2px var(--running); animation: flash 1.8s ease-out 1; }
+@keyframes flash { from { background: color-mix(in srgb, var(--running) 22%, var(--surface)); } to { background: var(--surface); } }
+
+/* Detail header card */
+.back { display: inline-block; margin: 4px 0 8px; font-size: 14px; color: var(--muted); text-decoration: none; }
+.back:hover { color: var(--text); }
+.card { background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--c);
+    border-radius: 10px; padding: 14px 18px 16px; }
+.card h1 { flex: 1; min-width: 0; margin: 0; font-size: 20px; line-height: 1.3; overflow-wrap: anywhere; }
+.card .pct { font-size: 20px; }
+.card .bar { height: 12px; margin: 12px 0 8px; border-radius: 6px; }
+.card .meta { font-size: 13px; }
+.card .message { margin: 10px 0 0; padding: 8px 10px; background: var(--surface-2); border-radius: 6px; font-size: 14px;
+    white-space: pre-line; overflow-wrap: anywhere; }
+.foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 12px; }
+.rid { font: 13px var(--mono); color: var(--muted); }
+.rid code { color: var(--text); user-select: all; }
+.actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px; }
+.btn { font: 500 13px/1.2 var(--sans); padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--surface-2); color: var(--text); cursor: pointer; }
+.btn:hover { border-color: var(--muted); }
+.btn:disabled { opacity: .5; cursor: default; }
+.btn.small { padding: 3px 10px; font-size: 12px; }
+.btn.good { color: var(--done); border-color: color-mix(in srgb, var(--done) 45%, var(--border)); }
+.btn.danger { color: var(--failed); border-color: color-mix(in srgb, var(--failed) 45%, var(--border)); }
+
+@media (max-width: 600px) {
+    body { font-size: 14px; }
+    .wrap { padding: 0 12px; }
+    .top .wrap { gap: 8px; }
+    .row { padding: 9px 10px 9px 10px; }
+    .meta { font-size: 12px; }
+    .card { padding: 12px 12px 14px; }
+    .card .line1 { flex-wrap: wrap; row-gap: 6px; }
+    .card h1 { order: 3; flex-basis: 100%; font-size: 18px; }
+    .card .pct { margin-left: auto; font-size: 18px; }
+    .card .meta { font-size: 12px; }
+    .actions { margin-left: 0; }
+    /* Task titles get the full row width below the #seq, badge and percent, not a narrow middle column. */
+    .task .line1 { flex-wrap: wrap; row-gap: 4px; }
+    .task .title { order: 3; flex-basis: 100%; }
+    .task .pct { margin-left: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .fill { transition: none; animation: none !important; }
+    .row.target { animation: none; }
+}
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+    <a class="brand" href="/">Task Status</a>
+    <span id="conn" class="conn" data-state="connecting" role="status"><span class="dot"></span><span id="conn-text">connecting</span></span>
+    <span class="spacer"></span>
+    <a class="setup" href="/api/usage" title="Instructions for agents: the HTTP API, the taskctl CLI, the skill and the CLAUDE.md rule">Agent setup</a>
+</div></header>
+<div id="banner" hidden aria-live="polite"><div class="wrap">
+    <span id="banner-text"></span>
+    <button type="button" class="btn small" id="retry">Retry now</button>
+</div></div>
+
+<main class="wrap">
+    <noscript><p class="empty">This page needs JavaScript. Agents: GET /api/usage for instructions.</p></noscript>
+    <div id="view-loading" class="loading">Loading&hellip;</div>
+
+    <section id="view-list" hidden>
+        <p id="summary" class="summary dots"><span data-status="running" data-ref="running"></span><span data-status="stale" data-ref="stale"></span><span data-status="done" data-ref="done"></span><span data-status="failed" data-ref="failed"></span></p>
+        <div id="list-empty" class="empty" hidden>
+            <p class="big">No requests yet.</p>
+            <p>Agents create requests and report progress over HTTP. Try it:</p>
+            <pre id="quickstart"></pre>
+        </div>
+        <div id="group-active">
+            <h2 class="section">Active <span class="count" id="count-active"></span></h2>
+            <p id="active-empty" class="none" hidden>Nothing running right now.</p>
+            <div id="list-active" class="rows"></div>
+        </div>
+        <details id="group-finished" open>
+            <summary class="section">Finished <span class="count" id="count-finished"></span>
+                <button type="button" class="btn small" id="clear" title="Delete the finished requests listed below">Clear</button></summary>
+            <div id="list-finished" class="rows"></div>
+        </details>
+    </section>
+
+    <section id="view-detail" hidden>
+        <a class="back" id="back" href="/">&larr; All requests</a>
+        <div id="req-head" class="card">
+            <div class="line1"><span class="badge" data-ref="badge"></span><h1 data-ref="title"></h1><span class="pct" data-ref="pct"></span></div>
+            <div class="bar" data-ref="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Request progress"><div class="fill" data-ref="fill"></div></div>
+            <div class="meta"><span data-ref="tasks"></span><span data-ref="failed" class="bad"></span><span data-ref="cancelled"></span><span data-ref="time"></span><span data-ref="eta"></span><span data-ref="started"></span><span data-ref="updated"></span><span data-ref="origin"></span></div>
+            <div class="message" data-ref="message" hidden></div>
+            <div class="foot">
+                <span class="rid">request <code data-ref="rid" title="Request ID (click to select)"></code></span>
+                <span class="actions">
+                    <button type="button" class="btn good" data-ref="markDone">Mark done</button>
+                    <button type="button" class="btn" data-ref="markFailed">Mark failed</button>
+                    <button type="button" class="btn danger" data-ref="del">Delete</button>
+                </span>
+            </div>
+        </div>
+        <h2 class="section">Tasks <span class="count" id="count-tasks"></span></h2>
+        <p id="task-empty" class="none" hidden>No tasks yet. Agents add them with <code id="task-empty-cmd"></code></p>
+        <ol id="task-list" class="rows"></ol>
+    </section>
+
+    <section id="view-notfound" class="empty" hidden>
+        <p class="big" id="nf-title"></p>
+        <p id="nf-text"></p>
+        <p><a href="/">&larr; All requests</a> &middot; <a href="" id="nf-retry">Retry</a></p>
+    </section>
+</main>
+
+<template id="tpl-req">
+    <a class="row req">
+        <div class="line1"><span class="badge" data-ref="badge"></span><span class="title" data-ref="title"></span><span class="pct" data-ref="pct"></span></div>
+        <div class="bar" data-ref="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div class="fill" data-ref="fill"></div></div>
+        <div class="hint" data-ref="hint"><span class="ht" data-ref="ht"></span><span class="hm" data-ref="hm"></span></div>
+        <div class="meta"><span data-ref="tasks"></span><span data-ref="failed" class="bad"></span><span data-ref="time"></span><span data-ref="eta"></span><span data-ref="updated"></span><span data-ref="origin"></span><span data-ref="rid"></span></div>
+    </a>
+</template>
+<template id="tpl-task">
+    <li class="row task">
+        <div class="line1"><a class="seq" data-ref="seq" title="Link to this task"></a><span class="badge" data-ref="badge"></span><span class="title" data-ref="title"></span><span class="pct" data-ref="pct"></span></div>
+        <div class="bar" data-ref="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div class="fill" data-ref="fill"></div></div>
+        <div class="msg" data-ref="msg"></div>
+        <div class="meta"><span data-ref="time"></span><span data-ref="eta"></span><span data-ref="updated"></span><span data-ref="tid"></span></div>
+    </li>
+</template>
+
+<script>
+(() => {
+    'use strict';
+
+    const POLL_MS = 1500;
+    const MAX_BACKOFF_MS = 15000;
+    const FETCH_TIMEOUT_MS = 5000;
+    const WRITE_TIMEOUT_MS = 10000;
+    const BANNER_AFTER_FAILS = 2;
+    const TICK_MS = 500;
+    const FINISHED_OPEN_KEY = 'taskstatus.finishedOpen';
+    const LABELS = { running: 'running', stale: 'stale', done: 'done', failed: 'failed', pending: 'queued', cancelled: 'cancelled' };
+    // A favicon cannot read CSS variables, so the ring uses fixed mid-tone colours.
+    const ICON_COLORS = { running: '#2563eb', stale: '#d97706', done: '#16a34a', failed: '#dc2626', idle: '#8b949e' };
+
+    const $ = (id) => document.getElementById(id);
+
+    let view = 'list';
+    let rid = null;
+    let apiPath = '/api/requests';
+    let clockOffset = 0;        // server clock minus client clock, in seconds
+    let timer = 0;
+    let busy = false;
+    let wantPoll = false;
+    let halted = false;
+    let failures = 0;
+    let lastError = '';
+    let lastOkAt = 0;           // client ms of the last successful poll
+    let nextPollAt = 0;
+    let loaded = false;
+    let lastData = null;
+    let headRefs = null;
+    let summaryRefs = null;
+    let scrollToHash = true;
+    let favKey = '';
+    const rows = new Map();     // id -> {el, refs, item, tick}; one view is live at a time
+
+    // Formatting
+
+    const pad = (n) => String(n).padStart(2, '0');
+    const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
+    const serverNow = () => Date.now() / 1000 + clockOffset;
+
+    function fmtDur(seconds) {
+        const s = Math.max(0, Math.floor(seconds || 0));
+        if (s < 60) return s + 's';
+        const m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+        if (m < 60) return m + 'm ' + pad(s % 60) + 's';
+        if (h < 24) return h + 'h ' + pad(m % 60) + 'm';
+        return d + 'd ' + pad(h % 24) + 'h';
+    }
+
+    function fmtAgo(seconds) {
+        const s = Math.max(0, Math.floor(seconds));
+        if (s < 5) return 'just now';
+        if (s < 60) return s + 's ago';
+        if (s < 3600) return Math.floor(s / 60) + 'm ago';
+        if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+        return Math.floor(s / 86400) + 'd ago';
+    }
+
+    function fmtClock(ts) {
+        const d = new Date(ts * 1000), today = new Date(serverNow() * 1000);
+        if (d.toDateString() === today.toDateString()) {
+            return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+        return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    }
+
+    const fmtStamp = (ts) => ts == null ? '' : new Date(ts * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'medium' });
+
+    // Remaining time rounds up, so the page never reads "0s left" while time remains.
+    function etaInfo(etaAt, now) {
+        if (etaAt == null) return null;
+        const rem = etaAt - now;
+        return rem >= 0 ? { text: '~' + fmtDur(Math.ceil(rem)) + ' left', overdue: false }
+                        : { text: 'overdue ' + fmtDur(-rem), overdue: true };
+    }
+
+    // Floored so 99.6 never reads as 100%; a request with no counted tasks has no meaningful percent.
+    function reqPct(r) {
+        return r.tasks_total === 0 && r.status !== 'done' ? '—' : Math.floor(r.percent) + '%';
+    }
+
+    function taskPct(t) {
+        return t.status === 'pending' || t.status === 'cancelled' ? '—' : Math.floor(t.percent) + '%';
+    }
+
+    function tasksText(r) {
+        if (r.tasks_total === 0 && r.tasks_cancelled === 0) return 'no tasks';
+        return r.tasks_done + '/' + r.tasks_total + ' tasks';
+    }
+
+    const reqStatus = (r) => r.status === 'running' && r.stale ? 'stale' : r.status;
+    const taskStatus = (t) => t.status === 'running' && t.stale ? 'stale' : t.status;
+
+    // DOM helpers: each writes only when the value changes
+
+    function setText(el, text) {
+        if (el.textContent !== text) el.textContent = text;
+    }
+
+    function setAttr(el, name, value) {
+        if (value == null || value === '') {
+            if (el.hasAttribute(name)) el.removeAttribute(name);
+        } else if (el.getAttribute(name) !== value) {
+            el.setAttribute(name, value);
+        }
+    }
+
+    function setHidden(el, hidden) {
+        if (el.hidden !== hidden) el.hidden = hidden;
+    }
+
+    function setStatus(el, status) {
+        if (el.dataset.status !== status) el.dataset.status = status;
+    }
+
+    // Optional text: hidden when empty, so the meta separators stay right.
+    function setPart(el, text) {
+        setHidden(el, !text);
+        if (text) setText(el, text);
+    }
+
+    function setBar(bar, fill, percent, indeterminate) {
+        const width = indeterminate ? '100%' : Math.max(0, Math.min(100, percent)) + '%';
+        if (fill.style.width !== width) fill.style.width = width;
+        bar.classList.toggle('indeterminate', indeterminate);
+        setAttr(bar, 'aria-valuenow', indeterminate ? null : String(Math.floor(percent)));
+    }
+
+    function collectRefs(root) {
+        const refs = {};
+        for (const node of root.querySelectorAll('[data-ref]')) refs[node.dataset.ref] = node;
+        return refs;
+    }
+
+    function cloneTpl(id) {
+        const el = $(id).content.firstElementChild.cloneNode(true);
+        return { el, refs: collectRefs(el) };
+    }
+
+    // Keyed reconcile: rows are reused (bar transitions and scroll position survive) and only moved
+    // when the order changes. New rows are filled before insertion so their bars don't animate from 0.
+    function reconcile(container, items, create, update, seen) {
+        let cursor = container.firstElementChild;
+        for (const item of items) {
+            seen.add(item.id);
+            let row = rows.get(item.id);
+            if (!row) {
+                row = create(item);
+                rows.set(item.id, row);
+            }
+            row.item = item;
+            update(row, item);
+            if (row.el !== cursor) container.insertBefore(row.el, cursor);
+            else cursor = cursor.nextElementSibling;
+        }
+    }
+
+    function prune(seen) {
+        for (const [id, row] of rows) {
+            if (!seen.has(id)) {
+                row.el.remove();
+                rows.delete(id);
+            }
+        }
+    }
+
+    function setDocTitle(text) {
+        if (document.title !== text) document.title = text;
+    }
+
+    function setFavicon(status, percent) {
+        const color = ICON_COLORS[status] || ICON_COLORS.idle;
+        const p = percent == null ? 100 : Math.max(0, Math.min(100, Math.round(percent)));
+        const key = color + '|' + p;
+        if (key === favKey) return;
+        favKey = key;
+        const circ = 81.68;  // 2 * pi * 13
+        const svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>" +
+            "<circle cx='16' cy='16' r='13' fill='none' stroke='" + color + "' stroke-opacity='.25' stroke-width='6'/>" +
+            "<circle cx='16' cy='16' r='13' fill='none' stroke='" + color + "' stroke-width='6' stroke-dasharray='" +
+            (circ * p / 100).toFixed(2) + ' ' + circ + "' transform='rotate(-90 16 16)'/></svg>";
+        $('favicon').setAttribute('href', 'data:image/svg+xml,' + encodeURIComponent(svg));
+    }
+
+    function showView(name) {
+        for (const v of ['loading', 'list', 'detail', 'notfound']) setHidden($('view-' + v), v !== name);
+    }
+
+    // Network
+
+    function schedule(ms) {
+        clearTimeout(timer);
+        timer = 0;
+        if (halted || document.hidden) return;
+        nextPollAt = Date.now() + ms;
+        timer = setTimeout(poll, ms);
+    }
+
+    function pollSoon() {
+        if (busy) wantPoll = true;
+        else poll();
+    }
+
+    // XHR rather than fetch: it is parsed and rendered synchronously in its load handler, and Firefox holds
+    // the document's load event for it, so the first poll is painted by the time the page counts as loaded
+    // (headless screenshots show data, not "Loading...").
+    function poll() {
+        if (busy || halted) return;
+        busy = true;
+        clearTimeout(timer);
+        timer = 0;
+        const xhr = new XMLHttpRequest();
+        const t0 = Date.now();
+        xhr.open('GET', apiPath);
+        xhr.responseType = 'json';
+        xhr.timeout = FETCH_TIMEOUT_MS;
+        xhr.setRequestHeader('Accept', 'application/json');
+        xhr.onload = () => {
+            const t1 = Date.now(), body = xhr.response;
+            if (view === 'detail' && (xhr.status === 404 || xhr.status === 400)) {
+                finishPoll(null, xhr.status, (body && body.error) || '');
+            } else if (xhr.status < 200 || xhr.status >= 300) {
+                finishPoll(null, 0, 'HTTP ' + xhr.status);
+            } else if (!body || typeof body.now !== 'number') {
+                finishPoll(null, 0, 'bad response');
+            } else {
+                clockOffset = body.now - (t0 + t1) / 2000;
+                finishPoll(body, 0, '');
+            }
+        };
+        xhr.onerror = () => finishPoll(null, 0, 'network error');
+        xhr.ontimeout = () => finishPoll(null, 0, 'timed out');
+        xhr.onabort = () => finishPoll(null, 0, 'aborted');
+        xhr.send();
+    }
+
+    // missing: the detail request answered 404 (unknown or deleted) or 400 (not a request id).
+    function finishPoll(data, missing, error) {
+        busy = false;
+        if (data || missing) {
+            failures = 0;
+            lastError = '';
+            lastOkAt = Date.now();
+        } else {
+            failures++;
+            lastError = error;
+        }
+        setConn();
+        if (missing) {
+            renderNotFound(missing === 404 ? (loaded ? 'deleted' : 'unknown') : 'invalid', error);
+            return;
+        }
+        if (data) {
+            try {
+                render(data);
+            } catch (e) {
+                console.error('render failed', e);  // a UI bug, not a network failure
+            }
+        }
+        const delay = wantPoll ? 0 : failures ? Math.min(POLL_MS * 2 ** failures, MAX_BACKOFF_MS) : POLL_MS;
+        wantPoll = false;
+        schedule(delay);
+    }
+
+    function setConn() {
+        const state = failures >= BANNER_AFTER_FAILS ? 'offline' : failures ? 'reconnecting' : lastOkAt ? 'live' : 'connecting';
+        const conn = $('conn');
+        if (conn.dataset.state !== state) conn.dataset.state = state;
+        setText($('conn-text'), state);
+        document.body.classList.toggle('offline', state === 'offline');
+        setHidden($('banner'), state !== 'offline');
+        updateBanner();
+    }
+
+    function updateBanner() {
+        if ($('banner').hidden) return;
+        const wait = Math.ceil((nextPollAt - Date.now()) / 1000);
+        let text = "Can't reach the task server" + (lastError ? ' (' + lastError + ')' : '') + '. ';
+        text += busy || wait <= 0 || !timer ? 'Retrying now' : 'Retrying in ' + wait + 's';
+        text += lastOkAt ? ' · last update ' + fmtAgo((Date.now() - lastOkAt) / 1000) : ' · not connected yet';
+        setText($('banner-text'), text);
+    }
+
+    // Writes carry JSON with an explicit Content-Type; the result never throws.
+    async function apiSend(method, path, body) {
+        const opts = { method, cache: 'no-store', headers: { Accept: 'application/json' } };
+        if (body !== undefined) {
+            opts.headers['Content-Type'] = 'application/json';
+            opts.body = JSON.stringify(body);
+        }
+        const ctrl = new AbortController();
+        const kill = setTimeout(() => ctrl.abort(), WRITE_TIMEOUT_MS);
+        opts.signal = ctrl.signal;
+        try {
+            const res = await fetch(path, opts);
+            const data = await res.json().catch(() => null);
+            return { ok: res.ok, status: res.status, data, error: res.ok ? '' : (data && data.error) || 'HTTP ' + res.status };
+        } catch (e) {
+            return { ok: false, status: 0, data: null, error: e.name === 'AbortError' ? 'timed out' : "can't reach the server" };
+        } finally {
+            clearTimeout(kill);
+        }
+    }
+
+    // Rendering
+
+    function render(data) {
+        lastData = data;
+        if (view === 'list') renderList(data);
+        else renderDetail(data);
+        loaded = true;
+        tick(true);
+    }
+
+    function renderList(data) {
+        const active = [], finished = [];
+        for (const r of data.requests) (r.status === 'running' ? active : finished).push(r);
+        const seen = new Set();
+        reconcile($('list-active'), active, createReqRow, updateReqRow, seen);
+        reconcile($('list-finished'), finished, createReqRow, updateReqRow, seen);
+        prune(seen);
+
+        const c = data.counts, totalFinished = c.done + c.failed, empty = data.requests.length === 0 && c.running + totalFinished === 0;
+        const summary = summaryRefs || (summaryRefs = collectRefs($('summary')));
+        setPart(summary.running, c.running ? c.running + ' running' : '');
+        setPart(summary.stale, c.stale ? c.stale + ' stale' : '');
+        setPart(summary.done, c.done ? c.done + ' done' : '');
+        setPart(summary.failed, c.failed ? c.failed + ' failed' : '');
+        setHidden($('summary'), empty);
+        setHidden($('list-empty'), !empty);
+        setHidden($('group-active'), empty);
+        setHidden($('active-empty'), active.length > 0);
+        setText($('count-active'), active.length ? String(active.length) : '');
+        setHidden($('group-finished'), finished.length === 0);
+        setText($('count-finished'), finished.length < totalFinished ? finished.length + ' of ' + totalFinished : String(finished.length));
+        if (!loaded) showView('list');
+
+        setDocTitle(c.running ? '(' + c.running + ' running) Task Status' : 'Task Status');
+        setFavicon(c.running ? (c.stale >= c.running ? 'stale' : 'running') : 'idle', null);
+    }
+
+    function createReqRow(r) {
+        const row = cloneTpl('tpl-req');
+        row.el.setAttribute('href', '/r/' + encodeURIComponent(r.id));
+        row.tick = tickReqRow;
+        return row;
+    }
+
+    function updateReqRow(row, r) {
+        const refs = row.refs, st = reqStatus(r), running = r.status === 'running';
+        setStatus(row.el, st);
+        setText(refs.badge, LABELS[st] || st);
+        setText(refs.title, r.title);
+        setAttr(refs.title, 'title', r.title);
+        setText(refs.pct, reqPct(r));
+        setBar(refs.bar, refs.fill, r.percent, running && r.tasks_total === 0);
+
+        let ht = '', hm = r.message || '';
+        if (running && r.current) {
+            ht = r.current.title;
+            hm = r.current.message || '';
+        } else if (running && !hm && r.tasks_pending) {
+            hm = plural(r.tasks_pending, 'task') + ' queued';
+        }
+        hm = hm.replace(/\s*\n\s*/g, ' \u00B7 ');  // one line: keep the breaks visible
+        setText(refs.ht, ht);
+        setText(refs.hm, hm);
+        setHidden(refs.hint, !ht && !hm);
+        setAttr(refs.hint, 'title', ht && hm ? ht + ' — ' + hm : ht || hm);
+
+        setText(refs.tasks, tasksText(r));
+        setPart(refs.failed, r.tasks_failed ? r.tasks_failed + ' failed' : '');
+        setPart(refs.origin, r.origin || '');
+        setAttr(refs.origin, 'title', r.origin ? 'origin: ' + r.origin : null);
+        setText(refs.rid, '#' + r.id);
+        setAttr(refs.time, 'title', running ? 'started ' + fmtStamp(r.created_at)
+                                            : fmtStamp(r.created_at) + ' → ' + fmtStamp(r.completed_at));
+        setAttr(refs.updated, 'title', fmtStamp(running ? r.updated_at : r.completed_at ?? r.updated_at));
+    }
+
+    function tickReqRow(row, now) {
+        const r = row.item, refs = row.refs, running = r.status === 'running';
+        setText(refs.time, running ? fmtDur(now - r.created_at) : 'took ' + fmtDur(r.elapsed));
+        const eta = running ? etaInfo(r.eta_at, now) : null;
+        setPart(refs.eta, eta ? eta.text : '');
+        refs.eta.classList.toggle('warn', !!eta && eta.overdue);
+        setText(refs.updated, running ? 'updated ' + fmtAgo(now - r.updated_at)
+                                      : 'finished ' + fmtAgo(now - (r.completed_at ?? r.updated_at)));
+        refs.updated.classList.toggle('warn', running && r.stale);
+    }
+
+    function renderDetail(d) {
+        if (!headRefs) headRefs = collectRefs($('req-head'));
+        updateHeader(d);
+        const seen = new Set();
+        reconcile($('task-list'), d.tasks, createTaskRow, updateTaskRow, seen);
+        prune(seen);
+        setHidden($('task-empty'), d.tasks.length > 0);
+        setText($('task-empty-cmd'), "taskctl add " + d.id + " 'title'");
+        setText($('count-tasks'), d.tasks.length ? String(d.tasks.length) : '');
+        if (!loaded) showView('detail');
+
+        const st = reqStatus(d);
+        const state = d.status === 'done' ? 'Done' : d.status === 'failed' ? 'Failed' : d.tasks_total ? reqPct(d) : 'Running';
+        setDocTitle(state + ' · ' + d.title + ' — Task Status');
+        setFavicon(st, d.status === 'running' && d.tasks_total === 0 ? null : d.percent);
+        applyHash();
+    }
+
+    function updateHeader(r) {
+        const h = headRefs, st = reqStatus(r), running = r.status === 'running';
+        setStatus($('req-head'), st);
+        setText(h.badge, LABELS[st] || st);
+        setText(h.title, r.title);
+        setText(h.pct, reqPct(r));
+        setBar(h.bar, h.fill, r.percent, running && r.tasks_total === 0);
+        setText(h.tasks, tasksText(r));
+        setPart(h.failed, r.tasks_failed ? r.tasks_failed + ' failed' : '');
+        setPart(h.cancelled, r.tasks_cancelled ? r.tasks_cancelled + ' cancelled' : '');
+        setAttr(h.cancelled, 'title', r.tasks_cancelled ? 'cancelled tasks are not counted in the total' : null);
+        setPart(h.origin, r.origin || '');
+        setAttr(h.origin, 'title', r.origin ? 'origin: ' + r.origin : null);
+        setText(h.started, 'started ' + fmtClock(r.created_at));
+        setAttr(h.started, 'title', fmtStamp(r.created_at));
+        setAttr(h.updated, 'title', fmtStamp(running ? r.updated_at : r.completed_at ?? r.updated_at));
+        setText(h.message, r.message || '');
+        setHidden(h.message, !r.message);
+        setText(h.rid, r.id);
+        setHidden(h.markDone, !running);
+        setHidden(h.markFailed, !running);
+    }
+
+    function tickHeader(now) {
+        const r = lastData, h = headRefs, running = r.status === 'running';
+        setText(h.time, running ? 'elapsed ' + fmtDur(now - r.created_at) : 'took ' + fmtDur(r.elapsed));
+        const eta = running ? etaInfo(r.eta_at, now) : null;
+        setPart(h.eta, eta ? eta.text : '');
+        h.eta.classList.toggle('warn', !!eta && eta.overdue);
+        setText(h.updated, running ? 'updated ' + fmtAgo(now - r.updated_at)
+                                   : 'finished ' + fmtAgo(now - (r.completed_at ?? r.updated_at)));
+        h.updated.classList.toggle('warn', running && r.stale);
+    }
+
+    function createTaskRow(t) {
+        const row = cloneTpl('tpl-task');
+        row.el.id = t.id;
+        row.refs.seq.setAttribute('href', '#' + encodeURIComponent(t.id));
+        row.tick = tickTaskRow;
+        return row;
+    }
+
+    function updateTaskRow(row, t) {
+        const refs = row.refs, st = taskStatus(t);
+        setStatus(row.el, st);
+        setText(refs.seq, '#' + t.seq);
+        setText(refs.badge, LABELS[st] || st);
+        setText(refs.title, t.title);
+        setText(refs.pct, taskPct(t));
+        setBar(refs.bar, refs.fill, t.status === 'pending' ? 0 : t.percent, false);
+        setText(refs.msg, t.message || '');
+        setHidden(refs.msg, !t.message);
+        setAttr(refs.msg, 'title', t.message);
+        setText(refs.tid, t.id);
+        setAttr(refs.time, 'title', t.started_at == null ? null
+            : (t.start_inferred ? 'never started; counted from when it was added: ' : 'started ') + fmtStamp(t.started_at));
+        setAttr(refs.updated, 'title', fmtStamp(t.completed_at ?? t.updated_at));
+    }
+
+    function tickTaskRow(row, now) {
+        const t = row.item, refs = row.refs, approx = t.start_inferred ? '~' : '';
+        const ended = fmtAgo(now - (t.completed_at ?? t.updated_at));
+        let time = '', eta = null, updated = '';
+        switch (t.status) {
+            case 'running':
+                time = 'running ' + (t.started_at == null ? '—' : approx + fmtDur(now - t.started_at));
+                eta = etaInfo(t.eta_at, now);
+                updated = 'updated ' + fmtAgo(now - t.updated_at);
+                break;
+            case 'pending':
+                time = 'not started';
+                break;
+            case 'done':
+                time = 'took ' + (t.elapsed == null ? '—' : approx + fmtDur(t.elapsed));
+                updated = 'done ' + ended;
+                break;
+            case 'failed':
+                time = 'ran ' + (t.elapsed == null ? '—' : approx + fmtDur(t.elapsed));
+                updated = 'failed ' + ended;
+                break;
+            case 'cancelled':
+                time = 'not counted';
+                updated = 'cancelled ' + ended;
+                break;
+        }
+        setText(refs.time, time);
+        setPart(refs.eta, eta ? eta.text : '');
+        refs.eta.classList.toggle('warn', !!eta && eta.overdue);
+        setPart(refs.updated, updated);
+        refs.updated.classList.toggle('warn', t.status === 'running' && t.stale);
+    }
+
+    // Deep links: /r/<rid>#<tid> scrolls to and highlights that task once it exists.
+    function applyHash() {
+        let id = '';
+        try {
+            id = decodeURIComponent(location.hash.slice(1)).toLowerCase();
+        } catch (e) { /* malformed escape: no target */ }
+        for (const [key, row] of rows) row.el.classList.toggle('target', key === id);
+        const row = id && rows.get(id);
+        if (row && scrollToHash) {
+            scrollToHash = false;
+            row.el.scrollIntoView({ block: 'center' });
+        }
+    }
+
+    function renderNotFound(kind, detail) {
+        halted = true;
+        clearTimeout(timer);
+        const texts = {
+            deleted: ['This request was deleted.', 'It is no longer on the board.'],
+            unknown: ['Request not found', 'There is no request ' + rid + ' on this board. It may have been deleted, ' +
+                      'or removed after the retention period.'],
+            invalid: ['Not a request id', 'Request ids look like k3m9qa.' + (detail ? ' (' + detail + ')' : '')],
+            path: ['Page not found', 'Nothing lives at ' + location.pathname + '.'],
+        };
+        const [title, text] = texts[kind];
+        setText($('nf-title'), title);
+        setText($('nf-text'), text);
+        showView('notfound');
+        setDocTitle('Not found — Task Status');
+        setFavicon('idle', null);
+    }
+
+    function tick(force) {
+        if (document.hidden && !force) return;
+        const now = serverNow();
+        for (const row of rows.values()) row.tick(row, now);
+        if (view === 'detail' && headRefs && lastData) tickHeader(now);
+        updateBanner();
+    }
+
+    // Actions
+
+    async function clearFinished(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        const ids = lastData ? lastData.requests.filter((r) => r.status !== 'running').map((r) => r.id) : [];
+        if (!ids.length || !confirm('Delete ' + plural(ids.length, 'finished request') + '? This cannot be undone.')) return;
+        const btn = $('clear');
+        btn.disabled = true;
+        let failed = 0, error = '';
+        for (const id of ids) {
+            const res = await apiSend('DELETE', '/api/requests/' + encodeURIComponent(id));
+            if (!res.ok && res.status !== 404) {
+                failed++;
+                error = res.error;
+            }
+        }
+        btn.disabled = false;
+        if (failed) alert('Could not delete ' + plural(failed, 'request') + ': ' + error);
+        pollSoon();
+    }
+
+    async function completeRequest(status) {
+        const r = lastData;
+        if (!r || !confirm('Mark "' + r.title + '" as ' + status + '?\n\nQueued tasks will be cancelled and running tasks ' +
+                           'closed as ' + status + '.')) return;
+        setActionsDisabled(true);
+        const res = await apiSend('POST', '/api/requests/' + encodeURIComponent(r.id) + '/complete',
+                                  { status, message: 'marked ' + status + ' from the web UI' });
+        setActionsDisabled(false);
+        if (!res.ok) alert('Could not mark the request ' + status + ': ' + res.error);
+        pollSoon();
+    }
+
+    async function deleteRequest() {
+        const r = lastData;
+        if (!r || !confirm('Delete "' + r.title + '" and its tasks? Agents still reporting to it will get errors.')) return;
+        setActionsDisabled(true);
+        const res = await apiSend('DELETE', '/api/requests/' + encodeURIComponent(r.id));
+        if (res.ok || res.status === 404) {
+            location.href = '/';
+            return;
+        }
+        setActionsDisabled(false);
+        alert('Could not delete the request: ' + res.error);
+    }
+
+    function setActionsDisabled(disabled) {
+        for (const key of ['markDone', 'markFailed', 'del']) headRefs[key].disabled = disabled;
+    }
+
+    // Boot
+
+    function route() {
+        const path = location.pathname.replace(/\/+$/, '') || '/';
+        if (path === '/' || path === '/r') return { view: 'list' };
+        const m = path.match(/^\/r\/([^/]+)$/);
+        if (!m) return { view: 'notfound' };
+        let id = m[1];
+        try {
+            id = decodeURIComponent(id);
+        } catch (e) { /* keep the raw segment */ }
+        id = id.toLowerCase();
+        // A task id in the path (hand-typed or pasted) shows its request with that task highlighted.
+        const task = id.match(/^([a-z0-9]{6})-(\d+)$/);
+        if (task) {
+            history.replaceState(null, '', '/r/' + task[1] + '#' + task[1] + '-' + Number(task[2]));
+            id = task[1];
+        }
+        return { view: 'detail', rid: id };
+    }
+
+    function init() {
+        const r = route();
+        view = r.view;
+        rid = r.rid || null;
+        $('nf-retry').addEventListener('click', (e) => {
+            e.preventDefault();
+            location.reload();
+        });
+        if (view === 'notfound') {
+            setHidden($('conn'), true);  // this page never polls, so "connecting" would never change
+            renderNotFound('path');
+            return;
+        }
+        apiPath = view === 'list' ? '/api/requests' : '/api/requests/' + encodeURIComponent(rid);
+
+        $('quickstart').textContent =
+            '# create a request with two planned tasks (the reply holds its id and page url)\n' +
+            'curl -sS --connect-timeout 5 -X POST ' + location.origin + '/api/requests \\\n' +
+            "    -H 'Content-Type: application/json' \\\n" +
+            '    -d \'{"title": "My request", "tasks": ["step one", "step two"]}\'\n\n' +
+            '# full instructions for agents: the API, the taskctl CLI, the skill and the CLAUDE.md rule\n' +
+            'curl -sS --connect-timeout 5 ' + location.origin + '/api/usage';
+
+        const finished = $('group-finished');
+        try {
+            if (localStorage.getItem(FINISHED_OPEN_KEY) === '0') finished.open = false;
+        } catch (e) { /* storage unavailable: default open */ }
+        finished.addEventListener('toggle', () => {
+            try {
+                localStorage.setItem(FINISHED_OPEN_KEY, finished.open ? '1' : '0');
+            } catch (e) { /* ignore */ }
+        });
+        $('clear').addEventListener('click', clearFinished);
+
+        headRefs = collectRefs($('req-head'));
+        headRefs.markDone.addEventListener('click', () => completeRequest('done'));
+        headRefs.markFailed.addEventListener('click', () => completeRequest('failed'));
+        headRefs.del.addEventListener('click', deleteRequest);
+        // Going back to the list we came from keeps its scroll position.
+        $('back').addEventListener('click', (e) => {
+            if (e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey &&
+                    document.referrer === location.origin + '/' && history.length > 1) {
+                e.preventDefault();
+                history.back();
+            }
+        });
+        $('task-list').addEventListener('click', (e) => {
+            const msg = e.target.closest('.msg');
+            if (msg && !String(window.getSelection() || '')) msg.classList.toggle('expanded');
+        });
+        addEventListener('hashchange', () => {
+            scrollToHash = true;
+            applyHash();
+        });
+
+        $('retry').addEventListener('click', pollSoon);
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) schedule(0);  // schedule() refuses while hidden: this just cancels the timer
+            else pollSoon();
+        });
+        addEventListener('pageshow', (e) => {
+            if (e.persisted && !halted) pollSoon();
+        });
+        setInterval(tick, TICK_MS);
+        poll();
+    }
+
+    init();
+})();
+</script>
+</body>
+</html>
