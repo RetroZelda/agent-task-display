@@ -12,17 +12,23 @@
 set -uo pipefail
 # Every suite already scrubs these, but a TASKS_URL exported for day-to-day agent use must never
 # steer a test at a real board, so clear them here too before anything is launched.
-unset TASKS_URL TASKS_HOST TASKS_PORT TASKS_DB TASKS_PUBLIC_URL TASKS_STRICT TASKS_TIMEOUT
+unset TASKS_URL TASKS_HOST TASKS_PORT TASKS_DB TASKS_PUBLIC_URL TASKS_STRICT TASKS_TIMEOUT \
+    TASKS_CONFIG TASKS_TLS_PORT TASKS_TLS_CERT TASKS_TLS_KEY TASKS_SPOOL_DIR TASKS_NO_UPDATE
+while read -r name; do unset "$name"; done < <(compgen -e | grep '^TASKS_')
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # name|file|what it covers
 SUITES=(
     "taskctl_units|test_taskctl_units.py|taskctl.py parsers, formatters, rule merge, run monitor"
     "server|test_server.py|server contract: routes, shapes, validation, state rules, templates"
+    "server_v2|test_server_v2.py|server v2: headers, attention, events, replay, settings, v1 migration"
+    "tls|test_tls.py|the optional HTTPS listener, its rendering and its errors"
     "cli_offline|test_cli_offline.py|taskctl with no board: exit codes, offline ids, the sh wrapper"
-    "cli|test_cli.py|taskctl <-> server: every subcommand, run, install-rule"
+    "cli|test_cli.py|taskctl <-> server: every subcommand, run, install-rule, ask/resume, api"
+    "spool|test_spool.py|taskctl's offline queue: queue, coalesce, lock, replay, connect vs read"
+    "self_update|test_self_update.py|an installed skill updating itself from the board"
     "ipv6|test_ipv6.py|dual-stack, IPv6 Origin/Host, --host variants, HTTP error paths"
-    "concurrency|test_concurrency.py|40 polling readers + a writer"
+    "concurrency|test_concurrency.py|40 polling readers (list, detail, events) + a writer"
     "launcher|test_launcher.sh|tasks.sh lifecycle, banner, pidfiles, busy port, LAN paths"
     "install_skill|test_install_skill.sh|tasks.sh --install-skill"
     "ufw|test_ufw.sh|tasks.sh firewall detection with fake ufw files"

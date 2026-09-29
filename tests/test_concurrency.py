@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Concurrency smoke: 40 reader threads (the list plus one detail page, as open dashboard tabs poll)
-for CONC_SECONDS (default 5) against a seeded scratch board, while one writer posts progress every
-0.2s. Every read and write must succeed with a well-formed body, and the last write must win.
-Latencies are printed for information, not asserted."""
+"""Concurrency smoke: 40 reader threads (the list plus one detail page, as open dashboard tabs poll,
+and /api/events from their own cursor, as every v2 page does) for CONC_SECONDS (default 5) against a
+seeded scratch board, while one writer posts progress every 0.2s. Every read and write must succeed
+with a well-formed body, the last write must win, and every reader following the events cursor must
+see every event exactly once, in order. Latencies are printed for information, not asserted."""
 from __future__ import annotations
 
 import json
@@ -44,13 +45,32 @@ def main(base):
     rid, tid = target['id'], target['tasks'][0]['id']
 
     S.section(f'{READERS} readers + 1 writer for {DURATION:g}s')
-    lat = {'list': [], 'detail': []}
+    lat = {'list': [], 'detail': [], 'events': []}
+    followed = []   # per reader: (its baseline cursor, every event id it was handed, in order)
     errs, lock = [], threading.Lock()
     writes = {'n': 0, 'lat': [], 'errs': [], 'last': None}
     stop_at = time.time() + DURATION
 
     def reader():
+        cursor = call('GET', '/api/events')[1]['cursor']
+        seen = []
+        with lock:
+            followed.append((cursor, seen))
         while time.time() < stop_at:
+            t0 = time.perf_counter()
+            try:
+                s, body = call('GET', f'/api/events?since={cursor}')
+                if s == 200 and isinstance(body.get('events'), list) and body['cursor'] >= cursor:
+                    seen.extend(e['id'] for e in body['events'])
+                    cursor = body['cursor']
+                    with lock:
+                        lat['events'].append((time.perf_counter() - t0) * 1000)
+                else:
+                    with lock:
+                        errs.append(f'events: bad body or status {s}')
+            except Exception as e:  # noqa: BLE001
+                with lock:
+                    errs.append(f'events: {e!r}')
             for kind, path in (('list', '/api/requests'), ('detail', '/api/requests/' + rid)):
                 t0 = time.perf_counter()
                 try:
@@ -93,10 +113,12 @@ def main(base):
         v = sorted(v)
         return v[min(len(v) - 1, int(len(v) * frac))] if v else float('nan')
 
-    reads = lat['list'] + lat['detail']
-    print(f"  reads={len(reads)} (list {len(lat['list'])}, detail {len(lat['detail'])}) read_errors={len(errs)}"
+    reads = lat['list'] + lat['detail'] + lat['events']
+    print(f"  reads={len(reads)} (list {len(lat['list'])}, detail {len(lat['detail'])}, events {len(lat['events'])})"
+          f" read_errors={len(errs)}"
           f"  writes={writes['n']} write_errors={len(writes['errs'])}")
-    for name, v in (('all reads', reads), ('list', lat['list']), ('detail', lat['detail']), ('progress writes', writes['lat'])):
+    for name, v in (('all reads', reads), ('list', lat['list']), ('detail', lat['detail']), ('events', lat['events']),
+                    ('progress writes', writes['lat'])):
         if v:
             print(f'  {name:16} p50={statistics.median(v):.1f}ms p95={q(v, .95):.1f}ms p99={q(v, .99):.1f}ms max={max(v):.1f}ms')
     check('every read succeeded with a well-formed body', not errs, errs[:5])
@@ -105,8 +127,21 @@ def main(base):
     check(f"the writer kept its pace ({writes['n']} writes)", writes['n'] >= max(1, int(DURATION / 0.2 * 0.5)))
     s, final = call('GET', '/api/tasks/' + tid)
     check('the last write won', (final['message'], final['percent']) == writes['last'], (final['message'], final['percent'], writes['last']))
+    s, final_events = call('GET', '/api/events')
+    top = final_events['cursor']
+    s, tail = call('GET', f'/api/events?since={top - writes["n"]}&limit=1000')
+    check('one event per progress write (the first starts the task)', [e['type'] for e in tail['events']]
+          == ['task_started'] + ['task_progress'] * (writes['n'] - 1)
+          and tail['events'][-1]['message'] == writes['last'][0], (writes['n'], [e['type'] for e in tail['events']][:5]))
+    for base_cursor, seen in followed:
+        s, rest = call('GET', f'/api/events?since={seen[-1] if seen else base_cursor}&limit=1000')
+        seen.extend(e['id'] for e in rest['events'])
+    bad = [(base, seen[:3]) for base, seen in followed if seen != list(range(base + 1, top + 1))]
+    check(f'every reader following the cursor saw every event once, in order ({len(followed)} readers)',
+          len(followed) == READERS and not bad, bad[:3])
     s, lst = call('GET', '/api/requests')
-    check('the counts are unchanged by the load', lst['counts'] == {'running': 21, 'stale': 0, 'done': 10, 'failed': 0}, lst['counts'])
+    check('the counts are unchanged by the load', lst['counts'] == {'running': 21, 'stale': 0, 'done': 10, 'failed': 0, 'waiting': 0},
+          lst['counts'])
 
 
 if __name__ == '__main__':

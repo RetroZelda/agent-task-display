@@ -2,9 +2,11 @@
 """taskctl <-> server: every subcommand and alias through the real sh wrapper against a scratch
 server (--stale-after 3, --expire-after 6), with every aggregate recomputed from the task list.
 Also: run (output pass-through, percent regex, signals, a background grandchild that outlives it),
-install-rule, the served and downloaded taskctl, and the offline sentinel."""
+install-rule, the served and downloaded taskctl, the offline sentinel, ask/resume (waiting in show and
+list), usage, changelog, api and flush."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -18,8 +20,8 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True  # no __pycache__ in the checkout, even when run without run_all.sh
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
-from harness import (TASKCTL_PY, WRAPPER, ScratchServer, Suite, api, clean_env, scratch_home,  # noqa: E402
-                     tasks_copy, tempdir, wait_until)
+from harness import (TASKCTL_PY, TASKS, WRAPPER, ScratchServer, Suite, api, clean_env, docs_version,  # noqa: E402
+                     scratch_home, tasks_copy, tempdir, wait_until)
 
 S = Suite('cli')
 check = S.check
@@ -34,10 +36,12 @@ ENV = clean_env(CLAUDE_CONFIG_DIR=CC)
 URL = ''
 
 TASK_KEYS = {'id', 'request_id', 'seq', 'title', 'status', 'percent', 'message', 'eta_at', 'eta_remaining',
-             'created_at', 'started_at', 'start_inferred', 'updated_at', 'completed_at', 'elapsed', 'stale', 'url'}
+             'created_at', 'started_at', 'start_inferred', 'updated_at', 'completed_at', 'elapsed', 'stale', 'url',
+             'attention'}
 REQUEST_KEYS = {'id', 'title', 'origin', 'status', 'message', 'created_at', 'updated_at', 'completed_at',
                 'elapsed', 'percent', 'tasks_total', 'tasks_done', 'tasks_failed', 'tasks_running',
-                'tasks_pending', 'tasks_cancelled', 'current', 'eta_at', 'stale', 'url'}
+                'tasks_pending', 'tasks_cancelled', 'current', 'eta_at', 'stale', 'url', 'attention', 'waiting',
+                'tasks_waiting'}
 NUDGE = ('taskctl: task was never started; its running time is approximate - run `taskctl start TID` '
          'when you begin a task')
 
@@ -81,8 +85,11 @@ def verify_task(t, now, where):
     exp_el = None if t['started_at'] is None else (t['completed_at'] or now) - t['started_at']
     check(f"{where}: {t['id']} elapsed", (exp_el is None and t['elapsed'] is None) or near(exp_el, t['elapsed']),
           (exp_el, t['elapsed']))
-    exp_stale = running and now - t['updated_at'] > STALE_AFTER and not (t['eta_at'] and now < t['eta_at'] + 60)
+    exp_stale = (running and t['attention'] is None and now - t['updated_at'] > STALE_AFTER
+                 and not (t['eta_at'] and now < t['eta_at'] + 60))
     check(f"{where}: {t['id']} stale", t['stale'] == exp_stale, (t['stale'], exp_stale))
+    check(f"{where}: {t['id']} attention is null or {{message, since}}", t['attention'] is None
+          or (set(t['attention']) == {'message', 'since'} and t['attention']['message']), t['attention'])
     check(f"{where}: {t['id']} url", t['url'] == f"{URL}/r/{t['request_id']}#{t['id']}", t['url'])
     check(f"{where}: {t['id']} percent in range, 1 decimal", 0 <= t['percent'] <= 100
           and round(t['percent'], 1) == t['percent'], t['percent'])
@@ -118,7 +125,11 @@ def verify_request(r, where):
     check(f'{where}: current', r['current'] == exp_cur, (r['current'], exp_cur))
     etas = [t['eta_at'] for t in running if t['eta_at'] is not None]
     check(f'{where}: eta_at = max running eta', r['eta_at'] == (max(etas) if etas else None), (r['eta_at'], etas))
-    exp_stale = (r['status'] == 'running' and now - r['updated_at'] > STALE_AFTER
+    exp_tw = sum(1 for t in running if t['attention'] is not None)
+    exp_waiting = r['status'] == 'running' and (r['attention'] is not None or exp_tw > 0)
+    check(f'{where}: tasks_waiting = running tasks with attention ({exp_tw})', r['tasks_waiting'] == exp_tw, r['tasks_waiting'])
+    check(f'{where}: waiting={exp_waiting}', r['waiting'] is exp_waiting, (r['waiting'], r['attention']))
+    exp_stale = (r['status'] == 'running' and not exp_waiting and now - r['updated_at'] > STALE_AFTER
                  and not any(t['eta_at'] and now < t['eta_at'] + 60 for t in running))
     check(f'{where}: stale={exp_stale}', r['stale'] == exp_stale, r['stale'])
     check(f'{where}: url', r['url'] == f"{URL}/r/{r['id']}", r['url'])
@@ -290,7 +301,8 @@ def main_flow():
     rc, out2, err = tc('ls')
     check('alias ls == list', rc == 0 and [x.split()[0] for x in lines(out2)] == [x.split()[0] for x in ll], out2)
     code, lst, _ = api(URL, 'GET', '/api/requests')
-    check('GET /api/requests counts', lst['counts'] == {'running': 2, 'stale': 0, 'done': 0, 'failed': 0}, lst['counts'])
+    check('GET /api/requests counts', lst['counts'] == {'running': 2, 'stale': 0, 'done': 0, 'failed': 0, 'waiting': 0},
+          lst['counts'])
 
     S.section('fail on a request: running -> failed (auto_closed), pending -> cancelled')
     rc, out, err = tc('fail', rid2, 'gave', 'up')
@@ -397,9 +409,13 @@ def main_flow():
     rc, out, err = tc('run', 'offline', '--', 'sh', '-c', 'echo ran; exit 4')
     check('run offline: runs the command, exits with its code', rc == 4 and out == 'ran\n', (rc, out, err))
     rc, out, err = tc('new', 'x', '-t', 'a', strict=False, url='http://127.0.0.1:1')
-    check('new unreachable (soft): offline x2, exit 0', rc == 0 and lines(out) == ['offline', 'offline'], (rc, out, err))
+    ids = lines(out)
+    check('new unreachable (soft): exit 0, its own rid + rid-1, queued', rc == 0 and len(ids) == 2
+          and re.fullmatch(r'[23456789a-hjkmnp-z]{6}', ids[0]) and ids[1] == ids[0] + '-1'
+          and 'queued for replay' in err, (rc, out, err))
     rc, out, err = tc('new', 'x', '-t', 'a', url='http://127.0.0.1:1')
-    check('new unreachable (strict): exit 3, no stdout', rc == 3 and out == '', (rc, out, err))
+    check('new unreachable (strict): exit 3, the queued ids still printed', rc == 3 and len(lines(out)) == 2
+          and 'offline' not in out and 'queued for replay' in err, (rc, out, err))
     rc, out, err = tc('ping', url='http://127.0.0.1:1')
     check('ping unreachable (strict): exit 3, stdout URL', rc == 3 and out == 'http://127.0.0.1:1\n' and 'unreachable' in err, (rc, out, err))
     rc, out, err = tc('ping', strict=False, url='http://127.0.0.1:1')
@@ -438,6 +454,92 @@ def main_flow():
     check('DELETE request', code == 200 and body['deleted'] == rid2)
     rc, out, err = tc('show', s1)
     check('a task of a deleted request: 404 (strict exit 1)', rc == 1 and 'request may have been deleted' in err, err)
+
+    S.section('ask and resume: a request or a task waiting for input')
+    rc, out, err = tc('new', 'Needs an answer', '-t', 'one', '-t', 'two')
+    arid, a1, a2 = lines(out)
+    rc, out, err = tc('ask', arid, 'Which', 'environment?')
+    r = verify_request(get_req(arid), 'after ask RID')
+    check('ask RID: rc 0, no stdout, the exact note', rc == 0 and out == '' and err == f'taskctl: {arid} waiting for input: Which environment?\n',
+          (rc, out, err))
+    check('ask RID: request-level attention, waiting, no task waits', r['attention'] and r['attention']['message'] == 'Which environment?'
+          and r['waiting'] is True and r['tasks_waiting'] == 0, r)
+    rc, out, err = tc('show', arid)
+    ol = out.splitlines()
+    check('show a waiting request: status waiting, the question under the header, then the page',
+          rc == 0 and ol[0].split()[1] == 'waiting' and ol[1] == 'waiting: Which environment?' and ol[2] == f'page: {URL}/r/{arid}'
+          and len(ol) == 5, out)
+    rc, out, err = tc('list')
+    line = next((x for x in lines(out) if x.startswith(arid)), '')
+    check('list marks the waiting request', rc == 0 and line.split()[1] == 'waiting', out)
+    code, lst, _ = api(URL, 'GET', '/api/requests')
+    check('counts.waiting counts it', lst['counts']['waiting'] == 1, lst['counts'])
+    rc, out, err = tc('ask', a1, 'Need', 'a', 'token')
+    t = get('/api/tasks/' + a1)
+    check('ask TID: starts the pending task, sets its attention', rc == 0 and err == f'taskctl: {a1} waiting for input: Need a token\n'
+          and t['status'] == 'running' and t['started_at'] and t['attention']['message'] == 'Need a token', (err, t))
+    rc, out, err = tc('show', arid)
+    ol = out.splitlines()
+    i = next((i for i, x in enumerate(ol) if f' {a1} ' in x), 0)
+    check('show: the waiting task line, then its question indented', ol[i].split()[0] == 'waiting'
+          and ol[i + 1] == '    waiting: Need a token', out)
+    rc, out, err = tc('show', a1)
+    check('show a waiting task: its line, then the question', rc == 0 and lines(out)[1:] == ['waiting: Need a token']
+          and lines(out)[0].split()[0] == 'waiting', out)
+    rc, out, err = tc('resume', arid)
+    r = verify_request(get_req(arid), 'after resume RID')
+    check("resume RID: the exact note; the request's own question cleared, its task still waits",
+          rc == 0 and err == f'taskctl: {arid} resumed\n' and r['attention'] is None and r['waiting'] is True
+          and r['tasks_waiting'] == 1, (err, r))
+    rc, out, err = tc('resume', arid)
+    check('resume again: idempotent, rc 0', rc == 0 and err == f'taskctl: {arid} resumed\n', (rc, err))
+    rc, out, err = tc('progress', a1, '40', 'got', 'the', 'token')
+    r = verify_request(get_req(arid), 'after progress on the waiting task')
+    check('progress on a waiting task clears its question', task_of(r, a1)['attention'] is None and r['waiting'] is False, r)
+    tc('ask', a1, 'One more thing?')
+    rc, out, err = tc('resume', a1)
+    t = get('/api/tasks/' + a1)
+    check('resume TID', rc == 0 and err == f'taskctl: {a1} resumed\n' and t['attention'] is None and t['status'] == 'running', (err, t))
+    tc('ask', arid, 'Ship it?')
+    tc('ask', a2, 'Also this?')
+    rc, out, err = tc('done', arid, 'answered')
+    r = verify_request(get_req(arid), 'after done on a waiting request')
+    check('closing the request clears its question and its tasks\'', r['attention'] is None and r['waiting'] is False
+          and all(t['attention'] is None for t in r['tasks']), r)
+    rc, out, err = tc('ask', a1, 'too late?')
+    check('ask on a closed task (strict): exit 1, 409', rc == 1 and '409' in err and 'already done' in err, (rc, err))
+    rc, out, err = tc('ask', arid, 'too late?', strict=False)
+    check('ask on a closed request (soft): exit 0, a warning with the hint', rc == 0 and 'taskctl: warning:' in err
+          and 'the request is closed' in err, (rc, err))
+    rc, out, err = tc('resume', a1)
+    check('resume on a closed task: idempotent, rc 0', rc == 0, (rc, err))
+
+    S.section('usage, changelog, api, flush')
+    code, usage_text, _ = api(URL, 'GET', '/api/usage', raw=True)
+    rc, out, err = tc('usage')
+    check("usage: the board's usage text on stdout, verbatim", rc == 0 and out == usage_text.decode() and err == '', (rc, err))
+    code, changelog, _ = api(URL, 'GET', '/api/changelog', raw=True)
+    rc, out, err = tc('changelog')
+    check("changelog: the board's changelog on stdout, newest first", rc == 0 and out == changelog.decode()
+          and out.startswith('## v2 — '), (rc, out[:80], err))
+    rc, out, err = tc('api', 'GET', '/api/health')
+    check('api GET /api/health: the JSON body on stdout', rc == 0 and json.loads(out)['version'] == '2'
+          and json.loads(out)['docs_version'] == docs_version(TASKS), (rc, out, err))
+    rc, out, err = tc('api', 'get', f'/api/requests/{arid}')
+    check('api: the method is case-insensitive, the body is the route\'s', rc == 0 and json.loads(out)['id'] == arid, (rc, err))
+    rc, out, err = tc('api', 'POST', f'/api/tasks/{t6}/progress', '{"message": "via api"}')
+    check('api POST with a JSON body: a 409 is printed and exits 1 (strict)', rc == 1 and json.loads(out)['status'] == 'done'
+          and '409' in err, (rc, out, err))
+    rc, out, err = tc('api', 'GET', '/api/requests/zzzzzz', strict=False)
+    check('api 404 (soft): the error body on stdout, a warning, exit 0', rc == 0
+          and json.loads(out) == {'error': "unknown request 'zzzzzz'"} and 'taskctl: warning:' in err and '404' in err, (rc, out, err))
+    rc, out, err = tc('api', 'PUT', '/api/settings', '{"settings": {"sound": {"volume": 0.4}}}')
+    check('api PUT: any method and route', rc == 0 and json.loads(out)['settings']['sound']['volume'] == 0.4, (rc, out, err))
+    tc('api', 'DELETE', '/api/settings')
+    rc, out, err = tc('flush')
+    check('flush with nothing queued: rc 0, says so', rc == 0 and out == '' and err == f'taskctl: nothing queued for {URL}\n', (rc, err))
+    rc, out, err = tc('ping')
+    check('ping with nothing queued: no queue note', rc == 0 and 'queued' not in err, err)
 
 
 def run_signals():
@@ -659,6 +761,10 @@ def served_files():
     check('served taskctl.py: BAKED_URL is the real base', baked == [f'BAKED_URL = "{URL}"'], baked)
     check('served taskctl.py: no other render tokens left', '{{' not in text.replace("BAKED_URL.startswith('{{')", ''),
           [line for line in text.splitlines() if '{{' in line])
+    check('served taskctl.py: BAKED_DOCS is the docs version, BAKED_API the API version',
+          [line for line in text.splitlines() if line.startswith(('BAKED_DOCS', 'BAKED_API'))]
+          == [f'BAKED_DOCS = "{docs_version(TASKS)}"', 'BAKED_API = "2"'] and hdrs.get('X-Tasks-Docs') == docs_version(TASKS),
+          [line for line in text.splitlines() if line.startswith('BAKED_')])
     code, wrapper, _ = api(URL, 'GET', '/api/skill/taskctl', raw=True)
     check('served wrapper is byte-identical (unrendered)', wrapper == WRAPPER.read_bytes())
     code, crafted, _ = api(URL, 'GET', '/api/skill/taskctl.py', headers={'Host': 'x";rm -rf /'}, raw=True)
@@ -672,8 +778,9 @@ def served_files():
     os.chmod(dl / 'taskctl.py', 0o755)
     rc, out, err = tc('ping', url=None, exe=dl / 'taskctl')
     check('downloaded taskctl pings its BAKED_URL', rc == 0 and out == URL + '\n' and 'ok' in err, (rc, out, err))
-    check('the repo taskctl.py keeps exactly one unrendered BAKED_URL line',
-          [line for line in TASKCTL_PY.read_text().splitlines() if line.startswith('BAKED_URL')] == ['BAKED_URL = "{{BASE_URL}}"'])
+    check('the repo taskctl.py keeps its three unrendered BAKED_ lines',
+          [line for line in TASKCTL_PY.read_text().splitlines() if line.startswith('BAKED_')]
+          == ['BAKED_URL = "{{BASE_URL}}"', 'BAKED_DOCS = "{{DOCS_VERSION}}"', 'BAKED_API = "{{VERSION}}"'])
 
 
 if __name__ == '__main__':

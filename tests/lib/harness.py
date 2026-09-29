@@ -5,17 +5,20 @@
     python3 tests/lib/harness.py free-port             (prints a free TCP port, for the shell suites)
 
 Every suite runs against throwaway state: a scratch server on a free port (never the real board's
-8765) with a temp --db and --pidfile, and a temp HOME / CLAUDE_CONFIG_DIR, all removed at exit.
+8765) with a temp --db, --pidfile and --config, a temp HOME / CLAUDE_CONFIG_DIR, and a temp taskctl
+offline queue (TASKS_SPOOL_DIR), all removed at exit.
 """
 from __future__ import annotations
 
 import atexit
+import hashlib
 import http.client
 import json
 import os
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -35,6 +38,8 @@ WRAPPER = TASKS / 'taskctl'
 TASKCTL_PY = TASKS / 'taskctl.py'
 FIXTURES = TESTS / 'fixtures'
 REAL_PORT = 8765   # the real board's default port; no test ever binds it
+# The agent instructions the board versions (X-Tasks-Docs, docs_version), in the contract's order.
+DOCS_FILES = ('skill/SKILL.md', 'templates/usage.md', 'templates/rule.md', 'templates/changelog.md', 'taskctl', 'taskctl.py')
 SKIP_EXIT = 77     # a suite that cannot run here (missing optional dependency) exits with this
 
 _TEMP_DIRS: list[Path] = []
@@ -89,6 +94,17 @@ def skip_suite(reason: str) -> None:
     sys.exit(SKIP_EXIT)
 
 
+def docs_version(root: Path = TASKS) -> str:
+    """The contract's docs_version of a tasks/ tree, computed independently of server.py."""
+    digest = hashlib.sha256()
+    for rel in DOCS_FILES:
+        digest.update(rel.encode() + b'\0')
+        path = Path(root) / rel
+        if path.is_file():
+            digest.update(path.read_bytes() + b'\0')
+    return digest.hexdigest()[:12]
+
+
 # ---------------------------------------------------------------- temp state
 
 def tempdir(prefix: str) -> Path:
@@ -106,10 +122,24 @@ def scratch_home(tmp: Path) -> Path:
     return home
 
 
+_SPOOL: list[Path] = []
+
+
+def spool_dir() -> Path:
+    """This process's scratch taskctl offline queue (TASKS_SPOOL_DIR in clean_env), made on first use."""
+    if not _SPOOL:
+        _SPOOL.append(tempdir('spool') / 'spool')
+    return _SPOOL[0]
+
+
 def clean_env(**extra) -> dict:
-    """os.environ without anything that points taskctl or the server somewhere else."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith('TASKS_') and k != 'CDPATH'}
+    """os.environ without anything that points taskctl or the server somewhere else. taskctl's offline
+    queue goes to a temp dir (TASKS_SPOOL_DIR), never the user's cache; pass TASKS_SPOOL_DIR=None to
+    drop it (then HOME, a temp one in every suite, decides)."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith('TASKS_') and k not in ('CDPATH', 'XDG_CACHE_HOME')}
     env['PYTHONDONTWRITEBYTECODE'] = '1'
+    env['TASKS_SPOOL_DIR'] = str(spool_dir())
     for key, value in extra.items():
         if value is None:
             env.pop(key, None)
@@ -246,10 +276,14 @@ def link_local() -> tuple[str, str] | None:
 
 
 def call(port: int, method: str, path: str, body=None, headers=None, raw: bytes | None = None,
-         host: str | None = None, addr: str = '127.0.0.1', timeout: float = 15):
+         host: str | None = None, addr: str = '127.0.0.1', timeout: float = 15, tls: bool = False):
     """One HTTP request with full control of Host and the body. Returns (status, headers, body):
-    headers lower-cased, body parsed JSON for application/json, else text."""
-    conn = http.client.HTTPConnection(addr, port, timeout=timeout)
+    headers lower-cased, body parsed JSON for application/json, else text. tls=True: HTTPS, without
+    verifying the (self-signed) certificate."""
+    if tls:
+        conn = http.client.HTTPSConnection(addr, port, timeout=timeout, context=ssl._create_unverified_context())
+    else:
+        conn = http.client.HTTPConnection(addr, port, timeout=timeout)
     hdrs = dict(headers or {})
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
     conn.putrequest(method, path, skip_host=host is not None, skip_accept_encoding=True)
@@ -284,6 +318,25 @@ def api(base: str, method: str, path: str, body=None, headers=None, raw: bool = 
     return code, (json.loads(payload) if payload else None), hdrs
 
 
+def self_signed_cert(tmp: Path):
+    """(cert, key, encrypted key) PEM files for localhost / 127.0.0.1, made with openssl; None when
+    openssl is not installed or cannot make them (the TLS checks are then skipped)."""
+    openssl = shutil.which('openssl')
+    if not openssl:
+        return None
+    cert, key, enc = tmp / 'cert.pem', tmp / 'key.pem', tmp / 'key-encrypted.pem'
+    base = [openssl, 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(key), '-out', str(cert),
+            '-days', '2', '-subj', '/CN=localhost']
+    for argv in (base + ['-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1'], base):  # -addext: OpenSSL 1.1.1+
+        if subprocess.run(argv, capture_output=True, timeout=60).returncode == 0:
+            break
+    else:
+        return None
+    made = subprocess.run([openssl, 'pkey', '-in', str(key), '-out', str(enc), '-aes-256-cbc', '-passout', 'pass:secret'],
+                          capture_output=True, timeout=60)
+    return cert, key, (enc if made.returncode == 0 else None)
+
+
 def wait_until(fn, timeout: float, interval: float = 0.2):
     """Polls fn until it returns something truthy or timeout passes; returns the last value."""
     deadline = time.monotonic() + timeout
@@ -305,7 +358,7 @@ class ScratchServer:
 
     def __init__(self, tmp: Path, *extra: str, script: Path = SERVER, port: int | None = None,
                  name: str = 'server', wrapper: Path | None = None, env: dict | None = None,
-                 fresh_db: bool = True):
+                 fresh_db: bool = True, own_config: bool = True):
         self.tmp = Path(tmp)
         self.extra = [str(x) for x in extra]
         self.script = Path(script)
@@ -316,6 +369,10 @@ class ScratchServer:
         self.db = self.tmp / f'{name}.db'
         self.pidfile = self.tmp / f'{name}.pid'
         self.log = self.tmp / f'{name}.log'
+        # A settings file of its own (the default, <db dir>/settings.json, is shared by every server in tmp);
+        # own_config=False leaves --config to the caller or the server's default.
+        given = any(x == '--config' or x.startswith('--config=') for x in self.extra)
+        self.config = self.tmp / f'{name}.settings.json' if own_config and not given else None
         self.proc: subprocess.Popen | None = None
         self.fresh_db = fresh_db
 
@@ -326,7 +383,7 @@ class ScratchServer:
     def argv(self) -> list[str]:
         return ([sys.executable] + ([str(self.wrapper)] if self.wrapper else []) +
                 [str(self.script), '--port', str(self.port), '--db', str(self.db), '--pidfile', str(self.pidfile),
-                 *self.extra])
+                 *(['--config', str(self.config)] if self.config else []), *self.extra])
 
     def start(self, wait: bool = True) -> 'ScratchServer':
         if self.fresh_db:
@@ -353,6 +410,13 @@ class ScratchServer:
 
     def call(self, *args, **kw):
         return call(self.port, *args, **kw)
+
+    def events(self, since=0, limit=1000):
+        """GET /api/events?since=N (since=None: the baseline)."""
+        query = '' if since is None else f'?since={since}&limit={limit}'
+        status, _, body = self.call('GET', '/api/events' + query)
+        assert status == 200, (status, body)
+        return body
 
     def api(self, method, path, body=None, **kw):
         return api(self.url, method, path, body, **kw)

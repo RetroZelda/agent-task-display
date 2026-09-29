@@ -44,20 +44,33 @@ check "one rule block in CLAUDE.md" test "$(grep -c '<!-- task-status:begin -->'
 check "the rule links to the board" grep -qF "http://127.0.0.1:$P/r/<rid>" "$CC/CLAUDE.md"
 check "the installed taskctl's ping is shown" has "$ERR" "taskctl: ok: board at http://127.0.0.1:$P"
 check "install-rule reported" has "$ERR" "taskctl: rule installed in $CC/CLAUDE.md"
-# Comma-separated so the block pastes into a JSON array; the last one (ping) has no comma.
-for sub in new add start progress done fail show list; do
-    check "allow line for $sub" grep -qxF "\"Bash($D/taskctl $sub *)\"," <<< "$OUT"
-done
-check "allow line for ping (last, no comma)" grep -qxF "\"Bash($D/taskctl ping *)\"" <<< "$OUT"
-check "the allow block pastes as a JSON array of 9" python3 -c '
+# The recommended rules: one JSON object that pastes into settings.json as it is, allowing every
+# taskctl call and asking for `taskctl run` and `taskctl update`, also behind a global option such as
+# --url (an ask rule wins over an allow rule).
+ASK_RULES='["run *", "--* run *", "update*", "--* update*", "install-rule*", "--* install-rule*"]'
+
+perm_json() { # the {...} block of the output, one object
+    python3 -c '
+import json, re, sys
+m = re.search(r"^\{\n.*?^\}$", sys.argv[1], re.M | re.S)
+print(json.dumps(json.loads(m.group(0))) if m else "")' "$1"
+}
+PERMS="$(perm_json "$OUT")"
+check "the permission block is valid JSON" test -n "$PERMS"
+check "allow: exactly one rule, for every taskctl call" python3 -c '
 import json, sys
-v = json.loads("[" + "".join(l for l in sys.argv[1].splitlines() if l.startswith("\"Bash(")) + "]")
-sys.exit(len(v) != 9)' "$OUT"
-check "no allow line for run" bash -c '! grep -q "taskctl run" <<< "$1"' _ "$OUT"
-check "the run exclusion is explained" has "$OUT" "'run' is deliberately excluded"
+p = json.loads(sys.argv[1])["permissions"]
+sys.exit(p["allow"] != ["Bash(%s/taskctl *)" % sys.argv[2]])' "$PERMS" "$D"
+check "ask: run and update, each also behind a global option" python3 -c '
+import json, sys
+p = json.loads(sys.argv[1])["permissions"]
+sys.exit(p["ask"] != ["Bash(%s/taskctl %s)" % (sys.argv[2], r) for r in json.loads(sys.argv[3])] or set(p) != {"allow", "ask"})' \
+    "$PERMS" "$D" "$ASK_RULES"
+check "the ask rules are explained (they win over the allow rule)" has "$OUT" "the ask rules win over it"
 check "banner: skill installed" has "$OUT" "  skill       installed in $D (reports to http://127.0.0.1:$P)"
 check "banner: rule present" has "$OUT" "  rule        present in $CC/CLAUDE.md"
-check "the allow rules come last" bash -c 'tail -3 <<< "$1" | grep -q "deliberately excluded"' _ "$OUT"
+check "the permission rules come last" bash -c 'tail -2 <<< "$1" | grep -q "reload-skills"' _ "$OUT"
+check "the rule block in CLAUDE.md asks for taskctl ask / resume" grep -qF "taskctl ask <rid>" "$CC/CLAUDE.md"
 check "no settings.json written" test ! -e "$CC/settings.json"
 check "no temp files left" test -z "$(find "$D" -name '.*' -type f)"
 check "skills/synced untouched" test "$(snapshot)" = "$SYNC_BEFORE"
@@ -118,7 +131,12 @@ run env -u CLAUDE_CONFIG_DIR HOME="$H" "$T" --port "$P" --install-skill
 check "exit 0" [ "$RC" = 0 ]
 check "installed under HOME" test -x "$H/.claude/skills/task-status/taskctl"
 check "rule under HOME" grep -q '<!-- task-status:begin -->' "$H/.claude/CLAUDE.md"
-check "allow lines use the HOME path" grep -qxF "\"Bash($H/.claude/skills/task-status/taskctl new *)\"," <<< "$OUT"
+check "the permission rules use the HOME path" python3 -c '
+import json, sys
+p = json.loads(sys.argv[1])["permissions"]
+sys.exit(p != {"allow": ["Bash(%s/taskctl *)" % sys.argv[2]],
+              "ask": ["Bash(%s/taskctl %s)" % (sys.argv[2], r) for r in json.loads(sys.argv[3])]})' \
+    "$(perm_json "$OUT")" "$H/.claude/skills/task-status" "$ASK_RULES"
 
 section "a relative CLAUDE_CONFIG_DIR resolves against the caller's cwd"
 mkdir -p "$TMP/cwd"

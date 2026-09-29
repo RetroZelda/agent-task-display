@@ -7,8 +7,9 @@
 #   has "$TEXT" "needle"            substring test (hasnt: the opposite)
 #   finish                          prints the RESULT line and exits 0/1
 #
-# Everything lives in $TMP (removed at exit, with any process whose command line mentions it), HOME
-# and CLAUDE_CONFIG_DIR point into it, and every TASKS_* variable is unset.
+# Everything lives in $TMP (removed at exit, with any process whose command line mentions it), HOME,
+# CLAUDE_CONFIG_DIR and taskctl's offline queue (TASKS_SPOOL_DIR) point into it, and every other
+# TASKS_* variable is unset.
 
 set -uo pipefail
 
@@ -24,7 +25,10 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/tasks-test-$SUITE.XXXXXX")"
 export HOME="$TMP/home"
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
 mkdir -p "$CLAUDE_CONFIG_DIR"
-unset TASKS_URL TASKS_HOST TASKS_PORT TASKS_DB TASKS_PUBLIC_URL TASKS_STRICT TASKS_TIMEOUT CDPATH
+unset TASKS_URL TASKS_HOST TASKS_PORT TASKS_DB TASKS_PUBLIC_URL TASKS_STRICT TASKS_TIMEOUT CDPATH \
+    TASKS_CONFIG TASKS_TLS_PORT TASKS_TLS_CERT TASKS_TLS_KEY TASKS_NO_UPDATE XDG_CACHE_HOME
+while read -r name; do unset "$name"; done < <(compgen -e | grep '^TASKS_')
+export TASKS_SPOOL_DIR="$TMP/spool"
 export PYTHONDONTWRITEBYTECODE=1
 
 PASS=0

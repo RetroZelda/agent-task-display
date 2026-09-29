@@ -4,6 +4,8 @@
 //   3. every number, status and title on the page matches a fresh read of the API
 //   4. nothing agent-supplied became markup (no <img>, no alert, no JS error)
 //   5. the running-time ticker advances
+//   6. what waits for input (API waiting / attention) is marked (data-waiting, the "needs input" badge,
+//      the question), sorts first in Active and leads the summary
 // Problems go into result.problems; test_ui.py fails on any.
 __t.run(async () => {
     const { sleep, $ } = __t;
@@ -63,8 +65,15 @@ __t.run(async () => {
     const m = location.pathname.match(/^\/r\/([^/]+)/);
     const floorPct = (p) => Math.floor(p) + '%';
     const checks = { rows: 0 };
+    const waitingList = (await (await fetch('/api/events')).json()).waiting;
+    const askText = (el) => { const a = el.querySelector(':scope > .ask'); return a.hidden ? null : a.querySelector('[data-ref=askQ]').textContent; };
     if (!m) {
         const d = await (await fetch('/api/requests')).json();
+        const active = [...$('list-active').children].map((e) => e.getAttribute('href').slice(3));
+        const firstPlain = active.findIndex((id) => !d.requests.find((r) => r.id === id).waiting);
+        if (firstPlain >= 0 && active.slice(firstPlain).some((id) => d.requests.find((r) => r.id === id).waiting)) bad('a waiting request sorts after one that is not: ' + active.join(','));
+        out.activeOrder = active;
+        out.waitingRows = [];
         for (const r of d.requests) {
             const row = document.querySelector('a.row[href="/r/' + r.id + '"]');
             if (!row) { bad('missing row ' + r.id); continue; }
@@ -81,9 +90,17 @@ __t.run(async () => {
             if (!(r.status === 'running' && r.tasks_total === 0) && fw !== r.percent + '%') bad(r.id + ' bar ' + fw + ' want ' + r.percent + '%');
             if ((r.tasks_failed ? r.tasks_failed + ' failed' : '') !== (row.querySelector('[data-ref=failed]').hidden ? '' : q('failed'))) bad(r.id + ' failed count');
             if (!row.dataset.status || !document.getElementById(r.status === 'running' ? 'list-active' : 'list-finished').contains(row)) bad(r.id + ' in the wrong group');
+            if ((row.dataset.waiting === 'yes') !== r.waiting) bad(r.id + ' data-waiting ' + row.dataset.waiting + ' but waiting ' + r.waiting);
+            const badge = row.querySelector('.badge').textContent;
+            if (r.waiting && badge !== 'needs input') bad(r.id + ' waits, but its badge says ' + badge);
+            const wantAsk = !r.waiting ? null : r.attention ? r.attention.message
+                : (waitingList.find((w) => w.request_id === r.id && w.task_id) || {}).message;
+            if (askText(row) !== wantAsk) bad(r.id + ' question "' + askText(row) + '" want "' + wantAsk + '"');
+            if (r.waiting) out.waitingRows.push({ id: r.id, ask: askText(row), more: row.querySelector('[data-ref=askMore]').textContent });
         }
-        const c = d.counts, s = $('summary').textContent;
-        const wantS = [c.running && c.running + ' running', c.stale && c.stale + ' stale', c.done && c.done + ' done', c.failed && c.failed + ' failed'].filter(Boolean).join('');
+        const c = d.counts, s = [...$('summary').children].filter((e) => !e.hidden).map((e) => e.textContent).join('');
+        const wantS = [c.waiting && c.waiting + ' waiting for you', c.running && c.running + ' running', c.stale && c.stale + ' stale',
+                       c.done && c.done + ' done', c.failed && c.failed + ' failed'].filter(Boolean).join('');
         if (s !== wantS) bad('summary "' + s + '" want "' + wantS + '"');
         out.summary = s;
         out.counts = c;
@@ -107,7 +124,12 @@ __t.run(async () => {
             const hst = d.status === 'running' && d.stale ? 'stale' : d.status;
             if (head.dataset.status !== hst) bad('header status ' + head.dataset.status + ' want ' + hst);
             out.header = { tasks: q('tasks'), pct: q('pct'), cancelled: q('cancelled'), time: q('time'), eta: q('eta'), origin: q('origin'),
-                           message: q('message'), markDoneHidden: head.querySelector('[data-ref=markDone]').hidden };
+                           message: q('message'), markDoneHidden: head.querySelector('[data-ref=markDone]').hidden,
+                           waiting: head.dataset.waiting || null, ask: askText(head), badge: head.querySelector('.badge').textContent };
+            const wantHead = !d.waiting ? undefined : d.attention ? 'request' : 'task';
+            if (head.dataset.waiting !== wantHead) bad('header data-waiting ' + head.dataset.waiting + ' want ' + wantHead);
+            if (askText(head) !== (d.attention ? d.attention.message : null)) bad('header question "' + askText(head) + '"');
+            out.waitingTasks = [];
             for (const t of d.tasks) {
                 const row = document.getElementById(t.id);
                 if (!row) { bad('missing task row ' + t.id); continue; }
@@ -120,6 +142,11 @@ __t.run(async () => {
                 if (tq('title') !== t.title) bad(t.id + ' title differs');
                 if ((t.message || '') !== tq('msg')) bad(t.id + ' message differs');
                 if (t.start_inferred && !/~/.test(tq('time'))) bad(t.id + ' start_inferred without ~');
+                const waits = !!t.attention && t.status === 'running';
+                if ((row.dataset.waiting === 'yes') !== waits) bad(t.id + ' data-waiting ' + row.dataset.waiting + ' but attention ' + JSON.stringify(t.attention));
+                if (askText(row) !== (waits ? t.attention.message : null)) bad(t.id + ' question "' + askText(row) + '"');
+                if (waits && row.querySelector('.badge').textContent !== 'needs input') bad(t.id + ' waits, but its badge says ' + row.querySelector('.badge').textContent);
+                if (waits) out.waitingTasks.push({ id: t.id, ask: askText(row) });
             }
             out.taskEmpty = !$('task-empty').hidden;
             out.target = [...document.querySelectorAll('.row.target')].map((e) => e.id);

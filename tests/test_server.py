@@ -17,8 +17,8 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True  # no __pycache__ in the checkout, even when run without run_all.sh
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
-from harness import (FIXTURES, SERVER, TASKS, ScratchServer, Suite, free_port, scratch_home,  # noqa: E402
-                     tempdir, wait_until)
+from harness import (FIXTURES, SERVER, TASKS, ScratchServer, Suite, docs_version, free_port,  # noqa: E402
+                     scratch_home, tempdir, wait_until)
 
 S = Suite('server')
 check = S.check
@@ -26,14 +26,16 @@ TMP = tempdir('server')
 scratch_home(TMP)
 
 TASK_KEYS = ['id', 'request_id', 'seq', 'title', 'status', 'percent', 'message', 'eta_at', 'eta_remaining',
-             'created_at', 'started_at', 'start_inferred', 'updated_at', 'completed_at', 'elapsed', 'stale', 'url']
+             'created_at', 'started_at', 'start_inferred', 'updated_at', 'completed_at', 'elapsed', 'stale', 'url',
+             'attention']
 REQ_KEYS = ['id', 'title', 'origin', 'status', 'message', 'created_at', 'updated_at', 'completed_at', 'elapsed',
             'percent', 'tasks_total', 'tasks_done', 'tasks_failed', 'tasks_running', 'tasks_pending',
-            'tasks_cancelled', 'current', 'eta_at', 'stale', 'url']
+            'tasks_cancelled', 'current', 'eta_at', 'stale', 'url', 'attention', 'waiting', 'tasks_waiting']
 CRAFTED = 'x";rm -rf'
 FILE_ROUTES = (('/', 'static/index.html', 'text/html,*/*'), ('/', 'templates/usage.md', '*/*'),
                ('/api', 'templates/usage.md', None), ('/api/usage', 'templates/usage.md', None),
                ('/api/rule', 'templates/rule.md', None), ('/r/abc', 'static/index.html', None),
+               ('/api/changelog', 'templates/changelog.md', None),
                ('/api/skill/SKILL.md', 'skill/SKILL.md', None), ('/api/skill/taskctl', 'taskctl', None),
                ('/api/skill/taskctl.py', 'taskctl.py', None))
 
@@ -58,8 +60,9 @@ def phase_api():
     try:
         check('pidfile holds pid', srv.pidfile.read_text().strip() == str(srv.proc.pid))
         s, h, b = call('GET', '/api/health')
-        check('health', s == 200 and b['ok'] is True and b['service'] == 'tasks' and b['version'] == '1'
-              and b['pid'] == srv.proc.pid and 'now' in b and 'started_at' in b and b['requests_running'] == 0, b)
+        check('health', s == 200 and b['ok'] is True and b['service'] == 'tasks' and b['version'] == '2'
+              and b['pid'] == srv.proc.pid and 'now' in b and 'started_at' in b and b['requests_running'] == 0
+              and b['docs_version'] == docs_version() and b['tls_port'] is None and b['config_path'] == str(srv.config), b)
         check('json headers', h.get('x-content-type-options') == 'nosniff' and h.get('cache-control') == 'no-store'
               and 'content-length' in h, h)
         s, h, b = call('HEAD', '/api/health')
@@ -82,7 +85,10 @@ def phase_api():
 
         S.section('create + validation')
         r = new_request('  Build\t\tthe\nthing\x00 now ', tasks=['a', ' b ', 'c'], origin='host:repo', precent=4)
-        check('request keys, in order', list(r)[:len(REQ_KEYS)] == REQ_KEYS and 'tasks' in r and 'now' in r, list(r))
+        check('request keys, in order', list(r)[:len(REQ_KEYS)] == REQ_KEYS and 'tasks' in r and 'now' in r
+              and r['existing'] is False, list(r))
+        check('a new request waits for nothing', r['attention'] is None and r['waiting'] is False and r['tasks_waiting'] == 0
+              and all(t['attention'] is None for t in r['tasks']), r)
         check('title cleaned', r['title'] == 'Build the thing now', repr(r['title']))
         check('create aggregates', r['origin'] == 'host:repo' and r['status'] == 'running' and r['tasks_total'] == 3
               and r['tasks_pending'] == 3, r)
@@ -359,7 +365,8 @@ def phase_api():
             dbcounts = dict(db.execute('select status, count(*) from requests group by status').fetchall())
         check('counts over the whole table', b['counts']['running'] == dbcounts.get('running', 0)
               and b['counts']['done'] == dbcounts.get('done', 0) and b['counts']['failed'] == dbcounts.get('failed', 0)
-              and 'stale' in b['counts'], (b['counts'], dbcounts))
+              and list(b['counts']) == ['running', 'stale', 'done', 'failed', 'waiting'] and b['counts']['waiting'] == 0,
+              (b['counts'], dbcounts))
         s, _, b = call('GET', '/api/requests?status=done&limit=1')
         check('status filter + limit', s == 200 and len(b['requests']) == 1 and b['requests'][0]['status'] == 'done'
               and b['counts']['running'] == dbcounts['running'], b['requests'])
@@ -453,13 +460,17 @@ def phase_templates():
         s, h, b = call('GET', '/', headers={'Accept': '*/*'})
         check('GET / otherwise: usage text, no-store, Vary', s == 200 and h['content-type'] == 'text/plain; charset=utf-8'
               and h.get('vary') == 'Accept' and h.get('cache-control') == 'no-store' and f'curl http://127.0.0.1:{P}/api/usage' in b, b)
-        check('render is a literal replace of the three tokens only', f'Dashboard: http://127.0.0.1:{P}\n' in b and 'Version 1' in b
-              and '{{UNKNOWN}}' in b and '{"json": {"braces": 1}}' in b and '${SHELL}' in b, b)
+        check('render is a literal replace of the four tokens only', f'Dashboard: http://127.0.0.1:{P}\n' in b and 'Version 2\n' in b
+              and f'Docs {docs_version(tree)}\n' in b and '{{UNKNOWN}}' in b and '{"json": {"braces": 1}}' in b and '${SHELL}' in b, b)
         for path in ('/api', '/api/usage', '/api/'):
             s, h, b2 = call('GET', path)
             check(f'usage at {path}', s == 200 and b2 == b, s)
         s, h, b = call('GET', '/api/rule')
         check('rule rendered', s == 200 and b.startswith('<!-- task-status:begin -->') and f'http://127.0.0.1:{P}' in b, b)
+        s, h, b = call('GET', '/api/changelog')
+        check('changelog rendered, text/plain, no-store', s == 200 and h['content-type'] == 'text/plain; charset=utf-8'
+              and h.get('cache-control') == 'no-store'
+              and b == f'## v2 — 2026-09-28\n- served by http://127.0.0.1:{P} (API 2, docs {docs_version(tree)})\n', b)
         s, h, b = call('GET', '/api/skill/SKILL.md')
         check('SKILL.md served unrendered', s == 200 and '{{BASE_URL}}' in b and h['content-type'] == 'text/plain; charset=utf-8', b)
         s, h, b = call('GET', '/api/skill/taskctl')

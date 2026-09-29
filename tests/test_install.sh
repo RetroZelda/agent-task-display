@@ -37,9 +37,35 @@ usage="$("${CURL[@]}" "$LOCAL/api/usage")"
 n_curl="$(grep -o 'curl -f\?sS ' <<< "$usage" | wc -l)"
 n_noproxy="$(grep -o "curl -f\?sS --connect-timeout 5 --noproxy '\*' " <<< "$usage" | wc -l)"
 check "every curl in it has --connect-timeout 5 --noproxy '*' ($n_noproxy of $n_curl)" [ "$n_curl" = "$n_noproxy" ]
-check "all 8 curls are there (3 install + 5 examples)" [ "$n_noproxy" = 8 ]
+check "all 10 curls are there (3 install + 7 examples)" [ "$n_noproxy" = 10 ]
 check "it mentions the IPv6 link-local / IP form note" has "$usage" "IPv6 link-local"
 check "it names the board by the address the agent used" has "$usage" "$LOCAL is a task-status board"
+for word in /api/events /api/settings /api/changelog X-Tasks-Replay X-Tasks-Docs attention tls_port; do
+    check "it documents $word" has "$usage" "$word"
+done
+
+section "the curl examples, run in order against the board (k3m9qa -> the created id)"
+mapfile -t examples < <(grep -E "^    curl -f?sS --connect-timeout 5 --noproxy '\*' (-X [A-Z]+ )?$LOCAL/api/(requests|tasks)" <<< "$usage")
+check "7 examples found" [ "${#examples[@]}" = 7 ]
+RID=""
+i=0
+for line in "${examples[@]}"; do
+    i=$((i + 1))
+    cmd="${line#    }"
+    [ -n "$RID" ] && cmd="${cmd//k3m9qa/$RID}"
+    out="$(bash -c "$cmd" 2>&1)"
+    rc=$?
+    status="$(python3 -c 'import json, sys; b = json.loads(sys.argv[1]); print(b.get("attention") and "waiting" or b["status"])' "$out" 2>/dev/null)"
+    check "example $i exits 0 with a JSON reply ($status): ${line:47:60}" test "$rc" = 0 -a -n "$status"
+    [ -n "$RID" ] || RID="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["id"])' "$out" 2>/dev/null)"
+    case "$i" in
+        2) check "example 2 started the task" test "$status" = running ;;
+        3) check "example 3 set the request's question" test "$status" = waiting ;;
+        4) check "example 4 cleared it" test "$status" = running ;;
+        5) check "example 5 closed the task done" test "$status" = done ;;
+        6|7) check "example $i: the request is failed" test "$status" = failed ;;
+    esac
+done
 
 install_cmd_of() { awk '/^    mkdir -p ~\/.claude\/skills\/task-status && curl/ { sub(/^    /, ""); print; exit }' <<< "$1"; }
 rule_cmd_of() { awk '/^    ~\/.claude\/skills\/task-status\/taskctl install-rule$/ { sub(/^    /, ""); print; exit }' <<< "$1"; }

@@ -1,7 +1,9 @@
 #! /bin/bash
 # tasks.sh lifecycle: arguments, --bg / --stop / --status / foreground, the banner, stale pidfiles, a
-# busy port, start failures, relative paths and env, the LAN/firewall paths (fake ufw, fake ip) and
-# the SIGKILL path. Runs a copy of the checkout in $TMP on free ports; never touches the real one.
+# busy port, start failures, relative paths and env, the LAN/firewall paths (fake ufw, fake ip), the
+# settings file and HTTPS options (--config, --tls-*; a self-signed certificate when openssl is
+# installed) and the SIGKILL path. Runs a copy of the checkout in $TMP on free ports; never touches
+# the real one.
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib/common.sh"
 
 command -v curl >/dev/null 2>&1 || skip_suite "curl not installed (tasks.sh needs it)"
@@ -22,6 +24,7 @@ make_root "$R"
 T="$R/tasks.sh"
 P="$(free_port)"
 Q="$(free_port)"
+P2="$(free_port)"
 DB="$TMP/launch.db"
 PIDF="$R/tasks/data/server-$P.pid"
 HN="$HOSTNAME"
@@ -47,7 +50,10 @@ check "--help exits 0 whatever else is given" [ "$RC" = 0 ]
 # One case per entry, arguments separated by "|".
 for case in "--port|0" "--port|65536" "--port|123456" "--port|abc" "--port" "--port|--bg" "--port=" "--bogus" \
             "positional" "--bg|--stop" "--status|--install-skill" "--port|$P|--port|$Q" "--port|$P|--port=$Q" \
-            "--public-url|ftp://x" '--public-url|http://x"y' "--public-url|notaurl" "--db|$TMP" "--host=" "--host|a b"; do
+            "--public-url|ftp://x" '--public-url|http://x"y' "--public-url|notaurl" "--db|$TMP" "--host=" "--host|a b" \
+            "--config" "--config|$TMP" "--config|a|--config|b" "--tls-port|$Q" "--tls-cert|x.pem" "--tls-port|$Q|--tls-key|k.pem" \
+            "--tls-port|abc|--tls-cert|c|--tls-key|k" "--tls-port|0|--tls-cert|c|--tls-key|k" "--port|$P|--tls-port|$P|--tls-cert|c|--tls-key|k" \
+            "--tls-port"; do
     IFS='|' read -r -a args <<< "$case"
     run "$T" "${args[@]}"
     if [ "$RC" = 1 ] && has "$ERR" "error:" && [ -z "$OUT" ]; then
@@ -60,6 +66,16 @@ run "$T" --host '' --status
 check "rejected: --host ''" bash -c '[ "$1" = 1 ] && [[ $2 == *error:* ]]' _ "$RC" "$ERR"
 run env TASKS_PORT=99999 "$T" --status
 check "an invalid TASKS_PORT is named in the error" bash -c '[ "$1" = 1 ] && [[ $2 == *TASKS_PORT* ]]' _ "$RC" "$ERR"
+run "$T" --port "$P" --tls-port "$Q" --status
+check "--tls-port alone: the error names what is missing" has "$ERR" "needs --tls-port, --tls-cert and --tls-key together; missing: --tls-cert --tls-key"
+run env TASKS_TLS_KEY=k.pem "$T" --port "$P" --status
+check "TASKS_TLS_KEY alone: refused too, with the env names" bash -c '[ "$1" = 1 ] && [[ $2 == *"missing: --tls-port --tls-cert"* && $2 == *TASKS_TLS_PORT* ]]' _ "$RC" "$ERR"
+run env TASKS_TLS_PORT=70000 TASKS_TLS_CERT=c TASKS_TLS_KEY=k "$T" --port "$P" --status
+check "an invalid TASKS_TLS_PORT is named in the error" bash -c '[ "$1" = 1 ] && [[ $2 == *"TASKS_TLS_PORT must be a port number"* ]]' _ "$RC" "$ERR"
+run "$T" --port "$P" --tls-port "$P" --tls-cert c --tls-key k --status
+check "--tls-port equal to --port: refused" has "$ERR" "--tls-port must differ from the http port ($P)"
+run "$T" --port "$P" --tls-port "$Q" --tls-cert "$TMP/nope.pem" --tls-key "$TMP/nope.key" --stop
+check "missing certificate files do not stop --stop (checked only when a server starts)" bash -c '[ "$1" = 0 ] && [[ $2 == *"not running on port"* ]]' _ "$RC" "$OUT"
 run "$T" --port="$P" --db="$DB" --status
 check "--x=v form accepted (status exits 3 while down)" [ "$RC" = 3 ]
 
@@ -91,7 +107,7 @@ check "health answers" curl -fsS --noproxy '*' --max-time 2 -o /dev/null "http:/
 check "banner dashboard url" has "$OUT" "  dashboard   http://127.0.0.1:$P/"
 check "banner LAN line: blocked" has "$OUT" "  LAN         http://$FAKE_LAN_IP:$P/  (blocked by ufw, see below)"
 check "banner hostname line: IPv6 blocked" has "$OUT" "  hostname    http://$HN:$P/  (IPv6 blocked by ufw, see below)"
-check "banner health line" has "$OUT" "  health      ok, version 1, up "
+check "banner health line" has "$OUT" "  health      ok, version 2, up "
 check "banner database" has "$OUT" "  database    $DB"
 check "banner log" has "$OUT" "  log         $R/.logs/tasks_server.log"
 check "banner skill missing, with the fix" has "$OUT" "  skill       missing -> $T --install-skill --port $P"
@@ -116,7 +132,7 @@ check "--bg with a different --db: banner shows the running db" has "$OUT" "  da
 run "$T" --port "$P" --status
 check "--status running exits 0" [ "$RC" = 0 ]
 check "--status running headline" has "$OUT" "tasks board: running (pid $PID1, port $P)"
-check "--status health" has "$OUT" "  health      ok, version 1"
+check "--status health" has "$OUT" "  health      ok, version 2"
 check "--status shows the running db (from its command line)" has "$OUT" "  database    $DB"
 check "--status shows the ufw box" has "$OUT" "sudo ufw allow from $FAKE_LAN_NET to any port $P proto tcp"
 run env TASKS_PORT="$P" "$T" --status
@@ -291,6 +307,73 @@ check "fg: SIGINT run logged its shutdown" has "$ERR" "shutting down"
 check "fg: pidfile removed after SIGINT" test ! -e "$PIDF"
 check "sudo was never invoked" test ! -e "$TMP/sudo.log"
 
+section "the settings file (--config, TASKS_CONFIG) in the banner"
+run "$T" --port "$P" --db "$DB" --bg
+check "no --config: the banner names <db dir>/settings.json, not created yet" \
+    has "$OUT" "  settings    $TMP/settings.json (not created yet: the defaults apply until someone saves the settings)"
+check "no --config passed to the server" hasnt "$(tr '\0' ' ' < "/proc/$(cat "$PIDF")/cmdline")" "--config"
+check "no https: the off line, with the reason" has "$OUT" "  https       off (browsers on other machines need it to show notifications; see --help)"
+"$T" --port "$P" --stop >/dev/null
+mkdir -p "$TMP/cwd"
+( cd "$TMP/cwd" && "$T" --port "$P" --db "$DB" --config conf/./s.json --bg >"$TMP/out.txt" 2>&1 )
+CMD="$(tr '\0' ' ' < "/proc/$(cat "$PIDF" 2>/dev/null)/cmdline" 2>/dev/null)"
+check "a relative --config resolves against the caller's cwd" has "$CMD" "--config $TMP/cwd/conf/s.json"
+check "the banner names it (from the server's health)" grep -qF "  settings    $TMP/cwd/conf/s.json (not created yet" "$TMP/out.txt"
+curl -fsS --noproxy '*' -X PUT -d '{"settings": {"sound": {"volume": 0.3}}}' "http://127.0.0.1:$P/api/settings" >/dev/null
+run "$T" --port "$P" --status
+check "a saved settings file: the plain path" grep -qx "  settings    $TMP/cwd/conf/s.json" <<< "$OUT"
+echo '{broken' > "$TMP/cwd/conf/s.json"
+run "$T" --port "$P" --status
+check "a broken settings file: the board's error" has "$OUT" "  settings    $TMP/cwd/conf/s.json (not usable, so the defaults apply: invalid JSON"
+run "$T" --port "$P" --config "$TMP/other.json" --bg
+check "--bg with a different --config: a note names the running one" has "$ERR" "--config $TMP/cwd/conf/s.json"
+"$T" --port "$P" --stop >/dev/null
+TASKS_CONFIG=envcfg.json "$T" --port "$P" --db "$DB" --bg >/dev/null 2>&1
+CMD="$(tr '\0' ' ' < "/proc/$(cat "$PIDF" 2>/dev/null)/cmdline" 2>/dev/null)"
+check "TASKS_CONFIG passed, made absolute" has "$CMD" "--config $TMP/envcfg.json"
+"$T" --port "$P" --stop >/dev/null
+
+section "the HTTPS listener (--tls-port, --tls-cert, --tls-key), with a self-signed certificate"
+if command -v openssl >/dev/null 2>&1 && openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost \
+        -keyout "$TMP/key.pem" -out "$TMP/cert.pem" >/dev/null 2>&1; then
+    run "$T" --port "$P" --db "$DB" --tls-port "$Q" --tls-cert "$TMP/missing.pem" --tls-key "$TMP/key.pem" --bg
+    check "a missing certificate: exit 1, the error names it, nothing started" bash -c '[ "$1" = 1 ] && [[ $2 == *"--tls-cert: cannot read the certificate $3/missing.pem"* ]]' _ "$RC" "$ERR" "$TMP"
+    check "...and nothing listens" port_free "$P"
+    run "$T" --port "$P" --db "$DB" --tls-port "$Q" --tls-cert "$TMP/cert.pem" --tls-key "$TMP/missing.key" --bg
+    check "a missing key: exit 1, the error names it" has "$ERR" "--tls-key: cannot read the private key $TMP/missing.key"
+    ( cd "$TMP" && "$T" --port "$P" --db "$DB" --tls-port "$Q" --tls-cert cert.pem --tls-key ./key.pem --bg >"$TMP/out.txt" 2>&1 )
+    CMD="$(tr '\0' ' ' < "/proc/$(cat "$PIDF" 2>/dev/null)/cmdline" 2>/dev/null)"
+    check "the TLS options reach the server, the paths absolute" has "$CMD" "--tls-port $Q --tls-cert $TMP/cert.pem --tls-key $TMP/key.pem"
+    check "the banner: the https line on the LAN address, blocked by ufw" grep -qF "  https       https://$FAKE_LAN_IP:$Q/  (blocked by ufw, see below)" "$TMP/out.txt"
+    check "the ufw box has a rule for the https port too" grep -qF "sudo ufw allow from $FAKE_LAN_NET to any port $Q proto tcp" "$TMP/out.txt"
+    check "the board answers over https" curl -fsSk --noproxy '*' --max-time 5 -o /dev/null "https://127.0.0.1:$Q/api/health"
+    H="$(curl -fsS --noproxy '*' --max-time 5 "http://127.0.0.1:$P/api/health")"
+    check "health says tls_port $Q" has "$H" "\"tls_port\": $Q"
+    U="$(curl -fsSk --noproxy '*' --max-time 5 "https://127.0.0.1:$Q/api/usage")"
+    check "usage over https names the http base for agents" has "$U" "http://127.0.0.1:$P is a task-status board"
+    run "$T" --port "$P" --status
+    check "--status: the https line" has "$OUT" "  https       https://$FAKE_LAN_IP:$Q/  (blocked by ufw, see below)"
+    run "$T" --port "$P" --tls-port "$P2" --tls-cert "$TMP/cert.pem" --tls-key "$TMP/key.pem" --bg
+    check "--bg with another --tls-port: a note names the running one" has "$ERR" "uses --tls-port $Q, not $P2"
+    "$T" --port "$P" --stop >/dev/null
+    check "--stop closes the https port too" port_free "$Q"
+    fake_ufw "-A ufw-user-input -p tcp --dport $P -j ACCEPT
+-A ufw-user-input -p tcp --dport $Q -j ACCEPT" "$V6_OTHER"
+    run env TASKS_TLS_PORT="$Q" TASKS_TLS_CERT="$TMP/cert.pem" TASKS_TLS_KEY="$TMP/key.pem" "$T" --port "$P" --db "$DB" --bg
+    check "TASKS_TLS_* start it; ufw open for both ports: a plain https line" grep -qx "  https       https://$FAKE_LAN_IP:$Q/" <<< "$OUT"
+    check "...and no ufw rule for the https port" hasnt "$OUT" "to any port $Q proto tcp"
+    "$T" --port "$P" --stop >/dev/null
+    fake_ufw "$V4_OTHER" "$V6_OTHER"
+    run "$T" --port "$P" --db "$DB" --host 127.0.0.1 --tls-port "$Q" --tls-cert "$TMP/cert.pem" --tls-key "$TMP/key.pem" --bg
+    check "loopback only: https on 127.0.0.1" has "$OUT" "  https       https://127.0.0.1:$Q/"
+    "$T" --port "$P" --stop >/dev/null
+    run "$T" --port "$P" --db "$DB" --host 127.0.0.1 --bg
+    check "loopback only, no https: no https line at all" hasnt "$OUT" "  https"
+    "$T" --port "$P" --stop >/dev/null
+else
+    skip "the HTTPS listener cases (openssl not installed or it cannot make a certificate)"
+fi
+
 section "SIGKILL path (a fake server that ignores SIGTERM)"
 F="$TMP/fake_root"
 mkdir -p "$F/tasks"
@@ -352,4 +435,5 @@ check "a symlinked launcher (e.g. on PATH) finds its checkout" bash -c '[ "$1" =
 section "cleanup"
 check "no scratch server left on port $P" port_free "$P"
 check "no scratch server left on port $Q" port_free "$Q"
+check "no scratch server left on port $P2" port_free "$P2"
 finish
