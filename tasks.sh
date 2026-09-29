@@ -970,8 +970,9 @@ print('{\n  "permissions": {\n    "allow": [%s],\n    "ask": [\n      %s\n    ]\
       % (json.dumps('Bash(%s *)' % taskctl), ',\n      '.join(json.dumps(rule) for rule in ask)))
 PY
     echo "The allow rule covers every report (so subagents are not refused); the ask rules win over it,"
-    echo "so 'taskctl run', which runs an arbitrary command, and 'taskctl update', which replaces the"
-    echo "skill's code, still ask you each time, also with an option such as --url in front of them."
+    echo "so 'taskctl run' (runs an arbitrary command), 'taskctl update' (replaces the skill's code) and"
+    echo "'taskctl install-rule' (rewrites CLAUDE.md) still ask you each time, also with an option such as"
+    echo "--url in front of them."
     echo "Start a new Claude Code session (or /reload-skills) to load the skill."
 }
 

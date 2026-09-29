@@ -71,8 +71,9 @@ installed CLI, which `echo ~/.claude/skills/task-status/taskctl` prints:
     }
 
 The allow rule covers every taskctl command, including ones a later version adds. An ask rule beats
-an allow rule, so `taskctl run`, which runs an arbitrary command, and `taskctl update`, which replaces
-the skill's code, still ask each time, also with a global option such as `--url` in front of them.
+an allow rule, so `taskctl run` (runs an arbitrary command), `taskctl update` (replaces the skill's
+code) and `taskctl install-rule` (rewrites the always-loaded CLAUDE.md) still ask each time, also
+with a global option such as `--url` in front of them.
 
 Once installed, follow the skill: it loads when you start multi-step, background, subagent or
 workflow work. taskctl commands: `new TITLE [-t TASK]...`, `add RID TITLE... [--start]`,

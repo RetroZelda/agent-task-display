@@ -115,8 +115,9 @@ subagents may be refused:
 Add the entries to the `permissions.allow` and `permissions.ask` lists of your
 `~/.claude/settings.json` (create the lists if they are missing). The allow rule covers every
 `taskctl` command, including the ones a later version adds. `taskctl run` runs an arbitrary command
-and `taskctl update` replaces the skill's code, and an ask rule wins over an allow rule, so every
-`run` and `update` still asks you first, also with a global option such as `--url` in front of it.
+`taskctl update` replaces the skill's code and `taskctl install-rule` rewrites your always-loaded
+`CLAUDE.md`; an ask rule wins over an allow rule, so each of those three still asks you first, also
+with a global option such as `--url` in front of it.
 Start a new Claude Code session, or run `/reload-skills`, to load the skill.
 
 Launcher options:
