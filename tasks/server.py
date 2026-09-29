@@ -2,56 +2,90 @@
 """Task-status board: a small HTTP service that agents push request and task progress to.
 
     python3 tasks/server.py [--host 0.0.0.0] [--port 8765] [--db tasks/data/tasks.db] [--public-url URL]
+        [--config PATH] [--tls-port P --tls-cert FILE --tls-key FILE]
         [--stale-after 600] [--expire-after 86400] [--retention-days 30] [--pidfile PATH] [--verbose]
 
-Env fallbacks: TASKS_HOST, TASKS_PORT, TASKS_DB, TASKS_PUBLIC_URL. The pidfile defaults to
-<db dir>/server-<port>.pid. Standard library only; needs Python >= 3.10 and SQLite >= 3.37.
+Env fallbacks: TASKS_HOST, TASKS_PORT, TASKS_DB, TASKS_PUBLIC_URL, TASKS_CONFIG, TASKS_TLS_PORT,
+TASKS_TLS_CERT, TASKS_TLS_KEY. The pidfile defaults to <db dir>/server-<port>.pid and the settings file
+to <db dir>/settings.json. Standard library only; needs Python >= 3.10 and SQLite >= 3.37.
 A wildcard --host (0.0.0.0, ::, * or empty) listens dual-stack, IPv4 and IPv6 on one socket, so a
 hostname that resolves to an IPv6 address works too; without IPv6 it falls back to IPv4 only. A
-specific address is bound as given.
+specific address is bound as given. --tls-port, --tls-cert and --tls-key (all three or none) add an
+HTTPS listener on the same host, by the same rules: the same routes over the same database, for
+browsers, which only allow notifications in a secure context.
 
-Frozen wire contract (every component is built against it)
+Wire contract, version 2 (every component is built against it; v1 clients keep working)
 
 IDs: a request id is 6 chars of 23456789abcdefghjkmnpqrstuvwxyz (k3m9qa); a task id is {rid}-{seq}
 (k3m9qa-3). Case-insensitive, returned lowercase. The wrong kind of id on a route is a 400 with a hint.
+
+Every response, success or error (http.server's own included), carries X-Tasks-Version: 2 and
+X-Tasks-Docs: <docs_version>. docs_version = sha256 over skill/SKILL.md, templates/usage.md,
+templates/rule.md, templates/changelog.md, taskctl and taskctl.py, in that order, each as relpath + NUL +
+bytes + NUL (a missing file: relpath + NUL only), hex[:12]: it changes whenever the agent instructions do.
 
 Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; empty body = {})
   GET    /                         static/index.html if Accept has text/html, else usage (Vary: Accept)
   GET    /r/<anything>             static/index.html
   GET    /api, /api/usage          templates/usage.md, rendered, text/plain
   GET    /api/rule                 templates/rule.md, rendered, text/plain
+  GET    /api/changelog            templates/changelog.md, rendered, text/plain: newest first, each entry a
+                                   line "## v<N> — <YYYY-MM-DD>" and its bullet lines
   GET    /api/skill/SKILL.md       skill/SKILL.md, text/plain
   GET    /api/skill/taskctl        taskctl (sh wrapper), text/plain
   GET    /api/skill/taskctl.py     taskctl.py, rendered, text/plain
   GET    /favicon.ico              204
-  GET    /api/health               {ok, service: "tasks", version: "1", pid, now, started_at, requests_running}
-  POST   /api/requests             {title, origin?, tasks?: [str]} -> 201 Request + tasks + now
+  GET    /api/health               {ok, service: "tasks", version: "2", pid, now, started_at, requests_running,
+                                   docs_version, tls_port (int | null), config_path}
+  POST   /api/requests             {title, origin?, tasks?: [str], id?} -> 201 Request + tasks + now + existing
+                                   (false). id is a client-made request id (else the server makes one; not an
+                                   id -> 400): if it exists with the same title -> 200 that request + tasks +
+                                   now + existing: true (an idempotent replay, nothing written); with another
+                                   title -> 409 {"error": "request id already exists"}
   GET    /api/requests             ?status=running|done|failed&limit=1..500 (100) -> {now, stale_after,
-                                   counts: {running, stale, done, failed}, requests}: running (created_at
-                                   DESC, max 500) then finished (completed_at DESC, limited); counts = all
+                                   counts: {running, stale, done, failed, waiting}, requests}: running
+                                   (created_at DESC, max 500) then finished (completed_at DESC, limited);
+                                   counts = all; waiting = running requests with waiting true
   GET    /api/requests/{rid}       Request + tasks (by seq) + now + stale_after
   DELETE /api/requests/{rid}       {deleted, now}
   POST   /api/requests/{rid}/complete  {status?: done|failed, message?}
                                    -> Request + tasks + now + auto_closed: [tid] + cancelled: [tid]
   POST   /api/requests/{rid}/tasks {title, start?: true} -> 201 Task + now + reopened
                                    {titles: [str]} -> 201 {now, request_id, tasks (pending), reopened}
+  POST   /api/requests/{rid}/attention  {message} -> Request + tasks + now; a closed request is a 409
+                                   {error, status, hint: "the request is closed"}
+  DELETE /api/requests/{rid}/attention  -> Request + tasks + now (idempotent; the request's own only)
   GET    /api/tasks/{tid}          Task + now
   POST   /api/tasks/{tid}/progress {message, percent?, eta_seconds?} -> Task + now
   POST   /api/tasks/{tid}/complete {status?: done|failed, message?} -> Task + now
-Rendering literally replaces {{BASE_URL}}, {{PUBLIC_URL}} and {{VERSION}}. Files are re-read per
-request; a missing one is a 500 {"error": "template missing: <path>"}.
+  POST   /api/tasks/{tid}/attention  {message} -> Task + now; a closed task is a 409 {error, status}
+  DELETE /api/tasks/{tid}/attention  -> Task + now (idempotent)
+  GET    /api/events               ?since=N&limit=1..1000 (500) -> {now, cursor, events, truncated, waiting,
+                                   stale, settings_version} (see Events)
+  GET    /api/settings             {now, path, version, exists, error, settings, defaults} (see Settings)
+  PUT    /api/settings             {settings: {...}, partial} -> the GET shape
+  DELETE /api/settings             removes the file (the defaults again) -> the GET shape
+Rendering literally replaces {{BASE_URL}}, {{PUBLIC_URL}}, {{VERSION}} and {{DOCS_VERSION}}. Files are
+re-read per request; a missing one is a 500 {"error": "template missing: <path>"}. On the HTTPS listener
+BASE_URL is http://<the Host's hostname>:<http port> (agents stay on plain http, which a self-signed
+certificate cannot break), while PUBLIC_URL and every url field keep the https address.
 
 Shapes (every key always present, null when absent; times are float epoch seconds, server clock)
   Task     id request_id seq title status percent message eta_at eta_remaining created_at started_at
-           start_inferred updated_at completed_at elapsed stale url
+           start_inferred updated_at completed_at elapsed stale url attention
   Request  id title origin status message created_at updated_at completed_at elapsed percent tasks_total
            tasks_done tasks_failed tasks_running tasks_pending tasks_cancelled current eta_at stale url
+           attention waiting tasks_waiting
+  Event    id ts type request_id task_id request_title task_title status percent message replayed
   Task status: pending|running|done|failed|cancelled. Request status: running|done|failed.
   tasks_total counts NON-cancelled tasks (Y), tasks_done is X. Request percent = mean over non-cancelled
   tasks, done counting 100 (none: 100 if the request is done, else 0). current = {id, title, message} of
   the latest-updated running task; eta_at = max running eta_at. elapsed runs from started_at (task) or
-  created_at (request) to completed_at or now. stale = running, silent > --stale-after, and not within
-  60s past a running eta_at. url = <public>/r/<rid>, plus #<tid> for a task.
+  created_at (request) to completed_at or now. attention = {message, since} | null: a question for the
+  user (a Request's is its own, not its tasks'). waiting = running and (the request's attention or a
+  running task's); tasks_waiting = running tasks with attention. stale = running, silent > --stale-after,
+  not within 60s past a running eta_at, and never while it has attention (task) or is waiting (request).
+  url = <public>/r/<rid>, plus #<tid> for a task.
 
 Errors are {error, field?, hint?}: 400 validation, 403 cross-origin write, 404 unknown id/route, 405
 (+Allow), 409 state conflict, 411 chunked, 413 body > 64 KiB, 500, 503 database busy (+Retry-After: 1).
@@ -67,15 +101,53 @@ State rules
   - Request complete (one transaction): pending tasks -> cancelled, running tasks -> the request's
     status. Same status again: no-op. Different status: overwrite, completed_at kept.
   - Adding tasks to a done/failed request reopens it. Every task write bumps the request's updated_at.
-  - Maintenance: running requests silent for --expire-after (and not inside a running eta) close as
-    failed "expired: no activity for 24h"; finished requests older than --retention-days are deleted.
-Writes (POST, DELETE) carrying an Origin header are refused unless Origin equals Host and Host names
-this machine (IP literal, [IPv6] included, localhost, its hostname, the --public-url host). No auth in v1.
+  - Attention: setting it on a pending task starts it; setting it again replaces message and since; it
+    bumps updated_at like any write. Progress on a task or its completion clears the task's attention; a
+    request's completion clears its own and all its tasks'.
+  - Maintenance: running requests silent for --expire-after (not waiting, not inside a running eta) close
+    as failed "expired: no activity for 24h"; finished requests older than --retention-days are deleted;
+    events older than 7 days are deleted, then all but the newest 10000.
+
+Events: every change writes events in its own transaction; they outlive deletes. status and percent
+are the entity's after the change (the request's for request-level events), times the write's.
+  request_created; request_reopened (a task added to a closed request); request_done, request_failed (a
+  status change by request complete or expiry; message = the request's; the cascade writes no task
+  events); request_deleted; task_added (each task added to an existing request); task_started (pending ->
+  running by progress or attention, or a single add with start); task_progress (progress on a running
+  task); task_done, task_failed (a status change by task complete); attention (message = the question;
+  task_id null at request level); attention_cleared (message = the question that was cleared).
+  GET /api/events without since: events [] and cursor = the last event id (0 if none), a baseline. With
+  since: the events with id > since, ascending, at most limit; truncated = more remain (then cursor = the
+  last one returned) or events after since were pruned; otherwise cursor = the last event id. waiting =
+  [{request_id, request_title, task_id | null, task_title | null, message, since}] for every attention
+  open in a running request, oldest first; stale = [{request_id, request_title}] of running requests
+  stale now; settings_version = the settings' version.
+
+Replays: taskctl queues writes while the board is unreachable and replays them later with the header
+X-Tasks-Replay: 1. On create request, request and task complete, progress and attention set/clear such a
+request may carry a numeric body field "at": the write's own time, clamped to [now - 86400, now] and
+never before the entity's updated_at. The write's times (an ETA's base included) use it, and its events
+get ts = it and replayed = true. Without the header "at" is an unknown field.
+
+Settings: the notification defaults for every viewer, a JSON file (--config), re-read whenever its
+mtime or size changes:
+  {"events": {KEY: {"highlight": bool, "title": bool, "sound": bool, "notify": bool}}, "sound": {"volume": 0..1}}
+  KEY: waiting task_failed request_failed request_done task_done task_started task_progress request_created
+  stale. settings = the defaults deep-merged with the file; a file that is not valid JSON or breaks the
+  schema counts as absent (the defaults) and says why in error. PUT validates its partial settings
+  (unknown key, channel or field, non-bool, volume outside 0..1 -> 400 with field), merges them onto the
+  current settings and writes the full result atomically. version = sha256 of the settings as compact
+  JSON with sorted keys, hex[:12].
+
+Writes (POST, PUT, DELETE) carrying an Origin header are refused unless Origin equals Host and Host names
+this machine (IP literal, [IPv6] included, localhost, its hostname, the --public-url host). No auth.
 """
 
 import argparse
+import copy
 import difflib
 import errno
+import hashlib
 import ipaddress
 import json
 import logging
@@ -86,6 +158,7 @@ import secrets
 import signal
 import socket
 import sqlite3
+import ssl
 import sys
 import threading
 import time
@@ -95,9 +168,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 
-VERSION = '1'
-SCHEMA_VERSION = 1
+VERSION = '2'
+SCHEMA_VERSION = 2
 TASKS_DIR = Path(__file__).resolve().parent
+# The agent-facing files; X-Tasks-Docs hashes them so an installed skill can tell it is out of date.
+DOCS_FILES = ('skill/SKILL.md', 'templates/usage.md', 'templates/rule.md', 'templates/changelog.md',
+              'taskctl', 'taskctl.py')
 
 ID_ALPHABET = '23456789abcdefghjkmnpqrstuvwxyz'
 RID_RE = re.compile(f'[{ID_ALPHABET}]{{6}}')
@@ -115,6 +191,10 @@ ETA_MAX = 7 * 86400
 TASKS_PER_CALL = 200
 TASKS_PER_REQUEST = 500
 RUNNING_LIST_MAX = 500
+REPLAY_WINDOW = 86400
+EVENTS_MAX_AGE = 7 * 86400
+EVENTS_KEEP = 10000
+EVENTS_PER_CALL = 1000
 STATUS_ALIASES = {
     'done': 'done', 'ok': 'done', 'success': 'done', 'complete': 'done', 'completed': 'done',
     'failed': 'failed', 'fail': 'failed', 'error': 'failed',
@@ -175,6 +255,17 @@ def clean_titles(value, field, warnings):
             for i, item in enumerate(value)]
 
 
+def clean_rid(value):
+    # A client-made request id (taskctl makes its own so a create can be queued offline and replayed).
+    if value is None:
+        return None
+    rid = value.strip().lower() if isinstance(value, str) else ''
+    if not RID_RE.fullmatch(rid):
+        raise ApiError(400, f'id must be 6 characters of {ID_ALPHABET}', field='id',
+                       hint='request ids look like k3m9qa')
+    return rid
+
+
 def parse_number(value, field, allow_percent_sign=False):
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ApiError(400, f'{field} must be a number', field=field)
@@ -232,6 +323,200 @@ def humanise(seconds):
     return ''.join(f'{n}{unit}' for n, unit in ((hours, 'h'), (minutes, 'm'), (secs, 's')) if n) or '0s'
 
 
+# Agent docs version
+
+_docs_lock = threading.Lock()
+_docs_cache = {'key': None, 'value': None}
+
+
+def docs_version():
+    """sha256 over DOCS_FILES (see the docstring), recomputed only when a file's mtime or size changes."""
+    key = []
+    for rel in DOCS_FILES:
+        try:
+            st = os.stat(TASKS_DIR / rel)
+            key.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            key.append(None)
+    with _docs_lock:
+        if _docs_cache['key'] == key:
+            return _docs_cache['value']
+    digest, complete = hashlib.sha256(), True
+    for rel, stamp in zip(DOCS_FILES, key):
+        digest.update(rel.encode() + b'\0')
+        if stamp is not None:
+            try:
+                digest.update((TASKS_DIR / rel).read_bytes() + b'\0')
+            except OSError:  # counts as missing, and is looked at again next time
+                complete = False
+    value = digest.hexdigest()[:12]
+    with _docs_lock:
+        _docs_cache.update(key=key if complete else None, value=value)
+    return value
+
+
+# Settings
+
+CHANNELS = ('highlight', 'title', 'sound', 'notify')
+# Each event KEY's default for the four channels, in CHANNELS order (T = on).
+_DEFAULT_EVENTS = {
+    'waiting': 'TTTT', 'task_failed': 'TTTT', 'request_failed': 'TTTT', 'request_done': 'TTTT',
+    'task_done': 'TFFF', 'task_started': 'TFFF', 'task_progress': 'TFFF', 'request_created': 'TFFF',
+    'stale': 'TTFF',
+}
+EVENT_KEYS = tuple(_DEFAULT_EVENTS)
+DEFAULT_SETTINGS = {
+    'events': {key: {channel: flag == 'T' for channel, flag in zip(CHANNELS, flags)}
+               for key, flags in _DEFAULT_EVENTS.items()},
+    'sound': {'volume': 0.6},
+}
+
+
+def _unknown(what, key, known, where):
+    guess = difflib.get_close_matches(key, known, n=1)
+    hint = f"did you mean '{guess[0]}'?" if guess else f"expected one of: {', '.join(known)}"
+    path = f'{where}.{key[:40]}' if where else key[:40]
+    return ApiError(400, f"unknown {what} '{key[:40]}' in {where or 'the settings'}", field=path, hint=hint)
+
+
+def check_settings(value, where):
+    """A validated copy of (partial) settings; the first problem is an ApiError 400 whose field is its path."""
+    def section(value, path):
+        if not isinstance(value, dict):
+            raise ApiError(400, f'{path or "the settings"} must be a JSON object', field=path or 'settings')
+        return value
+
+    def join(path, key):
+        return f'{path}.{key}' if path else key
+
+    out = {}
+    for key, part in section(value, where).items():
+        path = join(where, key)
+        if key == 'events':
+            out['events'] = {}
+            for name, channels in section(part, path).items():
+                if name not in EVENT_KEYS:
+                    raise _unknown('event', name, EVENT_KEYS, path)
+                out['events'][name] = {}
+                for channel, flag in section(channels, join(path, name)).items():
+                    if channel not in CHANNELS:
+                        raise _unknown('channel', channel, CHANNELS, join(path, name))
+                    if not isinstance(flag, bool):
+                        field = join(join(path, name), channel)
+                        raise ApiError(400, f'{field} must be true or false', field=field)
+                    out['events'][name][channel] = flag
+        elif key == 'sound':
+            out['sound'] = {}
+            for name, volume in section(part, path).items():
+                if name != 'volume':
+                    raise _unknown('field', name, ('volume',), path)
+                bad = ApiError(400, f'{join(path, name)} must be a number from 0 to 1', field=join(path, name))
+                if isinstance(volume, bool) or not isinstance(volume, (int, float)):
+                    raise bad
+                try:
+                    volume = float(volume)  # a JSON integer can be too large for a float
+                except OverflowError:
+                    raise bad from None
+                if not math.isfinite(volume) or not 0 <= volume <= 1:
+                    raise bad
+                out['sound']['volume'] = volume
+        else:
+            raise _unknown('field', key, ('events', 'sound'), where)
+    return out
+
+
+def merge_settings(base, patch):
+    merged = copy.deepcopy(base)
+    for name, channels in patch.get('events', {}).items():
+        merged['events'][name].update(channels)
+    merged['sound'].update(patch.get('sound', {}))
+    return merged
+
+
+def settings_version(settings):
+    return hashlib.sha256(json.dumps(settings, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:12]
+
+
+class Settings:
+    """The global settings file, re-read when its (mtime_ns, size) changes; writes are atomic."""
+
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._stamp = False  # not read yet
+        self.effective, self.version = DEFAULT_SETTINGS, settings_version(DEFAULT_SETTINGS)
+        self.error, self.exists = None, False
+
+    def _file_stamp(self):
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return None
+        return st.st_mtime_ns, st.st_size
+
+    def _load(self, stamp):
+        self._stamp, self.exists, self.error = stamp, stamp is not None, None
+        effective = DEFAULT_SETTINGS
+        if stamp is not None:
+            try:
+                effective = merge_settings(DEFAULT_SETTINGS, check_settings(
+                    json.loads(self.path.read_text(encoding='utf-8-sig')), ''))
+            except OSError as exc:
+                self.error = f'cannot read the file: {exc.strerror or exc}'
+            except ApiError as exc:
+                self.error = f'{exc} ({exc.payload["hint"]})' if exc.payload.get('hint') else str(exc)
+            except (ValueError, RecursionError) as exc:  # JSON and UTF-8 errors are ValueErrors
+                self.error = f'invalid JSON: {exc}'
+            except Exception as exc:  # anything unforeseen: still the defaults and an error, never a crash
+                self.error = f'invalid settings: {exc}'
+            if self.error:
+                log.warning('settings file %s: %s; using the defaults', self.path, _printable(self.error))
+        self.effective, self.version = effective, settings_version(effective)
+
+    def _refresh(self):
+        stamp = self._file_stamp()
+        if stamp != self._stamp:
+            if self._stamp is not False:
+                log.info('settings file %s changed; reloaded', self.path)
+            self._load(stamp)
+
+    def snapshot(self, now):
+        with self._lock:
+            self._refresh()
+            return {'now': now, 'path': str(self.path), 'version': self.version, 'exists': self.exists,
+                    'error': self.error, 'settings': self.effective, 'defaults': DEFAULT_SETTINGS}
+
+    def current_version(self):
+        with self._lock:
+            self._refresh()
+            return self.version
+
+    def update(self, patch):
+        with self._lock:
+            self._refresh()
+            text = json.dumps(merge_settings(self.effective, patch), indent=2) + '\n'
+            temp = self.path.with_name(f'.{self.path.name}.{os.getpid()}.tmp')
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with open(temp, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp, self.path)
+            except OSError as exc:
+                temp.unlink(missing_ok=True)
+                raise ApiError(500, f'cannot write {self.path}: {exc.strerror or exc}') from None
+            self._load(self._file_stamp())
+
+    def reset(self):
+        with self._lock:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise ApiError(500, f'cannot remove {self.path}: {exc.strerror or exc}') from None
+            self._load(self._file_stamp())
+
+
 # Storage
 
 SCHEMA = (
@@ -253,17 +538,39 @@ SCHEMA = (
     ) STRICT""",
 )
 
+
+def _migrate_2(db):
+    # Attention columns and the event log. Checked step by step, so running it twice changes nothing.
+    for table in ('requests', 'tasks'):
+        columns = {row[1] for row in db.execute(f'PRAGMA table_info({table})')}
+        for column, kind in (('attention_message', 'TEXT'), ('attention_at', 'REAL')):
+            if column not in columns:
+                db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {kind}')
+    db.execute("""CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, type TEXT NOT NULL, request_id TEXT NOT NULL,
+        task_id TEXT, request_title TEXT, task_title TEXT, status TEXT, percent REAL, message TEXT,
+        replayed INTEGER NOT NULL DEFAULT 0
+    ) STRICT""")  # no foreign key: events outlive the requests they describe
+    db.execute('CREATE INDEX IF NOT EXISTS events_ts ON events (ts)')
+
+
+# user_version N-1 -> N. A fresh database is created at 1 and then runs them all, so a fresh and an
+# upgraded database are the same.
+MIGRATIONS = {2: _migrate_2}
+
 # Aggregates live in SQL so the list and detail views can never disagree. {where} filters the
 # inner r.* rows; {order} sorts and limits the outer g.* rows.
 REQUEST_SELECT = """
 SELECT g.*, c.title AS current_title, c.message AS current_message FROM (
     SELECT r.id, r.title, r.origin, r.status, r.message, r.created_at, r.updated_at, r.completed_at,
+        r.attention_message, r.attention_at,
         COUNT(t.id) - IFNULL(SUM(t.status = 'cancelled'), 0) AS tasks_total,
         IFNULL(SUM(t.status = 'done'), 0) AS tasks_done,
         IFNULL(SUM(t.status = 'failed'), 0) AS tasks_failed,
         IFNULL(SUM(t.status = 'running'), 0) AS tasks_running,
         IFNULL(SUM(t.status = 'pending'), 0) AS tasks_pending,
         IFNULL(SUM(t.status = 'cancelled'), 0) AS tasks_cancelled,
+        IFNULL(SUM(t.status = 'running' AND t.attention_at IS NOT NULL), 0) AS tasks_waiting,
         AVG(CASE t.status WHEN 'done' THEN 100.0 WHEN 'cancelled' THEN NULL ELSE t.percent END) AS avg_percent,
         MAX(CASE WHEN t.status = 'running' THEN t.eta_at END) AS eta_at,
         (SELECT id FROM tasks WHERE request_id = r.id AND status = 'running'
@@ -273,24 +580,51 @@ SELECT g.*, c.title AS current_title, c.message AS current_message FROM (
 ) g LEFT JOIN tasks c ON c.id = g.current_id {order}
 """
 
-STALE_COUNT = """
-SELECT COUNT(*) FROM requests r WHERE r.status = 'running' AND ? - r.updated_at > ?
+# A running request r is waiting while it, or one of its running tasks, has a question for the user.
+WAITING = """(r.attention_at IS NOT NULL OR EXISTS (SELECT 1 FROM tasks w WHERE w.request_id = r.id
+                  AND w.status = 'running' AND w.attention_at IS NOT NULL))"""
+
+# params: now, stale_after, now
+STALE = f"""r.status = 'running' AND ? - r.updated_at > ? AND NOT {WAITING}
     AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.request_id = r.id AND t.status = 'running'
-                    AND t.eta_at IS NOT NULL AND ? < t.eta_at + 60)
+                    AND t.eta_at IS NOT NULL AND ? < t.eta_at + 60)"""
+
+STALE_COUNT = f'SELECT COUNT(*) FROM requests r WHERE {STALE}'
+STALE_LIST = f'SELECT r.id AS request_id, r.title AS request_title FROM requests r WHERE {STALE} ORDER BY r.created_at'
+WAITING_COUNT = f"SELECT COUNT(*) FROM requests r WHERE r.status = 'running' AND {WAITING}"
+WAITING_LIST = """
+SELECT * FROM (
+    SELECT r.id AS request_id, r.title AS request_title, NULL AS task_id, NULL AS task_title,
+        r.attention_message AS message, r.attention_at AS since, 0 AS seq
+    FROM requests r WHERE r.status = 'running' AND r.attention_at IS NOT NULL
+    UNION ALL
+    SELECT r.id, r.title, t.id, t.title, t.attention_message, t.attention_at, t.seq
+    FROM requests r JOIN tasks t ON t.request_id = r.id
+    WHERE r.status = 'running' AND t.status = 'running' AND t.attention_at IS NOT NULL
+) ORDER BY since, request_id, seq
 """
 
 # Shared by task complete and the request-complete cascade; params: status, status, message, now, now.
 CLOSE_TASK_SET = """
     status = ?, percent = CASE WHEN ? = 'done' THEN 100.0 ELSE percent END,
-    message = COALESCE(?, message), eta_at = NULL,
+    message = COALESCE(?, message), eta_at = NULL, attention_message = NULL, attention_at = NULL,
     completed_at = COALESCE(completed_at, ?), updated_at = ?,
     start_inferred = CASE WHEN started_at IS NULL THEN 1 ELSE start_inferred END,
     started_at = COALESCE(started_at, created_at)
 """
 
+# The titles are copied in, so an event still reads well after its request is gone.
+EVENT_INSERT = """
+INSERT INTO events (ts, type, request_id, task_id, request_title, task_title, status, percent, message, replayed)
+VALUES (?, ?, ?, ?, (SELECT title FROM requests WHERE id = ?), (SELECT title FROM tasks WHERE id = ?), ?, ?, ?, ?)
+"""
+
 
 class Store:
-    """One SQLite connection behind one lock: every step is atomic without busy-retry code."""
+    """One SQLite connection behind one lock: every step is atomic without busy-retry code.
+
+    Writes take now (the server clock) and, for a replayed write, at (its own time, already clamped to
+    the replay window); the effective time and the replayed flag travel together as a stamp."""
 
     def __init__(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,10 +639,17 @@ class Store:
             version = db.execute('PRAGMA user_version').fetchone()[0]
             if version > SCHEMA_VERSION:
                 raise RuntimeError(f'schema version {version} is newer than this server supports ({SCHEMA_VERSION})')
-            if version < 1:
+            fresh = version < 1
+            if fresh:
                 for statement in SCHEMA:
                     db.execute(statement)
+                version = 1
+            for target in range(version + 1, SCHEMA_VERSION + 1):
+                MIGRATIONS[target](db)
+            if version != SCHEMA_VERSION:
                 db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+                if not fresh:
+                    log.info('database %s upgraded from schema %d to %d', path, version, SCHEMA_VERSION)
 
     @contextmanager
     def _write(self):
@@ -334,6 +675,13 @@ class Store:
             except sqlite3.Error:
                 pass
             self._db.close()
+
+    @staticmethod
+    def _stamp(now, at, floor=None):
+        # (effective time, replayed): a replayed write's own time, never before the entity's last write.
+        if at is None:
+            return now, False
+        return (at if floor is None else max(at, floor)), True
 
     @staticmethod
     def _requests(db, where, params=(), order=''):
@@ -365,6 +713,23 @@ class Store:
         return row
 
     @staticmethod
+    def _touch(db, rid, when):
+        # A task write bumps its request; MAX keeps an older replayed write from moving it back.
+        db.execute('UPDATE requests SET updated_at = MAX(updated_at, ?) WHERE id = ?', (when, rid))
+
+    @staticmethod
+    def _event(db, stamp, kind, rid, task=None, status=None, message=None):
+        # A task event carries the task's status and percent, a request event the request's.
+        if task is not None:
+            tid, status, percent = task['id'], task['status'], task['percent']
+        else:
+            tid = None
+            percent = db.execute("SELECT AVG(CASE status WHEN 'done' THEN 100.0 WHEN 'cancelled' THEN NULL"
+                                 ' ELSE percent END) FROM tasks WHERE request_id = ?', (rid,)).fetchone()[0]
+            percent = round(percent, 1) if percent is not None else 100.0 if status == 'done' else 0.0
+        db.execute(EVENT_INSERT, (stamp[0], kind, rid, tid, rid, tid, status, percent, message, int(stamp[1])))
+
+    @staticmethod
     def _insert_tasks(db, rid, first_seq, titles, status, now):
         started = now if status == 'running' else None
         db.executemany(
@@ -373,19 +738,29 @@ class Store:
             [(f'{rid}-{seq}', rid, seq, title, status, now, started, now)
              for seq, title in enumerate(titles, first_seq)])
 
-    def create_request(self, title, origin, titles, now):
+    def create_request(self, rid, title, origin, titles, now, at=None):
+        """-> (row, tasks, existing). A known rid with the same title is an idempotent replay."""
         with self._write() as db:
-            for _ in range(20):
-                rid = ''.join(secrets.choice(ID_ALPHABET) for _ in range(6))
-                if db.execute('SELECT 1 FROM requests WHERE id = ?', (rid,)).fetchone() is None:
-                    break
+            if rid is None:
+                for _ in range(20):
+                    rid = ''.join(secrets.choice(ID_ALPHABET) for _ in range(6))
+                    if db.execute('SELECT 1 FROM requests WHERE id = ?', (rid,)).fetchone() is None:
+                        break
+                else:
+                    raise RuntimeError('could not allocate a free request id')
             else:
-                raise RuntimeError('could not allocate a free request id')
+                known = db.execute('SELECT title FROM requests WHERE id = ?', (rid,)).fetchone()
+                if known is not None:
+                    if known['title'] != title:
+                        raise ApiError(409, 'request id already exists')
+                    return (*self._detail(db, rid), True)
+            stamp = self._stamp(now, at)
             db.execute(
                 'INSERT INTO requests (id, title, origin, status, created_at, updated_at, next_seq)'
-                " VALUES (?, ?, ?, 'running', ?, ?, ?)", (rid, title, origin, now, now, len(titles) + 1))
-            self._insert_tasks(db, rid, 1, titles, 'pending', now)
-            return self._detail(db, rid)
+                " VALUES (?, ?, ?, 'running', ?, ?, ?)", (rid, title, origin, stamp[0], stamp[0], len(titles) + 1))
+            self._insert_tasks(db, rid, 1, titles, 'pending', stamp[0])
+            self._event(db, stamp, 'request_created', rid, status='running')
+            return (*self._detail(db, rid), False)
 
     def request_detail(self, rid):
         with self._read() as db:
@@ -401,41 +776,54 @@ class Store:
                 where, params = ('WHERE r.status = ?', (status, limit)) if status else \
                     ("WHERE r.status != 'running'", (limit,))
                 rows += self._requests(db, where, params, 'ORDER BY g.completed_at DESC, g.created_at DESC LIMIT ?')
-            counts = {'running': 0, 'stale': 0, 'done': 0, 'failed': 0}
+            counts = {'running': 0, 'stale': 0, 'done': 0, 'failed': 0, 'waiting': 0}
             counts.update(db.execute('SELECT status, COUNT(*) FROM requests GROUP BY status').fetchall())
             counts['stale'] = db.execute(STALE_COUNT, (now, stale_after, now)).fetchone()[0]
+            counts['waiting'] = db.execute(WAITING_COUNT).fetchone()[0]
             return rows, counts
 
     def running_count(self):
         with self._read() as db:
             return db.execute("SELECT COUNT(*) FROM requests WHERE status = 'running'").fetchone()[0]
 
-    def delete_request(self, rid):
-        with self._write() as db:
-            if db.execute('DELETE FROM requests WHERE id = ?', (rid,)).rowcount == 0:
-                raise ApiError(404, f"unknown request '{rid}'")
-
-    def complete_request(self, rid, status, message, now):
+    def delete_request(self, rid, now):
         with self._write() as db:
             request = self._request(db, rid)
-            auto_closed, cancelled = self._close_request(db, request, status, message, now)
+            self._event(db, (now, False), 'request_deleted', rid, status=request['status'])
+            db.execute('DELETE FROM requests WHERE id = ?', (rid,))
+
+    def complete_request(self, rid, status, message, now, at=None):
+        with self._write() as db:
+            request = self._request(db, rid)
+            stamp = self._stamp(now, at, request['updated_at'])
+            auto_closed, cancelled = self._close_request(db, request, status, message, stamp)
             return (*self._detail(db, rid), auto_closed, cancelled, request['status'])
 
-    @staticmethod
-    def _close_request(db, request, status, message, now):
-        rid, open_tasks = request['id'], []
+    def _close_request(self, db, request, status, message, stamp):
+        rid, when, open_tasks, waiting = request['id'], stamp[0], [], []
         if request['status'] == 'running':
             open_tasks = db.execute("SELECT id, status FROM tasks WHERE request_id = ?"
                                     " AND status IN ('pending', 'running') ORDER BY seq", (rid,)).fetchall()
+            waiting = db.execute('SELECT id, attention_message FROM tasks WHERE request_id = ?'
+                                 ' AND attention_at IS NOT NULL ORDER BY seq', (rid,)).fetchall()
             db.execute("UPDATE tasks SET status = 'cancelled', completed_at = ?, updated_at = ?"
-                       " WHERE request_id = ? AND status = 'pending'", (now, now, rid))
+                       " WHERE request_id = ? AND status = 'pending'", (when, when, rid))
             db.execute(f"UPDATE tasks SET {CLOSE_TASK_SET} WHERE request_id = ? AND status = 'running'",
-                       (status, status, None, now, now, rid))
+                       (status, status, None, when, when, rid))
         elif request['status'] == status and message is None:
             return [], []
         # A closed request always has completed_at, so COALESCE keeps the original close time.
         db.execute('UPDATE requests SET status = ?, message = COALESCE(?, message), completed_at = COALESCE('
-                   'completed_at, ?), updated_at = ? WHERE id = ?', (status, message, now, now, rid))
+                   'completed_at, ?), updated_at = ?, attention_message = NULL, attention_at = NULL WHERE id = ?',
+                   (status, message, when, when, rid))
+        for task in waiting:
+            self._event(db, stamp, 'attention_cleared', rid, self._task(db, task['id']),
+                        message=task['attention_message'])
+        if request['attention_at'] is not None:
+            self._event(db, stamp, 'attention_cleared', rid, status=status, message=request['attention_message'])
+        if request['status'] != status:
+            self._event(db, stamp, f'request_{status}', rid, status=status,
+                        message=request['message'] if message is None else message)
         return ([t['id'] for t in open_tasks if t['status'] == 'running'],
                 [t['id'] for t in open_tasks if t['status'] == 'pending'])
 
@@ -450,47 +838,151 @@ class Store:
             if reopened:
                 db.execute("UPDATE requests SET status = 'running', completed_at = NULL, message = NULL"
                            ' WHERE id = ?', (rid,))
-            db.execute('UPDATE requests SET next_seq = next_seq + ?, updated_at = ? WHERE id = ?',
+            db.execute('UPDATE requests SET next_seq = next_seq + ?, updated_at = MAX(updated_at, ?) WHERE id = ?',
                        (len(titles), now, rid))
             self._insert_tasks(db, rid, request['next_seq'], titles, 'running' if start else 'pending', now)
-            return self._tasks(db, rid, request['next_seq']), reopened
+            tasks, stamp = self._tasks(db, rid, request['next_seq']), (now, False)
+            if reopened:
+                self._event(db, stamp, 'request_reopened', rid, status='running')
+            for task in tasks:
+                self._event(db, stamp, 'task_added', rid, task)
+            if start:
+                self._event(db, stamp, 'task_started', rid, tasks[0])
+            return tasks, reopened
 
     def task(self, tid):
         with self._read() as db:
             return self._task(db, tid)
 
-    def progress(self, tid, message, percent, eta_at, now):
+    def progress(self, tid, message, percent, eta_seconds, now, at=None):
         with self._write() as db:
             task = self._task(db, tid)
             if task['status'] not in ('pending', 'running'):
                 raise ApiError(409, f"task {tid} is already {task['status']}", status=task['status'])
+            stamp = self._stamp(now, at, task['updated_at'])
+            when = stamp[0]
+            eta_at = None if eta_seconds is None else round(when + eta_seconds, 3)
             db.execute("UPDATE tasks SET status = 'running', started_at = COALESCE(started_at, ?),"
-                       ' percent = COALESCE(?, percent), message = ?, eta_at = ?, updated_at = ? WHERE id = ?',
-                       (now, percent, message, eta_at, now, tid))
-            db.execute('UPDATE requests SET updated_at = ? WHERE id = ?', (now, task['request_id']))
-            return self._task(db, tid)
+                       ' percent = COALESCE(?, percent), message = ?, eta_at = ?, attention_message = NULL,'
+                       ' attention_at = NULL, updated_at = ? WHERE id = ?', (when, percent, message, eta_at, when, tid))
+            self._touch(db, task['request_id'], when)
+            row = self._task(db, tid)
+            if task['attention_at'] is not None:
+                self._event(db, stamp, 'attention_cleared', row['request_id'], row, message=task['attention_message'])
+            self._event(db, stamp, 'task_started' if task['status'] == 'pending' else 'task_progress',
+                        row['request_id'], row, message=message)
+            return row
 
-    def complete_task(self, tid, status, message, now):
+    def complete_task(self, tid, status, message, now, at=None):
         with self._write() as db:
             task = self._task(db, tid)
+            stamp = self._stamp(now, at, task['updated_at'])
             # On a task already closed with this status CLOSE_TASK_SET changes only message and updated_at.
             if task['status'] != status or message is not None:
-                db.execute(f'UPDATE tasks SET {CLOSE_TASK_SET} WHERE id = ?', (status, status, message, now, now, tid))
-                db.execute('UPDATE requests SET updated_at = ? WHERE id = ?', (now, task['request_id']))
-            return self._task(db, tid), task['status']
+                db.execute(f'UPDATE tasks SET {CLOSE_TASK_SET} WHERE id = ?',
+                           (status, status, message, stamp[0], stamp[0], tid))
+                self._touch(db, task['request_id'], stamp[0])
+            row = self._task(db, tid)
+            if task['attention_at'] is not None:
+                self._event(db, stamp, 'attention_cleared', row['request_id'], row, message=task['attention_message'])
+            if task['status'] != status:
+                self._event(db, stamp, f'task_{status}', row['request_id'], row, message=row['message'])
+            return row, task['status']
+
+    def task_attention(self, tid, message, now, at=None):
+        with self._write() as db:
+            task = self._task(db, tid)
+            if task['status'] not in ('pending', 'running'):
+                raise ApiError(409, f"task {tid} is already {task['status']}", status=task['status'])
+            stamp = self._stamp(now, at, task['updated_at'])
+            db.execute("UPDATE tasks SET status = 'running', started_at = COALESCE(started_at, ?),"
+                       ' attention_message = ?, attention_at = ?, updated_at = ? WHERE id = ?',
+                       (stamp[0], message, stamp[0], stamp[0], tid))
+            self._touch(db, task['request_id'], stamp[0])
+            row = self._task(db, tid)
+            if task['status'] == 'pending':
+                self._event(db, stamp, 'task_started', row['request_id'], row, message=row['message'])
+            self._event(db, stamp, 'attention', row['request_id'], row, message=message)
+            return row
+
+    def task_resume(self, tid, now, at=None):
+        with self._write() as db:
+            task = self._task(db, tid)
+            if task['attention_at'] is None:
+                return task, False
+            stamp = self._stamp(now, at, task['updated_at'])
+            db.execute('UPDATE tasks SET attention_message = NULL, attention_at = NULL, updated_at = ? WHERE id = ?',
+                       (stamp[0], tid))
+            self._touch(db, task['request_id'], stamp[0])
+            row = self._task(db, tid)
+            self._event(db, stamp, 'attention_cleared', row['request_id'], row, message=task['attention_message'])
+            return row, True
+
+    def request_attention(self, rid, message, now, at=None):
+        with self._write() as db:
+            request = self._request(db, rid)
+            if request['status'] != 'running':
+                raise ApiError(409, f"request {rid} is already {request['status']}", status=request['status'],
+                               hint='the request is closed')
+            stamp = self._stamp(now, at, request['updated_at'])
+            db.execute('UPDATE requests SET attention_message = ?, attention_at = ?, updated_at = ? WHERE id = ?',
+                       (message, stamp[0], stamp[0], rid))
+            self._event(db, stamp, 'attention', rid, status='running', message=message)
+            return self._detail(db, rid)
+
+    def request_resume(self, rid, now, at=None):
+        with self._write() as db:
+            request = self._request(db, rid)
+            cleared = request['attention_at'] is not None
+            if cleared:
+                stamp = self._stamp(now, at, request['updated_at'])
+                db.execute('UPDATE requests SET attention_message = NULL, attention_at = NULL, updated_at = ?'
+                           ' WHERE id = ?', (stamp[0], rid))
+                self._event(db, stamp, 'attention_cleared', rid, status=request['status'],
+                            message=request['attention_message'])
+            return (*self._detail(db, rid), cleared)
+
+    def events(self, since, limit, now, stale_after):
+        with self._read() as db:
+            # The last id ever handed out (sqlite_sequence), so a cursor never moves back after pruning.
+            first, top, seq = db.execute("SELECT MIN(id), MAX(id), (SELECT seq FROM sqlite_sequence"
+                                         " WHERE name = 'events') FROM events").fetchone()
+            last = max(top or 0, seq or 0)
+            events, truncated, cursor = [], False, last
+            if since is not None:
+                rows = db.execute('SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?',
+                                  (since, limit + 1)).fetchall()
+                events = rows[:limit]
+                more = len(rows) > limit
+                pruned = since < (last + 1 if first is None else first) - 1
+                truncated = more or pruned
+                if more:
+                    cursor = events[-1]['id']
+            waiting = db.execute(WAITING_LIST).fetchall()
+            stale = db.execute(STALE_LIST, (now, stale_after, now)).fetchall()
+        return {'cursor': cursor, 'events': [event_json(row) for row in events], 'truncated': truncated,
+                'waiting': [{key: row[key] for key in ('request_id', 'request_title', 'task_id', 'task_title',
+                                                       'message', 'since')} for row in waiting],
+                'stale': [dict(row) for row in stale]}
 
     def expire(self, cutoff, message, now):
         with self._write() as db:
             rows = db.execute(
-                "SELECT * FROM requests r WHERE status = 'running' AND updated_at < ? AND NOT EXISTS"
+                f"SELECT * FROM requests r WHERE status = 'running' AND updated_at < ? AND NOT {WAITING} AND NOT EXISTS"
                 " (SELECT 1 FROM tasks t WHERE t.request_id = r.id AND t.status = 'running' AND t.eta_at > ?)",
                 (cutoff, now)).fetchall()
-            return [(row['id'], *self._close_request(db, row, 'failed', message, now)) for row in rows]
+            return [(row['id'], *self._close_request(db, row, 'failed', message, (now, False))) for row in rows]
 
     def prune(self, cutoff):
         with self._write() as db:
             return db.execute("DELETE FROM requests WHERE status != 'running' AND completed_at < ?",
                               (cutoff,)).rowcount
+
+    def prune_events(self, cutoff, keep):
+        with self._write() as db:
+            pruned = db.execute('DELETE FROM events WHERE ts < ?', (cutoff,)).rowcount
+            return pruned + db.execute('DELETE FROM events WHERE id <= (SELECT id FROM events ORDER BY id DESC'
+                                       ' LIMIT 1 OFFSET ?)', (keep,)).rowcount
 
 
 # Serialization
@@ -499,9 +991,14 @@ def is_stale(updated_at, eta_at, now, stale_after):
     return now - updated_at > stale_after and not (eta_at is not None and now < eta_at + 60)
 
 
+def attention_json(message, since):
+    return None if since is None else {'message': message, 'since': since}
+
+
 def task_json(row, now, public, stale_after):
     running = row['status'] == 'running'
     eta_at, started = row['eta_at'], row['started_at']
+    attention = attention_json(row['attention_message'], row['attention_at'])
     return {
         'id': row['id'], 'request_id': row['request_id'], 'seq': row['seq'], 'title': row['title'],
         'status': row['status'], 'percent': row['percent'], 'message': row['message'], 'eta_at': eta_at,
@@ -510,8 +1007,9 @@ def task_json(row, now, public, stale_after):
         'start_inferred': bool(row['start_inferred']), 'updated_at': row['updated_at'],
         'completed_at': row['completed_at'],
         'elapsed': None if started is None else round((row['completed_at'] or now) - started, 3),
-        'stale': running and is_stale(row['updated_at'], eta_at, now, stale_after),
+        'stale': running and attention is None and is_stale(row['updated_at'], eta_at, now, stale_after),
         'url': f"{public}/r/{row['request_id']}#{row['id']}",
+        'attention': attention,
     }
 
 
@@ -522,6 +1020,9 @@ def request_json(row, now, public, stale_after):
     current = None
     if row['current_id'] is not None:
         current = {'id': row['current_id'], 'title': row['current_title'], 'message': row['current_message']}
+    running = row['status'] == 'running'
+    attention = attention_json(row['attention_message'], row['attention_at'])
+    waiting = running and (attention is not None or row['tasks_waiting'] > 0)
     return {
         'id': row['id'], 'title': row['title'], 'origin': row['origin'], 'status': row['status'],
         'message': row['message'], 'created_at': row['created_at'], 'updated_at': row['updated_at'],
@@ -531,9 +1032,16 @@ def request_json(row, now, public, stale_after):
         **{key: row[key] for key in ('tasks_total', 'tasks_done', 'tasks_failed', 'tasks_running',
                                      'tasks_pending', 'tasks_cancelled')},
         'current': current, 'eta_at': row['eta_at'],
-        'stale': row['status'] == 'running' and is_stale(row['updated_at'], row['eta_at'], now, stale_after),
+        'stale': running and not waiting and is_stale(row['updated_at'], row['eta_at'], now, stale_after),
         'url': f"{public}/r/{row['id']}",
+        'attention': attention, 'waiting': waiting, 'tasks_waiting': row['tasks_waiting'],
     }
+
+
+def event_json(row):
+    return {**{key: row[key] for key in ('id', 'ts', 'type', 'request_id', 'task_id', 'request_title', 'task_title',
+                                         'status', 'percent', 'message')},
+            'replayed': bool(row['replayed'])}
 
 
 # HTTP
@@ -548,19 +1056,28 @@ ROUTES = (
     _route('GET', r'/favicon\.ico', 'favicon'),
     _route('GET', r'/api(?:/usage)?', 'file', rel='templates/usage.md', render=True),
     _route('GET', r'/api/rule', 'file', rel='templates/rule.md', render=True),
+    _route('GET', r'/api/changelog', 'file', rel='templates/changelog.md', render=True),
     _route('GET', r'/api/skill/SKILL\.md', 'file', rel='skill/SKILL.md'),
     _route('GET', r'/api/skill/taskctl', 'file', rel='taskctl'),
     _route('GET', r'/api/skill/taskctl\.py', 'file', rel='taskctl.py', render=True),
     _route('GET', r'/api/health', 'health'),
+    _route('GET', r'/api/events', 'events'),
+    _route('GET', r'/api/settings', 'get_settings'),
+    _route('PUT', r'/api/settings', 'put_settings'),
+    _route('DELETE', r'/api/settings', 'delete_settings'),
     _route('GET', r'/api/requests', 'list_requests'),
     _route('POST', r'/api/requests', 'create_request'),
     _route('GET', r'/api/requests/(?P<rid>[^/]+)', 'get_request'),
     _route('DELETE', r'/api/requests/(?P<rid>[^/]+)', 'delete_request'),
     _route('POST', r'/api/requests/(?P<rid>[^/]+)/complete', 'complete_request'),
     _route('POST', r'/api/requests/(?P<rid>[^/]+)/tasks', 'add_tasks'),
+    _route('POST', r'/api/requests/(?P<rid>[^/]+)/attention', 'request_attention'),
+    _route('DELETE', r'/api/requests/(?P<rid>[^/]+)/attention', 'request_resume'),
     _route('GET', r'/api/tasks/(?P<tid>[^/]+)', 'get_task'),
     _route('POST', r'/api/tasks/(?P<tid>[^/]+)/progress', 'progress'),
     _route('POST', r'/api/tasks/(?P<tid>[^/]+)/complete', 'complete_task'),
+    _route('POST', r'/api/tasks/(?P<tid>[^/]+)/attention', 'task_attention'),
+    _route('DELETE', r'/api/tasks/(?P<tid>[^/]+)/attention', 'task_resume'),
 )
 
 
@@ -590,6 +1107,7 @@ WILDCARD_HOSTS = ('0.0.0.0', '::', '', '*')
 class TasksServer(ThreadingHTTPServer):
     request_queue_size = 64
     allow_reuse_port = False  # never let a second server silently share the port
+    tls = False
 
     def __init__(self, host, port, handler, dual_stack=False):
         # dual_stack: one IPv6 socket on '::' that also takes IPv4 clients, so a hostname that resolves
@@ -610,16 +1128,41 @@ class TasksServer(ThreadingHTTPServer):
         log.info('connection error from %s: %s', plain_ip(client_address[0]), sys.exc_info()[1])
 
 
+class TLSTasksServer(TasksServer):
+    """The HTTPS listener. Accepted sockets are wrapped here without I/O; the handshake runs in the
+    request's own thread (Handler.setup), so a slow client never holds up accepting others."""
+    tls = True
+
+    def __init__(self, host, port, handler, dual_stack=False, context=None):
+        self.tls_context = context
+        super().__init__(host, port, handler, dual_stack)
+
+    def get_request(self):
+        sock, address = super().get_request()
+        try:
+            return self.tls_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), address
+        except OSError:
+            sock.close()
+            raise
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f'tasks/{VERSION}'
     sys_version = ''
     timeout = 30
+
+    def setup(self):
+        if self.server.tls:
+            self.request.settimeout(self.timeout)
+            self.request.do_handshake()  # a failure ends up in TasksServer.handle_error
+        super().setup()
 
     def _dispatch(self):
         method = 'GET' if self.command == 'HEAD' else self.command
         self._t0 = time.monotonic()
         self._error_note = ''
         self.warnings = []
+        self.replay = False
         path = self.path
         try:
             try:
@@ -629,7 +1172,7 @@ class Handler(BaseHTTPRequestHandler):
             self.query = parse_qs(split.query)
             path = unquote(split.path).rstrip('/') or '/'
             handler, params = self._match(method, path)
-            if method in ('POST', 'DELETE'):
+            if method in ('POST', 'PUT', 'DELETE'):
                 self._check_origin()
             getattr(self, 'h_' + handler)(**params)
         except ApiError as exc:
@@ -679,7 +1222,7 @@ class Handler(BaseHTTPRequestHandler):
                 return value
             if tid_match:
                 tid, parent = f'{tid_match[1]}-{int(tid_match[2])}', tid_match[1]
-                if suffix in ('', '/complete') and method != 'DELETE':
+                if suffix == '/attention' or (suffix in ('', '/complete') and method != 'DELETE'):
                     hint = f'{tid} is a task id; use /api/tasks/{tid}{suffix}'
                 else:
                     hint = f'{tid} is a task id; its request is {parent}'
@@ -688,7 +1231,8 @@ class Handler(BaseHTTPRequestHandler):
         if tid_match:
             return f'{tid_match[1]}-{int(tid_match[2])}'
         if rid_match:
-            hint = (f'{value} is a request id; use /api/requests/{value}{suffix}' if suffix in ('', '/complete')
+            hint = (f'{value} is a request id; use /api/requests/{value}{suffix}'
+                    if suffix in ('', '/complete', '/attention')
                     else f'{value} is a request id; task ids look like {value}-1')
             raise ApiError(400, f"'{value}' is a request id, not a task id", hint=hint)
         raise ApiError(400, f"malformed task id '{value[:40]}'", hint='task ids look like k3m9qa-3')
@@ -736,15 +1280,51 @@ class Handler(BaseHTTPRequestHandler):
         check_fields(body, known, self.warnings)
         return body
 
+    def _write_body(self, known):
+        # The writes taskctl may queue offline: a replay (X-Tasks-Replay: 1) may also carry "at".
+        self.replay = self.headers.get('X-Tasks-Replay', '').strip() == '1'
+        return self._body(known | {'at'} if self.replay else known)
+
+    def _at(self, body, now):
+        """A replayed write's own time, clamped to [now - REPLAY_WINDOW, now]; None when not a replay."""
+        if not self.replay:
+            return None
+        if body.get('at') is None:
+            return now
+        try:
+            at = parse_number(body['at'], 'at')
+        except ApiError:
+            self.warnings.append('at ignored: it must be a number (epoch seconds)')
+            return now
+        if at > now:
+            self.warnings.append(f'at clamped to now ({at - now:.3g}s in the future)')
+        elif at < now - REPLAY_WINDOW:
+            self.warnings.append(f'at clamped to {REPLAY_WINDOW // 3600}h ago')
+        return round(min(now, max(now - REPLAY_WINDOW, at)), 3)
+
     def base_url(self):
+        scheme = 'https' if self.server.tls else 'http'
         host = (self.headers.get('Host') or '').strip()
         if HOST_RE.fullmatch(host):
-            return 'http://' + host
+            return f'{scheme}://{host}'
         if self.server.public_url:
             return self.server.public_url
         ip, port = self.connection.getsockname()[:2]
         ip = plain_ip(ip).partition('%')[0]  # a link-local address's %zone is only meaningful here
-        return f'http://[{ip}]:{port}' if ':' in ip else f'http://{ip}:{port}'
+        return f'{scheme}://[{ip}]:{port}' if ':' in ip else f'{scheme}://{ip}:{port}'
+
+    def agent_url(self):
+        # BASE_URL of the rendered agent files. On the HTTPS listener it is plain http on the main port:
+        # agents stay on http, where a self-signed certificate cannot break urllib.
+        if not self.server.tls:
+            return self.base_url()
+        match = HOST_RE.fullmatch((self.headers.get('Host') or '').strip())
+        if match:
+            name = match.group(1)
+        else:
+            name = plain_ip(self.connection.getsockname()[0]).partition('%')[0]
+            name = f'[{name}]' if ':' in name else name
+        return f'http://{name}:{self.server.http_port}'
 
     def public_url(self):
         return self.server.public_url or self.base_url()
@@ -758,6 +1338,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('X-Content-Type-Options', 'nosniff')
             if cache:
                 self.send_header('Cache-Control', cache)
+            self.send_header('X-Tasks-Version', VERSION)
+            self.send_header('X-Tasks-Docs', docs_version())
             for key, value in (headers or {}).items():
                 self.send_header(key, value)
             self.end_headers()
@@ -812,10 +1394,9 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             raise ApiError(500, f'template missing: {rel}') from None
         if render:
-            base = self.base_url()
-            data = (data.decode('utf-8').replace('{{BASE_URL}}', base)
-                    .replace('{{PUBLIC_URL}}', self.server.public_url or base)
-                    .replace('{{VERSION}}', VERSION).encode('utf-8'))
+            data = (data.decode('utf-8').replace('{{BASE_URL}}', self.agent_url())
+                    .replace('{{PUBLIC_URL}}', self.public_url()).replace('{{VERSION}}', VERSION)
+                    .replace('{{DOCS_VERSION}}', docs_version()).encode('utf-8'))
         html = rel.endswith('.html')
         self._send(200, data, 'text/html; charset=utf-8' if html else 'text/plain; charset=utf-8',
                    'no-cache' if html else 'no-store', {'Vary': 'Accept'} if vary else None)
@@ -826,39 +1407,50 @@ class Handler(BaseHTTPRequestHandler):
     def h_health(self):
         self._reply(200, {'ok': True, 'service': 'tasks', 'version': VERSION, 'pid': os.getpid(), 'now': ts(),
                           'started_at': self.server.started_at,
-                          'requests_running': self.server.store.running_count()})
+                          'requests_running': self.server.store.running_count(),
+                          'docs_version': docs_version(), 'tls_port': self.server.tls_port,
+                          'config_path': str(self.server.settings.path)})
 
     def _query(self, name):
         values = self.query.get(name)
         return values[-1].strip().lower() if values else None
 
+    def _int_query(self, name, default, low, high):
+        if self._query(name) is None:
+            return default
+        try:
+            value = int(self._query(name))
+        except ValueError:
+            raise ApiError(400, f'{name} must be an integer', field=name) from None
+        if not low <= value <= high:
+            self.warnings.append(f'{name} {value} clamped to {low}..{high}')
+            value = min(high, max(low, value))
+        return value
+
     def h_list_requests(self):
         status = self._query('status')
         if status is not None and status not in ('running', 'done', 'failed'):
             raise ApiError(400, 'status must be running, done or failed', field='status')
-        limit = 100
-        if self._query('limit') is not None:
-            try:
-                limit = int(self._query('limit'))
-            except ValueError:
-                raise ApiError(400, 'limit must be an integer', field='limit') from None
-            if not 1 <= limit <= 500:
-                self.warnings.append(f'limit {limit} clamped to 1..500')
-                limit = min(500, max(1, limit))
+        limit = self._int_query('limit', 100, 1, 500)
         now, stale_after, public = ts(), self.server.stale_after, self.public_url()
         rows, counts = self.server.store.list_requests(status, limit, now, stale_after)
         self._reply(200, {'now': now, 'stale_after': stale_after, 'counts': counts,
                           'requests': [request_json(row, now, public, stale_after) for row in rows]})
 
     def h_create_request(self):
-        body, w = self._body({'title', 'origin', 'tasks'}), self.warnings
+        body, w = self._write_body({'title', 'origin', 'tasks', 'id'}), self.warnings
         title = clean_text(body.get('title'), 'title', TITLE_MAX, w, required=True)
         origin = clean_text(body.get('origin'), 'origin', ORIGIN_MAX, w)
         titles = [] if body.get('tasks') is None else clean_titles(body['tasks'], 'tasks', w)
+        rid = clean_rid(body.get('id'))
         now = ts()
-        row, tasks = self.server.store.create_request(title, origin, titles, now)
-        log.info("created request %s '%s' with %d task(s) from %s", row['id'], title, len(tasks), origin or '?')
-        self._reply(201, self._detail(row, tasks, now))
+        row, tasks, existing = self.server.store.create_request(rid, title, origin, titles, now, self._at(body, now))
+        if existing:
+            log.info('request %s already exists (a replayed create)', row['id'])
+        else:
+            log.info("created request %s '%s' with %d task(s) from %s%s", row['id'], title, len(tasks), origin or '?',
+                     ' (replayed)' if self.replay else '')
+        self._reply(200 if existing else 201, {**self._detail(row, tasks, now), 'existing': existing})
 
     def h_get_request(self, rid):
         now = ts()
@@ -866,16 +1458,18 @@ class Handler(BaseHTTPRequestHandler):
         self._reply(200, {**payload, 'stale_after': self.server.stale_after})
 
     def h_delete_request(self, rid):
-        self.server.store.delete_request(rid)
+        now = ts()
+        self.server.store.delete_request(rid, now)
         log.info('deleted request %s', rid)
-        self._reply(200, {'deleted': rid, 'now': ts()})
+        self._reply(200, {'deleted': rid, 'now': now})
 
     def h_complete_request(self, rid):
-        body, w = self._body({'status', 'message'}), self.warnings
+        body, w = self._write_body({'status', 'message'}), self.warnings
         status = parse_status(body.get('status'))
         message = clean_text(body.get('message'), 'message', MESSAGE_MAX, w, multiline=True)
         now = ts()
-        row, tasks, auto_closed, cancelled, previous = self.server.store.complete_request(rid, status, message, now)
+        row, tasks, auto_closed, cancelled, previous = self.server.store.complete_request(
+            rid, status, message, now, self._at(body, now))
         if previous != status:
             log.info('request %s %s (was %s; auto-closed %d, cancelled %d)', rid, status, previous,
                      len(auto_closed), len(cancelled))
@@ -907,29 +1501,94 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._reply(201, {**self._task(tasks[0], now), 'now': now, 'reopened': reopened})
 
+    def h_request_attention(self, rid):
+        body, w = self._write_body({'message'}), self.warnings
+        message = clean_text(body.get('message'), 'message', MESSAGE_MAX, w, required=True, multiline=True)
+        now = ts()
+        row, tasks = self.server.store.request_attention(rid, message, now, self._at(body, now))
+        log.info('request %s is waiting for input', rid)
+        self._reply(200, self._detail(row, tasks, now))
+
+    def h_request_resume(self, rid):
+        body = self._write_body(set())
+        now = ts()
+        row, tasks, cleared = self.server.store.request_resume(rid, now, self._at(body, now))
+        if cleared:
+            log.info('request %s resumed', rid)
+        self._reply(200, self._detail(row, tasks, now))
+
     def h_get_task(self, tid):
         now = ts()
         self._reply(200, {**self._task(self.server.store.task(tid), now), 'now': now})
 
     def h_progress(self, tid):
-        body, w = self._body({'message', 'percent', 'eta_seconds'}), self.warnings
+        body, w = self._write_body({'message', 'percent', 'eta_seconds'}), self.warnings
         message = clean_text(body.get('message'), 'message', MESSAGE_MAX, w, required=True, multiline=True)
         percent = None if body.get('percent') is None else parse_percent(body['percent'], w)
         eta = None if body.get('eta_seconds') is None else parse_eta(body['eta_seconds'], w)
         now = ts()
-        row = self.server.store.progress(tid, message, percent, None if eta is None else round(now + eta, 3), now)
+        row = self.server.store.progress(tid, message, percent, eta, now, self._at(body, now))
         log.debug('progress %s %s%% %s', tid, row['percent'], _printable(message))
         self._reply(200, {**self._task(row, now), 'now': now})
 
     def h_complete_task(self, tid):
-        body, w = self._body({'status', 'message'}), self.warnings
+        body, w = self._write_body({'status', 'message'}), self.warnings
         status = parse_status(body.get('status'))
         message = clean_text(body.get('message'), 'message', MESSAGE_MAX, w, multiline=True)
         now = ts()
-        row, previous = self.server.store.complete_task(tid, status, message, now)
+        row, previous = self.server.store.complete_task(tid, status, message, now, self._at(body, now))
         if previous != status:
             log.info('task %s %s (was %s)', tid, status, previous)
         self._reply(200, {**self._task(row, now), 'now': now})
+
+    def h_task_attention(self, tid):
+        body, w = self._write_body({'message'}), self.warnings
+        message = clean_text(body.get('message'), 'message', MESSAGE_MAX, w, required=True, multiline=True)
+        now = ts()
+        row = self.server.store.task_attention(tid, message, now, self._at(body, now))
+        log.info('task %s is waiting for input', tid)
+        self._reply(200, {**self._task(row, now), 'now': now})
+
+    def h_task_resume(self, tid):
+        body = self._write_body(set())
+        now = ts()
+        row, cleared = self.server.store.task_resume(tid, now, self._at(body, now))
+        if cleared:
+            log.info('task %s resumed', tid)
+        self._reply(200, {**self._task(row, now), 'now': now})
+
+    def h_events(self):
+        since = self._query('since')
+        if since is not None:
+            try:
+                since = int(since)
+                if not 0 <= since < 2 ** 63:
+                    raise ValueError
+            except ValueError:
+                raise ApiError(400, 'since must be an event id (an integer >= 0)', field='since',
+                               hint="omit since for a baseline; each reply's cursor is the next since") from None
+        limit = self._int_query('limit', 500, 1, EVENTS_PER_CALL)
+        version = self.server.settings.current_version()
+        now = ts()
+        self._reply(200, {'now': now, **self.server.store.events(since, limit, now, self.server.stale_after),
+                          'settings_version': version})
+
+    def h_get_settings(self):
+        self._reply(200, self.server.settings.snapshot(ts()))
+
+    def h_put_settings(self):
+        body = self._body({'settings'})
+        if body.get('settings') is None:
+            raise ApiError(400, 'settings is required', field='settings',
+                           hint='send {"settings": {"events": {"task_done": {"sound": true}}}}')
+        self.server.settings.update(check_settings(body['settings'], 'settings'))
+        log.info('settings saved to %s', self.server.settings.path)
+        self._reply(200, self.server.settings.snapshot(ts()))
+
+    def h_delete_settings(self):
+        self.server.settings.reset()
+        log.info('settings reset to the defaults (%s removed)', self.server.settings.path)
+        self._reply(200, self.server.settings.snapshot(ts()))
 
 
 def _printable(text):
@@ -951,6 +1610,9 @@ def maintenance_loop(store, expire_after, retention_days, stop):
                 pruned = store.prune(now - retention_days * 86400)
                 if pruned:
                     log.info('pruned %d finished request(s) older than %g days', pruned, retention_days)
+            pruned = store.prune_events(now - EVENTS_MAX_AGE, EVENTS_KEEP)
+            if pruned:
+                log.debug('pruned %d event(s)', pruned)
         except sqlite3.OperationalError as exc:
             log.warning('maintenance pass skipped: %s', exc)
         except Exception:
@@ -976,6 +1638,14 @@ def parse_args(argv):
     parser.add_argument('--db', type=Path, default=env('TASKS_DB') or str(TASKS_DIR / 'data' / 'tasks.db'))
     parser.add_argument('--public-url', default=env('TASKS_PUBLIC_URL') or None,
                         help='base for human links (e.g. http://<lan-ip>:8765); default: from the Host header')
+    parser.add_argument('--config', type=Path, default=env('TASKS_CONFIG') or None,
+                        help='global settings file (default: <db dir>/settings.json)')
+    parser.add_argument('--tls-port', type=int, default=env('TASKS_TLS_PORT') or None,
+                        help='also serve HTTPS on this port (with --tls-cert and --tls-key)')
+    parser.add_argument('--tls-cert', type=Path, default=env('TASKS_TLS_CERT') or None,
+                        help='PEM certificate (chain) for --tls-port')
+    parser.add_argument('--tls-key', type=Path, default=env('TASKS_TLS_KEY') or None,
+                        help='PEM private key (unencrypted) for --tls-port')
     parser.add_argument('--stale-after', type=_seconds, default=600,
                         help='seconds of silence before running work is stale')
     parser.add_argument('--expire-after', type=_seconds, default=86400,
@@ -987,6 +1657,17 @@ def parse_args(argv):
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error(f'--port must be 1..65535, got {args.port}')
+    tls = {'--tls-port': args.tls_port, '--tls-cert': args.tls_cert, '--tls-key': args.tls_key}
+    missing = [name for name, value in tls.items() if value is None]
+    if 0 < len(missing) < 3:
+        given = [name for name in tls if name not in missing]
+        parser.error(f'{" and ".join(given)} also need{"s" if len(given) == 1 else ""} {" and ".join(missing)}: '
+                     'give all three of --tls-port, --tls-cert and --tls-key, or none')
+    if args.tls_port is not None:
+        if not 1 <= args.tls_port <= 65535:
+            parser.error(f'--tls-port must be 1..65535, got {args.tls_port}')
+        if args.tls_port == args.port:
+            parser.error(f'--tls-port must differ from --port ({args.port})')
     if args.public_url:
         args.public_url = args.public_url.strip().rstrip('/')
         parts = urlsplit(args.public_url)
@@ -1016,19 +1697,34 @@ def _interrupt(signum, frame):
     raise KeyboardInterrupt
 
 
-def listen(host, port):
+def listen(host, port, server_class=TasksServer, **extra):
     # A wildcard host listens dual-stack; without IPv6 it falls back to IPv4 only. Any other host is
     # bound as given (an IPv6 one is IPv6 only).
     host = host.strip('[]')
     if host in WILDCARD_HOSTS:
         try:
-            return TasksServer('::', port, Handler, dual_stack=True)
+            return server_class('::', port, Handler, dual_stack=True, **extra)
         except OSError as exc:
             if exc.errno in (errno.EADDRINUSE, errno.EACCES):
                 raise
             log.info('IPv6 is unavailable (%s); listening on IPv4 only', exc.strerror or exc)
         host = '0.0.0.0'
-    return TasksServer(host, port, Handler)
+    return server_class(host, port, Handler, **extra)
+
+
+def _listen_error(exc, host, port, flag=''):
+    # flag names the option for the second listener's errors (--tls-port).
+    if exc.errno == errno.EADDRINUSE:
+        return (f'error: {flag}port {port} already in use (is the tasks server already running? '
+                f'try: curl -s http://127.0.0.1:{port}/api/health)')
+    return f'error: {flag}cannot listen on {host}:{port}: {exc.strerror or exc}'
+
+
+def _shown(httpd, scheme):
+    host, port = httpd.server_address[:2]
+    if httpd.dual_stack:
+        return f'{scheme}://0.0.0.0:{port} and {scheme}://[::]:{port}'
+    return f'{scheme}://[{host}]:{port}' if ':' in host else f'{scheme}://{host}:{port}'
 
 
 def main(argv=None):
@@ -1042,48 +1738,68 @@ def main(argv=None):
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, stream=sys.stderr,
                         format='%(asctime)s %(levelname)s %(message)s')
 
+    context = None
+    if args.tls_port is not None:
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            # An encrypted key would prompt on the terminal; an empty password makes it an error instead.
+            context.load_cert_chain(args.tls_cert, args.tls_key, password=lambda: b'')
+        except (OSError, ValueError) as exc:  # ssl.SSLError is an OSError
+            print(f'error: cannot load the TLS certificate {args.tls_cert} and key {args.tls_key}: '
+                  f'{getattr(exc, "strerror", None) or exc}', file=sys.stderr)
+            return 2
     try:
         httpd = listen(args.host, args.port)
     except OSError as exc:
-        if exc.errno == errno.EADDRINUSE:
-            print(f'error: port {args.port} already in use (is the tasks server already running? '
-                  f'try: curl -s http://127.0.0.1:{args.port}/api/health)', file=sys.stderr)
-        else:
-            print(f'error: cannot listen on {args.host}:{args.port}: {exc.strerror or exc}', file=sys.stderr)
+        print(_listen_error(exc, args.host, args.port), file=sys.stderr)
         return 2
+    servers = [httpd]
+    if context is not None:
+        try:
+            servers.append(listen(args.host, args.tls_port, TLSTasksServer, context=context))
+        except OSError as exc:
+            httpd.server_close()
+            print(_listen_error(exc, args.host, args.tls_port, '--tls-port: '), file=sys.stderr)
+            return 2
     try:
         store = Store(args.db)
     except (sqlite3.Error, OSError, RuntimeError) as exc:
-        httpd.server_close()
+        for server in servers:
+            server.server_close()
         print(f'error: cannot open database {args.db}: {exc}', file=sys.stderr)
         return 2
     pidfile = args.pidfile or args.db.parent / f'server-{args.port}.pid'
     try:
         write_pidfile(pidfile)
     except OSError as exc:
-        httpd.server_close()
+        for server in servers:
+            server.server_close()
         store.close()
         print(f'error: cannot write pidfile {pidfile}: {exc}', file=sys.stderr)
         return 2
 
-    httpd.store = store
-    httpd.public_url = args.public_url
-    httpd.stale_after = args.stale_after
-    httpd.started_at = ts()
-    httpd.local_names = frozenset(name.lower() for name in (
+    settings = Settings(Path(os.path.abspath(args.config or args.db.parent / 'settings.json')))
+    settings.current_version()  # read it now, so a broken file is reported at startup
+    local_names = frozenset(name.lower() for name in (
         'localhost', socket.gethostname(), urlsplit(args.public_url or '').hostname) if name)
+    started_at = ts()
+    for server in servers:
+        server.store, server.settings = store, settings
+        server.public_url = args.public_url
+        server.stale_after = args.stale_after
+        server.started_at = started_at
+        server.local_names = local_names
+        server.http_port, server.tls_port = args.port, args.tls_port
 
     stop = threading.Event()
     threading.Thread(target=maintenance_loop, name='maintenance', daemon=True,
                      args=(store, args.expire_after, args.retention_days, stop)).start()
     signal.signal(signal.SIGTERM, _interrupt)
-    host, port = httpd.server_address[:2]
-    if httpd.dual_stack:
-        shown = f'http://0.0.0.0:{port} and http://[::]:{port}'
-    else:
-        shown = f'http://[{host}]:{port}' if ':' in host else f'http://{host}:{port}'
-    log.info('tasks server listening on %s (db %s, pid %d, public url %s)', shown,
-             args.db, os.getpid(), args.public_url or 'from Host header')
+    for server in servers[1:]:
+        threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.5}, name='https', daemon=True).start()
+        log.info('https listener on %s (certificate %s)', _shown(server, 'https'), args.tls_cert)
+    log.info('tasks server listening on %s (db %s, pid %d, public url %s, settings %s)', _shown(httpd, 'http'),
+             args.db, os.getpid(), args.public_url or 'from Host header', settings.path)
     try:
         httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
@@ -1091,7 +1807,10 @@ def main(argv=None):
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         stop.set()
-        httpd.server_close()
+        for server in servers[1:]:
+            server.shutdown()
+        for server in servers:
+            server.server_close()
         store.close()
         remove_pidfile(pidfile)
     return 0

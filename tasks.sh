@@ -8,11 +8,11 @@ set -euo pipefail
 ROOT="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SERVER="$ROOT/tasks/server.py"
 DEFAULT_PORT=8765
-TASKCTL_SUBS=(new add start progress done fail show list ping)
 
 usage() {
     cat <<EOF
 usage: $0 [--bg | --stop | --status | --install-skill] [--host HOST] [--port PORT] [--db PATH] [--public-url URL]
+          [--config PATH] [--tls-port PORT --tls-cert FILE --tls-key FILE]
 
   (no action)       run the board in the foreground (Ctrl-C stops it)
   --bg              start it in the background; if it is already running, just report it
@@ -27,6 +27,13 @@ usage: $0 [--bg | --stop | --status | --install-skill] [--host HOST] [--port POR
                     (default: \$TASKS_DB or tasks/data/tasks.db)
   --public-url URL  base of the links the board hands out (default: \$TASKS_PUBLIC_URL, else the
                     LAN address when the firewall lets the LAN in, else the address each client used)
+  --config PATH     the board-wide notification settings file; relative to the current directory
+                    (default: \$TASKS_CONFIG or settings.json next to the database)
+  --tls-port PORT   also serve the board over HTTPS on this port, so browsers on other machines can
+                    show notifications (default: \$TASKS_TLS_PORT; off when unset)
+  --tls-cert FILE   the PEM certificate (chain) for it (default: \$TASKS_TLS_CERT)
+  --tls-key FILE    its PEM private key (default: \$TASKS_TLS_KEY)
+                    The three TLS options go together: give all of them or none.
 
 Values can also be given as --port=8765.
 EOF
@@ -60,6 +67,10 @@ OPT_HOST=""
 OPT_PORT=""
 OPT_DB=""
 OPT_PUBLIC_URL=""
+OPT_CONFIG=""
+OPT_TLS_PORT=""
+OPT_TLS_CERT=""
+OPT_TLS_KEY=""
 declare -A SEEN=()
 while [ $# -gt 0 ]; do
     arg="$1"
@@ -69,7 +80,8 @@ while [ $# -gt 0 ]; do
         --status) set_action status ;;
         --install-skill) set_action install-skill ;;
         -h|--help) usage; exit 0 ;;
-        --host|--host=*|--port|--port=*|--db|--db=*|--public-url|--public-url=*)
+        --host|--host=*|--port|--port=*|--db|--db=*|--public-url|--public-url=*|--config|--config=*|\
+        --tls-port|--tls-port=*|--tls-cert|--tls-cert=*|--tls-key|--tls-key=*)
             name="${arg%%=*}"
             if [ -n "${SEEN[$name]:-}" ]; then
                 die "$name given more than once"
@@ -93,6 +105,10 @@ while [ $# -gt 0 ]; do
                 --port) OPT_PORT="$value" ;;
                 --db) OPT_DB="$value" ;;
                 --public-url) OPT_PUBLIC_URL="$value" ;;
+                --config) OPT_CONFIG="$value" ;;
+                --tls-port) OPT_TLS_PORT="$value" ;;
+                --tls-cert) OPT_TLS_CERT="$value" ;;
+                --tls-key) OPT_TLS_KEY="$value" ;;
             esac
             ;;
         -*) die "unknown option: $arg" "run $0 --help for usage" ;;
@@ -111,29 +127,69 @@ if [ -n "$OPT_DB" ]; then DB="$OPT_DB"; DB_FROM="--db"
 else DB="${TASKS_DB:-$ROOT/tasks/data/tasks.db}"; DB_FROM="TASKS_DB"; fi
 if [ -n "$OPT_PUBLIC_URL" ]; then PUBLIC_URL="$OPT_PUBLIC_URL"; PUBLIC_URL_FROM="--public-url"
 else PUBLIC_URL="${TASKS_PUBLIC_URL:-}"; PUBLIC_URL_FROM="TASKS_PUBLIC_URL"; fi
+if [ -n "$OPT_CONFIG" ]; then CONFIG="$OPT_CONFIG"; CONFIG_FROM="--config"
+else CONFIG="${TASKS_CONFIG:-}"; CONFIG_FROM="TASKS_CONFIG"; fi
+if [ -n "$OPT_TLS_PORT" ]; then TLS_PORT="$OPT_TLS_PORT"; TLS_PORT_FROM="--tls-port"
+else TLS_PORT="${TASKS_TLS_PORT:-}"; TLS_PORT_FROM="TASKS_TLS_PORT"; fi
+if [ -n "$OPT_TLS_CERT" ]; then TLS_CERT="$OPT_TLS_CERT"; TLS_CERT_FROM="--tls-cert"
+else TLS_CERT="${TASKS_TLS_CERT:-}"; TLS_CERT_FROM="TASKS_TLS_CERT"; fi
+if [ -n "$OPT_TLS_KEY" ]; then TLS_KEY="$OPT_TLS_KEY"; TLS_KEY_FROM="--tls-key"
+else TLS_KEY="${TASKS_TLS_KEY:-}"; TLS_KEY_FROM="TASKS_TLS_KEY"; fi
 
-# 10# keeps a leading zero from being read as octal, and normalises "08765" to the same pidfile.
-if ! [[ $PORT =~ ^[0-9]{1,5}$ ]] || [ "$((10#$PORT))" -lt 1 ] || [ "$((10#$PORT))" -gt 65535 ]; then
-    die "$PORT_FROM must be a port number from 1 to 65535, got '$PORT'"
-fi
-PORT="$((10#$PORT))"
+# $1: a port as given, $2: where it came from. Prints it as a plain number; 10# keeps a leading zero
+# from being read as octal, and normalises "08765" to the same pidfile.
+valid_port() {
+    if ! [[ $1 =~ ^[0-9]{1,5}$ ]] || [ "$((10#$1))" -lt 1 ] || [ "$((10#$1))" -gt 65535 ]; then
+        die "$2 must be a port number from 1 to 65535, got '$1'"
+    fi
+    echo "$((10#$1))"
+}
+PORT="$(valid_port "$PORT" "$PORT_FROM")" || exit 1
 
 if [ -z "$HOST" ] || [[ $HOST =~ [[:space:]] ]]; then
     die "$HOST_FROM must be an address to listen on, got '$HOST'"
 fi
 
-# A relative --db is relative to where the caller is, not to this script.
-case "$DB" in
-    "~") DB="$HOME" ;;
-    "~/"*) DB="$HOME/${DB#"~/"}" ;;
-esac
-case "$DB" in
-    /*) ;;
-    *) DB="$PWD/$DB" ;;
-esac
-DB="$(realpath -m -s -- "$DB")"
+# A relative path is relative to where the caller is, not to this script (which changes directory).
+abs_path() {
+    local path="$1"
+    case "$path" in
+        "~") path="$HOME" ;;
+        "~/"*) path="$HOME/${path#"~/"}" ;;
+    esac
+    case "$path" in
+        /*) ;;
+        *) path="$PWD/$path" ;;
+    esac
+    realpath -m -s -- "$path"
+}
+DB="$(abs_path "$DB")"
 if [ -d "$DB" ]; then
     die "$DB_FROM must name the database file, but $DB is a directory"
+fi
+if [ -n "$CONFIG" ]; then
+    CONFIG="$(abs_path "$CONFIG")"
+    if [ -d "$CONFIG" ]; then
+        die "$CONFIG_FROM must name the settings file, but $CONFIG is a directory"
+    fi
+fi
+
+# The HTTPS listener: all three settings or none. The files are checked only when a server starts.
+if [ -n "$TLS_PORT$TLS_CERT$TLS_KEY" ]; then
+    missing=()
+    [ -n "$TLS_PORT" ] || missing+=("--tls-port")
+    [ -n "$TLS_CERT" ] || missing+=("--tls-cert")
+    [ -n "$TLS_KEY" ] || missing+=("--tls-key")
+    if [ ${#missing[@]} -gt 0 ]; then
+        die "the HTTPS listener needs --tls-port, --tls-cert and --tls-key together; missing: ${missing[*]}" \
+            "(or set TASKS_TLS_PORT, TASKS_TLS_CERT and TASKS_TLS_KEY; leave all three out for plain http only)"
+    fi
+    TLS_PORT="$(valid_port "$TLS_PORT" "$TLS_PORT_FROM")" || exit 1
+    if [ "$TLS_PORT" = "$PORT" ]; then
+        die "$TLS_PORT_FROM must differ from the http port ($PORT)"
+    fi
+    TLS_CERT="$(abs_path "$TLS_CERT")"
+    TLS_KEY="$(abs_path "$TLS_KEY")"
 fi
 
 if [ -n "$PUBLIC_URL" ]; then
@@ -254,11 +310,12 @@ running_pid() {
     return 1
 }
 
+# $1: the port to look at.
 port_listeners() {
     if command -v ss >/dev/null 2>&1; then
-        ss -Hltnp "sport = :$PORT" 2>/dev/null || true
+        ss -Hltnp "sport = :$1" 2>/dev/null || true
     else
-        python3 - "$PORT" <<'PY' || true
+        python3 - "$1" <<'PY' || true
 import socket, sys
 try:
     socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=1).close()
@@ -269,28 +326,38 @@ PY
     fi
 }
 
+# Checks the http port and, when the HTTPS listener is on, its port too.
 refuse_busy_port() {
-    local listeners
-    listeners="$(port_listeners)"
-    if [ -n "$listeners" ]; then
-        echo "error: port $PORT is already in use by another program:" >&2
-        printf '         %s\n' "$listeners" >&2
-        echo "       pick another port with --port, or stop that program" >&2
-        exit 1
-    fi
+    local listeners port flag
+    for port in "$PORT" ${TLS_PORT:+"$TLS_PORT"}; do
+        flag="--port"
+        [ "$port" = "$PORT" ] || flag="--tls-port"
+        listeners="$(port_listeners "$port")"
+        if [ -n "$listeners" ]; then
+            echo "error: port $port is already in use by another program:" >&2
+            printf '         %s\n' "$listeners" >&2
+            echo "       pick another port with $flag, or stop that program" >&2
+            exit 1
+        fi
+    done
 }
 
-# Reads the listen address, database and public URL the running server was actually started with,
-# so reports describe it rather than this invocation's flags.
+# Reads the listen address, database, public URL, settings file and HTTPS port the running server
+# was actually started with, so reports describe it rather than this invocation's flags. RUN_CONFIG
+# is empty when it was not given (the server's default: settings.json next to the database).
 RUN_HOST=""
 RUN_DB=""
 RUN_PUBLIC_URL=""
+RUN_CONFIG=""
+RUN_TLS_PORT=""
 read_running_config() {
     local pid="$1" i=0 arg next
     local -a argv=()
     RUN_HOST="$HOST"
     RUN_DB="$DB"
     RUN_PUBLIC_URL=""
+    RUN_CONFIG=""
+    RUN_TLS_PORT=""
     mapfile -d '' -t argv 2>/dev/null < "/proc/$pid/cmdline" || return 0
     while [ $i -lt ${#argv[@]} ]; do
         arg="${argv[$i]}"
@@ -302,6 +369,10 @@ read_running_config() {
             --db=*) RUN_DB="${arg#*=}" ;;
             --public-url) RUN_PUBLIC_URL="$next"; i=$((i + 1)) ;;
             --public-url=*) RUN_PUBLIC_URL="${arg#*=}" ;;
+            --config) RUN_CONFIG="$next"; i=$((i + 1)) ;;
+            --config=*) RUN_CONFIG="${arg#*=}" ;;
+            --tls-port) RUN_TLS_PORT="$next"; i=$((i + 1)) ;;
+            --tls-port=*) RUN_TLS_PORT="${arg#*=}" ;;
         esac
         i=$((i + 1))
     done
@@ -331,6 +402,12 @@ warn_running_differs() {
     fi
     if [ -n "$OPT_PUBLIC_URL" ] && [ "$RUN_PUBLIC_URL" != "$PUBLIC_URL" ]; then
         echo "note: the running server (pid $pid) uses --public-url ${RUN_PUBLIC_URL:-(none)}, not $PUBLIC_URL; run $SELF --stop$SELF_PORT first to change it" >&2
+    fi
+    if [ -n "$OPT_CONFIG" ] && [ "$RUN_CONFIG" != "$CONFIG" ]; then
+        echo "note: the running server (pid $pid) uses --config ${RUN_CONFIG:-(the default)}, not $CONFIG; run $SELF --stop$SELF_PORT first to change it" >&2
+    fi
+    if [ -n "$OPT_TLS_PORT" ] && [ "$RUN_TLS_PORT" != "$TLS_PORT" ]; then
+        echo "note: the running server (pid $pid) uses --tls-port ${RUN_TLS_PORT:-(none)}, not $TLS_PORT; run $SELF --stop$SELF_PORT first to change it" >&2
     fi
 }
 
@@ -371,9 +448,10 @@ except OSError:
 }
 
 # 0: ufw lets the LAN reach $PORT (or is not filtering at all); 1: it does not; 2: cannot tell.
-# IPv4 by default; with $1 = 6 the same question for IPv6 (/etc/ufw/user6.rules).
+# IPv4 by default; with $1 = 6 the same question for IPv6 (/etc/ufw/user6.rules). $2: another port
+# to ask about (the HTTPS one) instead of $PORT.
 lan_firewall_open() {
-    local v6="${1:-}"
+    local v6="${1:-}" port="${2:-$PORT}"
     if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-active --quiet ufw 2>/dev/null; then
         return 0
     fi
@@ -394,7 +472,7 @@ lan_firewall_open() {
     # Rules look like `-A ufw-user-input -p tcp --dport 8765 -s 192.168.1.0/24 -j ACCEPT` (ufw6-user-*
     # in user6.rules); also accept `ufw limit`, multiport lists and ranges. A udp-only rule does not
     # open a tcp port.
-    awk -v port="$PORT" -v chain="ufw$v6-user" '
+    awk -v port="$port" -v chain="ufw$v6-user" '
         $1 == "-A" && $2 == chain "-input" && $0 ~ (" -j (ACCEPT|" chain "-limit-accept)( |$)") && !/ -p udp / {
             for (i = 3; i < NF; i++) {
                 if ($i != "--dport" && $i != "--dports") continue
@@ -494,6 +572,30 @@ hostname_line() {
     esac
 }
 
+# The board's HTTPS listener, for the banner: its port (empty when it is off) and, like LAN_STATE, whether
+# the LAN can reach that port (open | blocked | unknown; empty when there is no LAN address to ask about).
+TLS_SHOWN=""
+TLS_LAN_STATE=""
+set_tls_state() {
+    TLS_SHOWN="$1"
+    TLS_LAN_STATE=""
+    if [ -n "$TLS_SHOWN" ] && [ -n "$LAN_IP" ]; then
+        case "$LAN_STATE" in
+            open|blocked|unknown) TLS_LAN_STATE="$(firewall_state "" "$TLS_SHOWN")" ;;
+        esac
+    fi
+}
+
+https_line() {
+    local local_base="${LOCAL_URL%:*}"
+    case "$TLS_LAN_STATE" in
+        open) echo "https://$LAN_IP:$TLS_SHOWN/" ;;
+        blocked) echo "https://$LAN_IP:$TLS_SHOWN/  (blocked by ufw, see below)" ;;
+        unknown) echo "https://$LAN_IP:$TLS_SHOWN/  (may be blocked: cannot read /etc/ufw/user.rules)" ;;
+        *) echo "https://${local_base#http://}:$TLS_SHOWN/" ;;
+    esac
+}
+
 lan_warning() {
     local public="$1" lines=()
     case "$LAN_STATE" in
@@ -524,6 +626,20 @@ lan_warning() {
                 "that resolves the name to this machine's fe80:: address, as Windows can):"
                 ""
                 "  sudo ufw allow from fe80::/10 to any port $PORT proto tcp")
+    fi
+    if [ "$TLS_LAN_STATE" = blocked ] || [ "$TLS_LAN_STATE" = unknown ]; then
+        if [ ${#lines[@]} -gt 0 ] && [ -n "${lines[-1]}" ]; then
+            lines+=("")
+        fi
+        if [ "$TLS_LAN_STATE" = blocked ]; then
+            lines+=("ufw is active and has no rule letting the LAN reach the HTTPS port $TLS_SHOWN.")
+        else
+            lines+=("ufw is active but /etc/ufw/user.rules is unreadable, so the HTTPS port $TLS_SHOWN"
+                    "may be closed to other machines.")
+        fi
+        lines+=("For https (browser notifications) from other machines, run this yourself:"
+                ""
+                "  sudo ufw allow from $LAN_NET to any port $TLS_SHOWN proto tcp")
     fi
     if [ ${#lines[@]} -eq 0 ]; then
         return 0
@@ -562,9 +678,37 @@ rule_state() {
     fi
 }
 
+# $1: a JSON object, $2: a key. Prints its value, or nothing when it is missing or null.
+json_field() {
+    python3 -c '
+import json, sys
+try:
+    value = json.loads(sys.argv[1]).get(sys.argv[2])
+except (ValueError, AttributeError):
+    value = None
+if value is not None:
+    print(value)' "$1" "$2" 2>/dev/null || true
+}
+
+# $1: the settings file, $2: the running board's /api/settings answer (empty when there is none).
+settings_line() {
+    local file="$1" error=""
+    if [ -n "$2" ]; then
+        error="$(json_field "$2" error)"
+    fi
+    if [ -n "$error" ]; then
+        echo "$file (not usable, so the defaults apply: $error)"
+    elif [ -e "$file" ]; then
+        echo "$file"
+    else
+        echo "$file (not created yet: the defaults apply until someone saves the settings)"
+    fi
+}
+
+# $1: the /api/health answer (empty when there was none).
 health_summary() {
-    local json
-    if ! json="$(health_json)" || ! is_tasks_health "$json"; then
+    local json="$1"
+    if [ -z "$json" ]; then
         echo "no answer from $LOCAL_URL/api/health"
         return 0
     fi
@@ -583,9 +727,28 @@ print('ok, version %s, up %s, %s running request%s'
 PY
 }
 
-# $1: headline, $2: pid, $3: fg | bg, then the running server's host, database and public URL.
+# $1: headline, $2: pid, $3: fg | bg, then the running server's host, database, public URL, settings
+# file (empty: the default, next to the database) and HTTPS port (empty: none). A running server's
+# own /api/health has the last word on the settings file and the HTTPS port.
 banner() {
-    local headline="$1" pid="$2" mode="$3" host="$4" db="$5" public="$6" agent_base=""
+    local headline="$1" pid="$2" mode="$3" host="$4" db="$5" public="$6" config="${7:-}" tls="${8:-}"
+    local agent_base="" health="" settings="" value
+    if [ "$mode" != fg ]; then
+        if ! health="$(health_json)" || ! is_tasks_health "$health"; then
+            health=""
+        fi
+    fi
+    if [ -n "$health" ]; then
+        value="$(json_field "$health" tls_port)"
+        if [ -n "$value" ]; then tls="$value"; fi
+        value="$(json_field "$health" config_path)"
+        if [ -n "$value" ]; then config="$value"; fi
+        settings="$("${CURL[@]}" -fsS --connect-timeout 1 --max-time 2 "$LOCAL_URL/api/settings" 2>/dev/null)" || settings=""
+    fi
+    if [ -z "$config" ]; then
+        config="$(dirname -- "$db")/settings.json"
+    fi
+    set_tls_state "$tls"
     echo
     echo "tasks board: $headline (pid $pid, port $PORT)"
     echo "  dashboard   $LOCAL_URL/"
@@ -593,10 +756,17 @@ banner() {
     if [ -n "$LAN6_STATE" ]; then
         echo "  hostname    $(hostname_line)"
     fi
+    if [ -n "$TLS_SHOWN" ]; then
+        echo "  https       $(https_line)"
+    elif [ "$LAN_STATE" != loopback ]; then
+        # A browser on this machine (localhost) can notify without it; one on another machine cannot.
+        echo "  https       off (browsers on other machines need it to show notifications; see --help)"
+    fi
     if [ "$mode" != fg ]; then
-        echo "  health      $(health_summary)"
+        echo "  health      $(health_summary "$health")"
     fi
     echo "  database    $db"
+    echo "  settings    $(settings_line "$config" "$settings")"
     if [ "$mode" = fg ]; then
         echo "  log         this terminal"
     else
@@ -634,6 +804,18 @@ build_server_args() {
     SERVER_ARGS=(--host "$HOST" --port "$PORT" --db "$DB" --pidfile "$PIDFILE")
     if [ -n "$public" ]; then
         SERVER_ARGS+=(--public-url "$public")
+    fi
+    if [ -n "$CONFIG" ]; then
+        SERVER_ARGS+=(--config "$CONFIG")
+    fi
+    if [ -n "$TLS_PORT" ]; then
+        if [ ! -f "$TLS_CERT" ] || [ ! -r "$TLS_CERT" ]; then
+            die "$TLS_CERT_FROM: cannot read the certificate $TLS_CERT"
+        fi
+        if [ ! -f "$TLS_KEY" ] || [ ! -r "$TLS_KEY" ]; then
+            die "$TLS_KEY_FROM: cannot read the private key $TLS_KEY"
+        fi
+        SERVER_ARGS+=(--tls-port "$TLS_PORT" --tls-cert "$TLS_CERT" --tls-key "$TLS_KEY")
     fi
 }
 
@@ -775,19 +957,21 @@ install_skill() {
     fi
 }
 
-print_allow_rules() {
-    local i sep
-    echo "Recommended permissions.allow entries for $CONFIG_DIR/settings.json. Add them yourself;"
-    echo "this script never edits settings.json:"
-    # Commas between entries, so the block pastes straight into the JSON array.
-    for i in "${!TASKCTL_SUBS[@]}"; do
-        sep=","
-        if [ "$i" -eq $((${#TASKCTL_SUBS[@]} - 1)) ]; then
-            sep=""
-        fi
-        printf '"Bash(%s/taskctl %s *)"%s\n' "$SKILL_DIR" "${TASKCTL_SUBS[$i]}" "$sep"
-    done
-    echo "'run' is deliberately excluded: it runs an arbitrary command, so approve each use of it."
+print_permission_rules() {
+    echo "Recommended permission rules for $CONFIG_DIR/settings.json. Add them yourself (into the"
+    echo "permissions.allow and permissions.ask lists, if you already have them); this script never"
+    echo "edits settings.json:"
+    # Each string goes through json.dumps, so a path with a quote or a backslash still pastes as valid JSON.
+    python3 - "$SKILL_DIR/taskctl" <<'PY'
+import json, sys
+taskctl = sys.argv[1]
+ask = ['Bash(%s %s)' % (taskctl, rule) for rule in ('run *', '--* run *', 'update*', '--* update*', 'install-rule*', '--* install-rule*')]
+print('{\n  "permissions": {\n    "allow": [%s],\n    "ask": [\n      %s\n    ]\n  }\n}'
+      % (json.dumps('Bash(%s *)' % taskctl), ',\n      '.join(json.dumps(rule) for rule in ask)))
+PY
+    echo "The allow rule covers every report (so subagents are not refused); the ask rules win over it,"
+    echo "so 'taskctl run', which runs an arbitrary command, and 'taskctl update', which replaces the"
+    echo "skill's code, still ask you each time, also with an option such as --url in front of them."
     echo "Start a new Claude Code session (or /reload-skills) to load the skill."
 }
 
@@ -799,7 +983,7 @@ case "$ACTION" in
         if pid="$(running_pid)"; then
             read_running_config "$pid"
             detect_lan "$RUN_HOST"
-            banner "running" "$pid" bg "$RUN_HOST" "$RUN_DB" "$RUN_PUBLIC_URL"
+            banner "running" "$pid" bg "$RUN_HOST" "$RUN_DB" "$RUN_PUBLIC_URL" "$RUN_CONFIG" "$RUN_TLS_PORT"
             exit 0
         fi
         detect_lan "$HOST"
@@ -827,12 +1011,12 @@ case "$ACTION" in
             install_skill
         fi
         if $STARTED; then
-            banner "started" "$PID" bg "$RUN_HOST" "$RUN_DB" "$RUN_PUBLIC_URL"
+            banner "started" "$PID" bg "$RUN_HOST" "$RUN_DB" "$RUN_PUBLIC_URL" "$RUN_CONFIG" "$RUN_TLS_PORT"
         else
-            banner "already running" "$PID" bg "$RUN_HOST" "$RUN_DB" "$RUN_PUBLIC_URL"
+            banner "already running" "$PID" bg "$RUN_HOST" "$RUN_DB" "$RUN_PUBLIC_URL" "$RUN_CONFIG" "$RUN_TLS_PORT"
         fi
         if [ "$ACTION" = install-skill ]; then
-            print_allow_rules
+            print_permission_rules
         fi
         ;;
     "")
@@ -846,7 +1030,7 @@ case "$ACTION" in
         mkdir -p "$DATA_DIR"
         public="$(server_public_url)"
         # exec keeps this pid, so the banner can name it before the server starts.
-        banner "starting in the foreground, Ctrl-C stops it" "$$" fg "$HOST" "$DB" "$public"
+        banner "starting in the foreground, Ctrl-C stops it" "$$" fg "$HOST" "$DB" "$public" "$CONFIG" "$TLS_PORT"
         exec python3 "$SERVER" "${SERVER_ARGS[@]}"
         ;;
 esac
