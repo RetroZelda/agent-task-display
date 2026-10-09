@@ -456,7 +456,9 @@ eq('since 3: nothing newer, so the newest', tc.whats_new(CL, 3), '## v3 — 2026
 eq('no API version: the newest', tc.whats_new(CL, None), '## v3 — 2026-10-01\n- three')
 eq('no headings: the whole text', tc.whats_new('  just text\n', 1), 'just text')
 real = (Path(TASKCTL_PY).parent / 'templates' / 'changelog.md').read_text()
-S.check("the real changelog: v2's entry is what a v1 CLI is told", tc.whats_new(real, 1).startswith('## v2 — ')
-        and '## v1' not in tc.whats_new(real, 1), tc.whats_new(real, 1)[:200])
+S.check("the real changelog: a v1 CLI is told v3 and v2, not v1", tc.whats_new(real, 1).startswith('## v3 — ')
+        and '## v2 — ' in tc.whats_new(real, 1) and '## v1' not in tc.whats_new(real, 1), tc.whats_new(real, 1)[:200])
+S.check("the real changelog: a v2 CLI is told v3 alone", tc.whats_new(real, 2).startswith('## v3 — ')
+        and '## v2' not in tc.whats_new(real, 2), tc.whats_new(real, 2)[:200])
 
 sys.exit(S.finish())

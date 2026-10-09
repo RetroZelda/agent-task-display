@@ -22,6 +22,7 @@ SUITES=(
     "taskctl_units|test_taskctl_units.py|taskctl.py parsers, formatters, rule merge, run monitor"
     "server|test_server.py|server contract: routes, shapes, validation, state rules, templates"
     "server_v2|test_server_v2.py|server v2: headers, attention, events, replay, settings, v1 migration"
+    "stream|test_stream.py|live stream: URL, argv and MP4 units, the routes, supervisor and media with a fake ffmpeg, real ffmpeg"
     "tls|test_tls.py|the optional HTTPS listener, its rendering and its errors"
     "cli_offline|test_cli_offline.py|taskctl with no board: exit codes, offline ids, the sh wrapper"
     "cli|test_cli.py|taskctl <-> server: every subcommand, run, install-rule, ask/resume, api"

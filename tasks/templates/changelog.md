@@ -1,3 +1,8 @@
+## v3 — 2026-10-08
+- Live stream: `taskctl api POST /api/stream '{"url": "http://camera.lan:8554/"}'` shows a network video or audio stream (http, https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp) beside the board on every open dashboard; a newer url replaces it, `taskctl api DELETE /api/stream` closes it and `taskctl api GET /api/stream` shows it. Do this only when your user asks. The board host needs ffmpeg for it.
+- HTTP API: GET, POST and DELETE /api/stream and GET /api/stream/media; /api/events gains `stream`; new errors: 410 for a stream that was replaced or closed, and 503 (+Retry-After) while the stream is not connected yet or has 16 viewers.
+- Dashboard: the alert settings dialog is now just "Settings" and has a Live stream section for this device: the stream's sound on or off, and its volume.
+
 ## v2 — 2026-09-28
 - Waiting for the user: `taskctl ask ID 'QUESTION'` flags a request or one task as waiting for input (the board pulses it, shows the question, and can chime or send a notification); `taskctl resume ID` clears it. While a request is open, run ask before you stop to ask the user anything or wait for them, and resume once they answer.
 - Offline queue: while the board is unreachable, new, start, progress, ask, resume, done and fail are queued on this machine and replayed in order, with their original times, by the next taskctl command that reaches the board. One taskctl replays at a time and no other waits for it. `new` now prints real ids even offline; `add` still prints `offline`. `taskctl flush` replays the queue now and `taskctl ping` shows its size.

@@ -7,6 +7,11 @@
 Every suite runs against throwaway state: a scratch server on a free port (never the real board's
 8765) with a temp --db, --pidfile and --config, a temp HOME / CLAUDE_CONFIG_DIR, and a temp taskctl
 offline queue (TASKS_SPOOL_DIR), all removed at exit.
+
+The live stream's helpers (see "streams" below): fake_ffmpeg_dir (tests/lib/fake_ffmpeg.py as the board's
+ffmpeg), real_ffmpeg_dir, FFMPEG / FFPROBE (None when absent), make_ts / ts_from / ts_without_audio (MPEG-TS
+sources made with ffmpeg), probe (ffprobe), split_boxes (the boxes of an MP4), stream_get (a media response
+read in the background), FakeUpstream (a source like the real one), children_of / find_procs.
 """
 from __future__ import annotations
 
@@ -19,9 +24,11 @@ import shutil
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -58,21 +65,24 @@ class Suite:
         self.skipped = 0
         self.verbose = os.environ.get('TESTS_VERBOSE') == '1'
         self.t0 = time.monotonic()
+        self.lock = threading.Lock()  # a suite may run scenarios in threads
 
     def check(self, label: str, cond, detail='') -> bool:
-        if cond:
-            self.passed += 1
-            if self.verbose:
-                print(f'  ok   {label}', flush=True)
-        else:
-            self.failed.append(label)
-            text = detail if isinstance(detail, str) else repr(detail)
-            print(f'  FAIL {label}' + (f'\n       {text[:1500]}' if text else ''), flush=True)
+        with self.lock:
+            if cond:
+                self.passed += 1
+                if self.verbose:
+                    print(f'  ok   {label}', flush=True)
+            else:
+                self.failed.append(label)
+                text = detail if isinstance(detail, str) else repr(detail)
+                print(f'  FAIL {label}' + (f'\n       {text[:1500]}' if text else ''), flush=True)
         return bool(cond)
 
     def skip(self, label: str, reason: str) -> None:
-        self.skipped += 1
-        print(f'  SKIP {label} ({reason})', flush=True)
+        with self.lock:
+            self.skipped += 1
+            print(f'  SKIP {label} ({reason})', flush=True)
 
     @staticmethod
     def section(title: str) -> None:
@@ -347,6 +357,516 @@ def wait_until(fn, timeout: float, interval: float = 0.2):
         time.sleep(interval)
 
 
+# ---------------------------------------------------------------- streams (ffmpeg, a fake source, media readers)
+
+FFMPEG = os.environ.get('FFMPEG') or shutil.which('ffmpeg')       # the real ones, for the checks that need them;
+FFPROBE = os.environ.get('FFPROBE') or shutil.which('ffprobe')    # None when absent (those checks are then skipped)
+TS_PACKET = 188
+
+
+def install_fake_ffmpeg(directory: Path) -> Path:
+    """directory/ffmpeg: tests/lib/fake_ffmpeg.py with an absolute interpreter on its first line (so a PATH of this
+    directory alone runs it, where `#!/usr/bin/env python3` would not be found). Written under another name and
+    renamed, so a board looking for ffmpeg never meets half a file."""
+    body = (LIB / 'fake_ffmpeg.py').read_text().split('\n', 1)[1]
+    directory = Path(directory)
+    temp, target = directory / '.ffmpeg.new', directory / 'ffmpeg'
+    temp.write_text(f'#!{sys.executable}\n{body}')
+    temp.chmod(0o755)
+    os.replace(temp, target)
+    return target
+
+
+def fake_ffmpeg_dir(tmp: Path, name: str = 'fakebin', install: bool = True) -> Path:
+    """tmp/fakebin holding the fake ffmpeg: put it first on the board's PATH (clean_env(PATH=...)), and set
+    FAKE_FFMPEG_LOG for the record of every run. The directory is under tmp, so reap() finds the fake by its command
+    line. install=False makes it empty (install_fake_ffmpeg adds the fake later: ffmpeg turning up while the board runs)."""
+    directory = Path(tmp) / name
+    directory.mkdir(parents=True, exist_ok=True)
+    if install:
+        install_fake_ffmpeg(directory)
+    return directory
+
+
+def real_ffmpeg_dir(tmp: Path) -> Path | None:
+    """tmp/realbin holding `ffmpeg`, a link to FFMPEG, for a board's PATH; None without ffmpeg. The link is under
+    tmp, so reap() finds the real ffmpeg a failed test left behind by its command line."""
+    if not FFMPEG:
+        return None
+    directory = Path(tmp) / 'realbin'
+    directory.mkdir(parents=True, exist_ok=True)
+    link = directory / 'ffmpeg'
+    if not link.is_symlink():
+        link.symlink_to(FFMPEG)
+    return directory
+
+
+_ENCODERS: list = []
+
+
+def has_encoder(name: str) -> bool:
+    """Whether FFMPEG can encode with name (libx264, say)."""
+    if not FFMPEG:
+        return False
+    if not _ENCODERS:
+        try:
+            out = subprocess.run([FFMPEG, '-hide_banner', '-encoders'], capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ''
+        _ENCODERS.append({line.split()[1] for line in out.splitlines() if line.startswith(' ') and len(line.split()) > 1})
+    return name in _ENCODERS[0]
+
+
+class TsData(bytes):
+    """MPEG-TS bytes that know how long they play (.seconds): what FakeUpstream paces itself by."""
+    seconds = 6.0
+
+
+def _ts(data: bytes, seconds: float) -> TsData:
+    out = TsData(data)
+    out.seconds = seconds
+    return out
+
+
+_TS_CACHE: dict = {}
+
+
+def make_ts(kind: str = 'video', seconds: float = 6, *, gop: int = 30, size: str = '320x180', rate: int = 30) -> TsData | None:
+    """MPEG-TS made from ffmpeg's test sources: kind 'video' (H.264 baseline with a keyframe every gop frames, like
+    today's real source), 'av' (that and AAC stereo at 48 kHz) or 'audio' (MP2). None without ffmpeg or libx264."""
+    key = (kind, seconds, gop, size, rate)
+    if key not in _TS_CACHE:
+        _TS_CACHE[key] = _make_ts(*key)
+    return _TS_CACHE[key]
+
+
+def _make_ts(kind, seconds, gop, size, rate):
+    video, audio = kind in ('video', 'av'), kind in ('av', 'audio')
+    if not FFMPEG or (video and not has_encoder('libx264')):
+        return None
+    argv = [FFMPEG, '-hide_banner', '-loglevel', 'error', '-nostdin']
+    if video:
+        argv += ['-f', 'lavfi', '-i', f'testsrc2=size={size}:rate={rate}']
+    if audio:
+        argv += ['-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000']
+    argv += ['-t', str(seconds)]
+    if video:
+        argv += ['-c:v', 'libx264', '-profile:v', 'baseline', '-pix_fmt', 'yuv420p', '-g', str(gop), '-sc_threshold', '0']
+    if audio:
+        argv += (['-c:a', 'aac', '-b:a', '64k'] if video else ['-c:a', 'mp2', '-b:a', '128k']) + ['-ac', '2']
+    try:
+        done = subprocess.run(argv + ['-f', 'mpegts', 'pipe:1'], capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _ts(done.stdout, float(seconds)) if done.returncode == 0 and done.stdout else None
+
+
+def probe(data: bytes, timeout: float = 60) -> dict | None:
+    """ffprobe's -show_streams -show_format of data (MPEG-TS, MP4...) as parsed JSON; None without ffprobe or when it
+    cannot read the data."""
+    if not FFPROBE:
+        return None
+    try:
+        done = subprocess.run([FFPROBE, '-v', 'error', '-show_streams', '-show_format', '-of', 'json', '-i', 'pipe:0'],
+                              input=bytes(data), capture_output=True, timeout=timeout)
+        return json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def ts_from(data: bytes, seconds: float) -> TsData | None:
+    """data from `seconds` into it (at the first video packet from then, on a packet boundary): a source joined
+    mid-way, mid-GOP when the GOP is long. None without ffprobe."""
+    if not FFPROBE:
+        return None
+    with tempfile.NamedTemporaryFile(suffix='.ts') as f:
+        f.write(data)
+        f.flush()
+        try:
+            done = subprocess.run([FFPROBE, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=pos,pts_time', '-of', 'json',
+                                   '-i', f.name], capture_output=True, timeout=60)
+            packets = [(float(p['pts_time']), int(p['pos'])) for p in json.loads(done.stdout)['packets']]
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+            return None
+    if not packets:
+        return None
+    wanted = packets[0][0] + seconds
+    cut = next((pos for pts, pos in packets if pts >= wanted), None)
+    if cut is None:
+        return None
+    cut = cut // TS_PACKET * TS_PACKET
+    return _ts(data[cut:], getattr(data, 'seconds', 6.0) * (len(data) - cut) / max(len(data), 1))
+
+
+def ts_without_audio(data: bytes) -> TsData | None:
+    """data with every audio packet removed and the program table left as it was: a source that announces a sound track
+    and never sends any. None without ffprobe."""
+    info = probe(data)
+    if not info:
+        return None
+    pids = {int(s['id'], 16) for s in info['streams'] if s.get('codec_type') == 'audio' and s.get('id')}
+    if not pids:
+        return None
+    kept = bytearray()
+    for pos in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+        if ((data[pos + 1] & 0x1f) << 8 | data[pos + 2]) not in pids:
+            kept += data[pos:pos + TS_PACKET]
+    return _ts(kept, getattr(data, 'seconds', 6.0))
+
+
+def split_boxes(data: bytes, start: int = 0, end: int | None = None) -> list:
+    """The complete top-level MP4 boxes of data as (type, start, end); stops at a truncated or impossible one. Understands
+    64-bit sizes; a size of 0 means "to the end"."""
+    end = len(data) if end is None else end
+    out, pos = [], start
+    while pos + 8 <= end:
+        size, kind = struct.unpack_from('>I4s', data, pos)
+        header = 8
+        if size == 1:
+            if pos + 16 > end:
+                break
+            size, header = struct.unpack_from('>Q', data, pos + 8)[0], 16
+        elif size == 0:
+            size = end - pos
+        if size < header or pos + size > end:
+            break
+        out.append((kind.decode('latin-1'), pos, pos + size))
+        pos += size
+    return out
+
+
+class StreamReader:
+    """One HTTP response read in the background, for bodies that do not end (the media route). Records when the headers,
+    the first byte and the end came, and keeps the body so far.
+
+        r = stream_get(srv.port, '/api/stream/media?id=...')
+        r.wait_headers(5); r.status; r.headers           headers lower-cased
+        r.wait_bytes(50000, 10); r.body; r.boxes()       what arrived (bytes; split_boxes of it)
+        r.wait_closed(5); r.error                        the server ended it (error: what the socket said, if it broke)
+        r.pause(); r.resume(); r.close()                 stop calling recv (the socket's buffers fill); hang up
+    rcvbuf shrinks the receive buffer before connecting (a reader that cannot take much); paused starts without reading
+    the body."""
+
+    def __init__(self, port: int, path: str, *, tls: bool = False, addr: str = '127.0.0.1', method: str = 'GET', headers=None,
+                 host: str | None = None, rcvbuf: int | None = None, paused: bool = False, timeout: float = 60):
+        self.status: int | None = None
+        self.headers: dict = {}
+        self.error: BaseException | None = None
+        self.t0 = time.monotonic()
+        self.t_headers = self.t_first = self.t_closed = None
+        self._data = bytearray()
+        self._cond = threading.Condition()
+        self._done = False
+        self._sock: socket.socket | None = None
+        self._go = threading.Event()
+        if not paused:
+            self._go.set()
+        self._thread = threading.Thread(target=self._run, args=(port, path, tls, addr, method, headers or {}, host, rcvbuf, timeout), daemon=True)
+        self._thread.start()
+
+    def _run(self, port, path, tls, addr, method, headers, host, rcvbuf, timeout):
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET6 if ':' in addr else socket.AF_INET, socket.SOCK_STREAM)
+            if rcvbuf:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+            sock.settimeout(timeout)
+            sock.connect((addr, port))
+            if tls:
+                sock = ssl._create_unverified_context().wrap_socket(sock, server_hostname=addr)
+            self._sock = sock
+            lines = [f'{method} {path} HTTP/1.1', f'Host: {host or f"{addr}:{port}"}', 'Connection: close',
+                     *(f'{k}: {v}' for k, v in headers.items())]
+            sock.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode())
+            buf = b''
+            while b'\r\n\r\n' not in buf:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError('closed before the headers were complete')
+                buf += chunk
+            head, _, rest = buf.partition(b'\r\n\r\n')
+            status_line, *header_lines = head.decode('latin-1').split('\r\n')
+            with self._cond:
+                self.status = int(status_line.split()[1])
+                self.headers = {k.strip().lower(): v.strip() for k, _, v in (line.partition(':') for line in header_lines)}
+                self.t_headers = time.monotonic()
+                self._cond.notify_all()
+            if rest:
+                self._add(rest)
+            while method != 'HEAD':
+                self._go.wait()
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                self._add(chunk)
+        except (OSError, ValueError, IndexError) as exc:  # a timeout, a reset, a TLS error, a malformed reply
+            self.error = exc
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            with self._cond:
+                self.t_closed = time.monotonic()
+                self._done = True
+                self._cond.notify_all()
+
+    def _add(self, chunk: bytes) -> None:
+        with self._cond:
+            if self.t_first is None:
+                self.t_first = time.monotonic()
+            self._data += chunk
+            self._cond.notify_all()
+
+    def _wait(self, cond, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while not cond():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+        return True
+
+    def wait_headers(self, timeout: float = 10) -> bool:
+        return self._wait(lambda: self.status is not None or self._done, timeout) and self.status is not None
+
+    def wait_bytes(self, n: int, timeout: float = 10) -> bool:
+        return self._wait(lambda: len(self._data) >= n or self._done, timeout) and len(self._data) >= n
+
+    def wait_closed(self, timeout: float = 10) -> bool:
+        return self._wait(lambda: self._done, timeout)
+
+    @property
+    def body(self) -> bytes:
+        with self._cond:
+            return bytes(self._data)
+
+    @property
+    def closed(self) -> bool:
+        return self._done
+
+    def boxes(self) -> list:
+        return split_boxes(self.body)
+
+    def json(self, timeout: float = 10):
+        """The body parsed as JSON (an error reply's), once it has all come; None if it is not JSON."""
+        self.wait_closed(timeout)
+        try:
+            return json.loads(self.body)
+        except ValueError:
+            return None
+
+    def pause(self) -> None:
+        self._go.clear()
+
+    def resume(self) -> None:
+        self._go.set()
+
+    def close(self) -> None:
+        """Hang up. The socket is only shut down here, which wakes the reader thread, and that thread closes it: closing
+        a socket another thread is blocked on can give its number to a new socket, which the blocked thread then reads."""
+        self._go.set()
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self.wait_closed(5)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def stream_get(port: int, path: str, tls: bool = False, **kw) -> StreamReader:
+    """Start reading GET path from the board in the background; see StreamReader for what the result offers."""
+    return StreamReader(port, path, tls=tls, **kw)
+
+
+class FakeUpstream:
+    """A stream source like the real one: on 127.0.0.1, HTTP/1.0, `video/mp2t`, no Content-Length, no CORS headers,
+    the data (MPEG-TS) paced to real time and looping.
+
+        up = FakeUpstream(make_ts('av'))          up.url, up.connections (all so far), up.active (open now), up.requests
+        up.mode = 'blackhole'; up.close()
+
+    mode: serve; refuse (nothing listens there: connection refused, until serve() is called); blackhole (accepts, never
+    answers); 404; 500; html (200 text/html); redirect (302 to `location`, file:///etc/hostname); close (sends
+    `close_after` bytes, then hangs up). data is TsData from make_ts (it knows its duration), else seconds says how long
+    it plays. marker (a path, tmp) goes into the URL's path so that reap() finds an ffmpeg left reading it."""
+
+    def __init__(self, data: bytes = b'', mode: str = 'serve', *, seconds: float | None = None, loop: bool = True,
+                 location: str = 'file:///etc/hostname', close_after: int = 4096, marker: str | Path = ''):
+        self.data = bytes(data)
+        self.seconds = float(seconds or getattr(data, 'seconds', 6.0))
+        self.mode, self.loop, self.location, self.close_after = mode, loop, location, close_after
+        self.connections = self.active = 0
+        self.requests: list = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._socks: list = []
+        self._listener: socket.socket | None = None
+        self._acceptor: threading.Thread | None = None
+        self.port = 0
+        if mode == 'refuse':   # reserve a port and leave it unbound: connecting is refused
+            with socket.socket() as s:
+                s.bind(('127.0.0.1', 0))
+                self.port = s.getsockname()[1]
+        else:
+            self._listen()
+        self.url = f'http://127.0.0.1:{self.port}{str(marker).rstrip("/")}/stream'
+
+    def _listen(self) -> None:
+        sock = socket.socket()
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('127.0.0.1', self.port))
+        sock.listen(64)
+        sock.settimeout(0.2)
+        self.port = sock.getsockname()[1]
+        self._listener = sock
+        self._acceptor = threading.Thread(target=self._accept, args=(sock,), daemon=True)
+        self._acceptor.start()
+
+    def serve(self) -> None:
+        """Start serving on the port that was refusing (the source coming back)."""
+        self.mode = 'serve'
+        if self._listener is None:
+            self._listen()
+
+    def _accept(self, sock: socket.socket) -> None:
+        # The thread that accepts is the one that closes the listening socket (see close()).
+        try:
+            while not self._stop.is_set():
+                try:
+                    conn, _ = sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                with self._lock:
+                    self.connections += 1
+                    self.active += 1
+                    self._socks.append(conn)
+                threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+        finally:
+            sock.close()
+
+    def _handle(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(10)
+            head = b''
+            while b'\r\n\r\n' not in head:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                head += chunk
+            with self._lock:
+                self.requests.append(head.decode('latin-1').split('\r\n\r\n')[0])
+            mode = self.mode
+            if mode == 'blackhole':
+                self._stop.wait()
+            elif mode in ('404', '500'):
+                reason = 'Not Found' if mode == '404' else 'Internal Server Error'
+                conn.sendall(f'HTTP/1.0 {mode} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.encode())
+            elif mode == 'html':
+                body = b'<html><body>not a video stream</body></html>'
+                conn.sendall(b'HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' % (len(body), body))
+            elif mode == 'redirect':
+                conn.sendall(f'HTTP/1.0 302 Found\r\nLocation: {self.location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.encode())
+            else:
+                conn.sendall(b'HTTP/1.0 200 OK\r\nContent-Type: video/mp2t\r\nConnection: close\r\n\r\n')
+                if mode == 'close':
+                    conn.sendall((self.data * (self.close_after // max(len(self.data), 1) + 1))[:self.close_after])
+                else:
+                    self._pace(conn)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            with self._lock:
+                self.active -= 1
+
+    def _pace(self, conn: socket.socket) -> None:
+        """The data at the speed it was made for, from its start, again and again."""
+        if not self.data:
+            self._stop.wait()
+            return
+        rate = len(self.data) / self.seconds
+        chunk, pos, sent, t0 = TS_PACKET * 7, 0, 0, time.monotonic()
+        while not self._stop.is_set():
+            piece = self.data[pos:pos + chunk]
+            conn.sendall(piece)
+            pos += len(piece)
+            sent += len(piece)
+            if pos >= len(self.data):
+                if not self.loop:
+                    return
+                pos = 0
+            self._stop.wait(max(0.0, t0 + sent / rate - time.monotonic()))
+
+    def close(self) -> None:
+        """Stop serving: connections are shut down (each handler thread then closes its own socket, and the accepting
+        thread the listener, so no socket is closed under a thread that is using it)."""
+        self._stop.set()
+        with self._lock:
+            socks, self._socks = self._socks, []
+        for conn in socks:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        acceptor = getattr(self, '_acceptor', None)
+        if acceptor is not None:
+            acceptor.join(2)
+        self._listener = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def children_of(pid: int, alive: bool = True) -> list:
+    """The pids of pid's children, from /proc (zombies, which are only waiting to be reaped, left out unless alive=False)."""
+    out = []
+    for name in os.listdir('/proc'):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f'/proc/{name}/stat') as f:
+                stat = f.read()
+        except OSError:
+            continue
+        state, ppid = stat.rsplit(')', 1)[1].split()[:2]  # the name may hold spaces and parentheses
+        if int(ppid) == pid and not (alive and state == 'Z'):
+            out.append(int(name))
+    return sorted(out)
+
+
+def find_procs(needle: str) -> list:
+    """The pids of the processes (other than this one) whose command line mentions needle: an ffmpeg left reading a
+    source after its board was killed, say."""
+    out, want = [], needle.encode()
+    for name in os.listdir('/proc'):
+        if name.isdigit() and int(name) != os.getpid():
+            try:
+                with open(f'/proc/{name}/cmdline', 'rb') as f:
+                    if want in f.read():
+                        out.append(int(name))
+            except OSError:
+                pass
+    return sorted(out)
+
+
 # ---------------------------------------------------------------- scratch server
 
 class ScratchServer:
@@ -367,6 +887,7 @@ class ScratchServer:
         self.wrapper = wrapper
         self.env = env
         self.db = self.tmp / f'{name}.db'
+        self.stream_file = self.db.with_suffix('.stream.json')   # where the board keeps its open stream (0600)
         self.pidfile = self.tmp / f'{name}.pid'
         self.log = self.tmp / f'{name}.log'
         # A settings file of its own (the default, <db dir>/settings.json, is shared by every server in tmp);
@@ -389,6 +910,7 @@ class ScratchServer:
         if self.fresh_db:
             for suffix in ('', '-wal', '-shm'):
                 Path(str(self.db) + suffix).unlink(missing_ok=True)
+            self.stream_file.unlink(missing_ok=True)   # a stream a previous run left open must not come back
         self.log.write_text('')
         with open(self.log, 'a') as log:
             self.proc = subprocess.Popen(self.argv(), stdout=log, stderr=subprocess.STDOUT,

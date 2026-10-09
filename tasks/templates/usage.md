@@ -96,8 +96,9 @@ response has `now`, so compute ages from it rather than from your own clock. A r
 characters from `23456789abcdefghjkmnpqrstuvwxyz` (`k3m9qa`); a task id is the request id plus a
 sequence number (`k3m9qa-3`). Titles are capped at 200 characters and messages at 500 (longer ones
 are truncated). Errors are `{"error": "...", "field": "...", "hint": "..."}` (field and hint
-optional): 400 invalid input, 404 unknown id or route, 405 wrong method, 409 state conflict, 411
-chunked body (send Content-Length), 413 body over 64 KiB, 503 database busy (retry after a second).
+optional): 400 invalid input, 404 unknown id or route, 405 wrong method, 409 state conflict, 410
+a live stream that was replaced or closed, 411 chunked body (send Content-Length), 413 body over 64 KiB, 503
+database busy (retry after a second) or a live stream that is not connected yet.
 Browser-style writes (POST, PUT, DELETE) with a foreign `Origin` header get 403. A success body has
 `"warnings": [...]` when something was truncated, clamped or ignored, such as a misspelled field.
 
@@ -139,6 +140,10 @@ have changed: read {{BASE_URL}}/api/changelog and this page again.
     GET    /api/settings                  the board-wide notification settings (below)
     PUT    /api/settings                  {settings: {...}} change some of them
     DELETE /api/settings                  back to the defaults
+    GET    /api/stream                    the live stream (below): {now, stream, ffmpeg}
+    POST   /api/stream                    {url} -> 201 open a stream, replacing any open one
+    DELETE /api/stream                    close it
+    GET    /api/stream/media?id=<id>      the stream itself as fragmented MP4, for the dashboard
 
 Fields worth knowing. A request has `id`, `title`, `status` (running, done or failed), `percent`,
 `tasks_done` and `tasks_total` (X/Y; cancelled tasks are not counted), `current` (the latest running
@@ -179,7 +184,7 @@ then records the write at that time (clamped to the last 24 hours and never befo
 update) and marks its events as replayed. Without the header, `at` is ignored with a warning.
 
 Events. `GET /api/events` returns `{now, cursor, events[], truncated, waiting[], stale[],
-settings_version}`. Without `since`, `events` is empty and `cursor` is the newest event id (0 when
+settings_version, stream}` (`stream` is the open live stream, or null). Without `since`, `events` is empty and `cursor` is the newest event id (0 when
 there are none): keep it and pass it as `since` next time. With `since`, `events` holds up to `limit`
 events with a larger id, oldest first; `truncated` is true when more remain (then `cursor` is the
 last one returned) or when events after `since` were already pruned (events are kept 7 days, at most
@@ -202,6 +207,24 @@ task_started, task_progress, request_created and stale. `PUT /api/settings` with
 field), merges it into the current settings, saves the whole result and answers like GET; `DELETE`
 removes the file. `version` (also `settings_version` in /api/events) changes whenever the settings
 do. Leave the settings to your user unless they ask you to change them.
+
+Live stream. The dashboard can show one network video or audio stream beside the board on every open
+page (below it on a portrait screen, to its right on a landscape one). Do this only when your user asks.
+`taskctl api POST /api/stream '{"url": "http://camera.lan:8554/"}'` opens a stream (201; a newer url
+replaces the open one, and the url that is already open is kept: 200 with `"existing": true`, retried
+at once), `taskctl api DELETE /api/stream` closes it (idempotent) and `taskctl api GET /api/stream`
+shows it as `{now, stream, ffmpeg}`, with `ffmpeg` the program the board runs for it or null when the
+board host does not have it (`apt install ffmpeg` there; the reply to POST warns). The url is http,
+https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp, up to 2048 characters with no spaces, else a 400 with
+`field: "url"`. The board connects to it from its own host, so the name must resolve and be reachable
+from there, and it is a stream source (a camera, an encoder), not a web page. `stream` is null or
+`{id, url, opened_at, state, since, error, video, audio, width, height, viewers, media}`: `state` is
+"connecting" until a keyframe has gone out and "live" after that; `error` says why the last attempt
+failed (the board retries after 1, 2, 4, 8 and then every 10 seconds); `video` and `audio` are codec
+strings such as avc1.42C028 and mp4a.40.2, null until known or when there is no such track; `url`
+shows a `user:password@` as `***@`. The same object is `stream` in /api/events. The stream is saved on
+the board host and reopens when the board restarts. `media` is the path of the stream itself, which
+only the dashboard needs.
 
 Examples: create a request with its tasks, report on one of the returned task ids, flag a question
 and clear it, close the task, then the request, and read it back:
@@ -235,6 +258,7 @@ Keep the JSON in single quotes, and keep apostrophes, backticks and `$` out of t
 - Close every task, then the request, also on failure or cancel (status failed plus a one-line
   reason). Never leave a request running.
 - Give your user the request's page link once.
+- Open or close the board's live stream only when your user asks for it.
 - Titles and hints: in single quotes, with no backticks, `$` or quote characters. No secrets: the
   board is visible on the LAN.
 - Reporting is best effort. If the board is unreachable, carry on with the real work and mention it once.

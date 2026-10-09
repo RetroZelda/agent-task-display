@@ -521,9 +521,9 @@ def main_flow():
     code, changelog, _ = api(URL, 'GET', '/api/changelog', raw=True)
     rc, out, err = tc('changelog')
     check("changelog: the board's changelog on stdout, newest first", rc == 0 and out == changelog.decode()
-          and out.startswith('## v2 — '), (rc, out[:80], err))
+          and out.startswith('## v3 — '), (rc, out[:80], err))
     rc, out, err = tc('api', 'GET', '/api/health')
-    check('api GET /api/health: the JSON body on stdout', rc == 0 and json.loads(out)['version'] == '2'
+    check('api GET /api/health: the JSON body on stdout', rc == 0 and json.loads(out)['version'] == '3'
           and json.loads(out)['docs_version'] == docs_version(TASKS), (rc, out, err))
     rc, out, err = tc('api', 'get', f'/api/requests/{arid}')
     check('api: the method is case-insensitive, the body is the route\'s', rc == 0 and json.loads(out)['id'] == arid, (rc, err))
@@ -564,7 +564,7 @@ def run_signals():
     check('run: the first report is "running: CMD" (shell-quoted)', msgs and msgs[0] == "running: sh -c 'sleep 1.5; echo hi'", msgs[:3])
     check('run: the closing message', get('/api/tasks/' + b)['message'] == 'exit 0 after 2s', get('/api/tasks/' + b)['message'])
 
-    p = subprocess.Popen([str(WRAPPER), '--strict', '--url', URL, 'run', a, '--', 'sh', '-c', 'echo up; sleep 30'],
+    p = subprocess.Popen([str(WRAPPER), '--strict', '--url', URL, 'run', a, '--', 'sh', '-c', 'echo up; exec sleep 30'],
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV, text=True, cwd=WORK)
     wait_until(lambda: get('/api/tasks/' + a)['status'] == 'running', 5, 0.1)
     time.sleep(0.5)
@@ -763,7 +763,7 @@ def served_files():
           [line for line in text.splitlines() if '{{' in line])
     check('served taskctl.py: BAKED_DOCS is the docs version, BAKED_API the API version',
           [line for line in text.splitlines() if line.startswith(('BAKED_DOCS', 'BAKED_API'))]
-          == [f'BAKED_DOCS = "{docs_version(TASKS)}"', 'BAKED_API = "2"'] and hdrs.get('X-Tasks-Docs') == docs_version(TASKS),
+          == [f'BAKED_DOCS = "{docs_version(TASKS)}"', 'BAKED_API = "3"'] and hdrs.get('X-Tasks-Docs') == docs_version(TASKS),
           [line for line in text.splitlines() if line.startswith('BAKED_')])
     code, wrapper, _ = api(URL, 'GET', '/api/skill/taskctl', raw=True)
     check('served wrapper is byte-identical (unrendered)', wrapper == WRAPPER.read_bytes())

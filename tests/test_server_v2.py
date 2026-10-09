@@ -70,21 +70,22 @@ def phase_headers():
         docs = docs_version(tree)
         check('the repo tree and its copy have the same docs version', docs == docs_version())
         s, h, b = call('GET', '/api/health')
-        check('health: v2 fields, in order', s == 200 and b['version'] == '2' and b['docs_version'] == docs and b['tls_port'] is None
+        check('health: v2 fields, in order', s == 200 and b['version'] == '3' and b['docs_version'] == docs and b['tls_port'] is None
               and b['config_path'] == str(srv.config) and list(b)[-3:] == ['docs_version', 'tls_port', 'config_path'], b)
-        check('health headers', h.get('x-tasks-version') == '2' and h.get('x-tasks-docs') == docs, h)
+        check('health headers', h.get('x-tasks-version') == '3' and h.get('x-tasks-docs') == docs, h)
         routes = [('GET', '/'), ('GET', '/r/k3m9qa'), ('GET', '/api/usage'), ('GET', '/api/rule'), ('GET', '/api/changelog'),
                   ('GET', '/api/skill/SKILL.md'), ('GET', '/api/skill/taskctl'), ('GET', '/api/skill/taskctl.py'),
                   ('GET', '/favicon.ico'), ('HEAD', '/api/health'), ('GET', '/api/events'), ('GET', '/api/settings'),
                   ('GET', '/api/requests'), ('POST', '/api/requests'), ('GET', '/nope'), ('PUT', '/api/requests'),
                   ('GET', '/api/requests/zzzzzz'), ('GET', '/api/requests/bogus!'), ('GET', '/api/events?since=x'),
-                  ('POST', '/api/tasks/zzzzzz-1/attention'), ('DELETE', '/api/settings')]
+                  ('POST', '/api/tasks/zzzzzz-1/attention'), ('DELETE', '/api/settings'), ('GET', '/api/stream'),
+                  ('POST', '/api/stream'), ('DELETE', '/api/stream'), ('GET', '/api/stream/media')]
         for method, path in routes:
             s, h, b = call(method, path, {} if method == 'POST' else None,
                            headers={'Accept': 'text/html'} if path == '/' else None)
-            check(f'{method} {path} ({s}): both headers', h.get('x-tasks-version') == '2' and h.get('x-tasks-docs') == docs, h)
+            check(f'{method} {path} ({s}): both headers', h.get('x-tasks-version') == '3' and h.get('x-tasks-docs') == docs, h)
         s, h, b = call('POST', '/api/requests', {'title': 'x'}, headers=EVIL)
-        check('403 cross-origin: both headers', s == 403 and h.get('x-tasks-version') == '2' and h.get('x-tasks-docs') == docs, h)
+        check('403 cross-origin: both headers', s == 403 and h.get('x-tasks-version') == '3' and h.get('x-tasks-docs') == docs, h)
         s, h, b = call('POST', '/api/requests', raw=b'{"title": "' + b'x' * 70000 + b'"}')
         check('413: both headers', s == 413 and h.get('x-tasks-docs') == docs, (s, h))
         for label, data in (('400 malformed request line', b'GARBAGE\r\n\r\n'), ('501 unknown method', b'FOO / HTTP/1.0\r\n\r\n'),
@@ -92,19 +93,19 @@ def phase_headers():
                             ('431 long header', b'GET / HTTP/1.0\r\nX: ' + b'a' * 70000 + b'\r\n\r\n'),
                             ('505 HTTP/2.0', b'GET / HTTP/2.0\r\n\r\n')):
             s, h, b = raw_request(P, data)
-            check(f"http.server's own {label} ({s}): both headers", h.get('x-tasks-version') == '2' and h.get('x-tasks-docs') == docs, h)
+            check(f"http.server's own {label} ({s}): both headers", h.get('x-tasks-version') == '3' and h.get('x-tasks-docs') == docs, h)
 
         s, h, b = call('GET', '/api/changelog')
         want = (tree / 'templates' / 'changelog.md').read_text()
         check('/api/changelog: the file, text/plain, no-store', s == 200 and h['content-type'] == 'text/plain; charset=utf-8'
               and h.get('cache-control') == 'no-store' and b == want.replace('{{BASE_URL}}', f'http://127.0.0.1:{P}')
-              .replace('{{PUBLIC_URL}}', f'http://127.0.0.1:{P}').replace('{{VERSION}}', '2').replace('{{DOCS_VERSION}}', docs), b[:200])
+              .replace('{{PUBLIC_URL}}', f'http://127.0.0.1:{P}').replace('{{VERSION}}', '3').replace('{{DOCS_VERSION}}', docs), b[:200])
         heads = [line for line in b.splitlines() if line.startswith('## ')]
-        check('changelog: newest first, one "## v<N> — <YYYY-MM-DD>" heading per entry, v2 then v1',
-              [line.split()[1] for line in heads] == ['v2', 'v1'] and b.startswith('## v2 — ')
+        check('changelog: newest first, one "## v<N> — <YYYY-MM-DD>" heading per entry, v3, v2, v1',
+              [line.split()[1] for line in heads] == ['v3', 'v2', 'v1'] and b.startswith('## v3 — ')
               and all(re.fullmatch(r'## v\d+ — \d{4}-\d\d-\d\d', line) for line in heads), heads)
         s, h, b = call('GET', '/api/skill/taskctl.py')
-        check('taskctl.py: BAKED_DOCS and BAKED_API rendered', f'BAKED_DOCS = "{docs}"' in b and 'BAKED_API = "2"' in b
+        check('taskctl.py: BAKED_DOCS and BAKED_API rendered', f'BAKED_DOCS = "{docs}"' in b and 'BAKED_API = "3"' in b
               and '{{DOCS_VERSION}}' not in b and '{{VERSION}}' not in b, [x for x in b.splitlines() if x.startswith('BAKED_')])
 
         S.section('docs_version follows the agent files, and only them')
@@ -120,7 +121,7 @@ def phase_headers():
                   and b['docs_version'] == docs_version(tree) and h['x-tasks-docs'] == b['docs_version'], (before, b['docs_version']))
         (tree / 'templates' / 'usage.md').write_text('X {{DOCS_VERSION}} {{VERSION}} {{BASE_URL}}\n')
         s, h, b = call('GET', '/api/usage')
-        check('the {{DOCS_VERSION}} token renders the docs version of the files being served', b == f'X {docs_version(tree)} 2 http://127.0.0.1:{P}\n'
+        check('the {{DOCS_VERSION}} token renders the docs version of the files being served', b == f'X {docs_version(tree)} 3 http://127.0.0.1:{P}\n'
               and h['x-tasks-docs'] == docs_version(tree), (b, h.get('x-tasks-docs')))
         (tree / 'templates' / 'changelog.md').unlink()
         s, h, b = call('GET', '/api/changelog')
@@ -328,7 +329,7 @@ def phase_api():
         S.section('/api/events: baseline, limit, truncated, pruned')
         s, h, b = call('GET', '/api/events')
         check('baseline: events [], cursor = the last id, keys in order', s == 200 and b['events'] == [] and b['truncated'] is False
-              and b['cursor'] > 0 and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version'], b)
+              and b['cursor'] > 0 and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream'], b)
         top = b['cursor']
         s, h, b = call('GET', f'/api/events?since={top - 5}&limit=2')
         check('limit 2: two events, truncated, cursor = the last returned', [x['id'] for x in b['events']] == [top - 4, top - 3]

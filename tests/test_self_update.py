@@ -76,7 +76,7 @@ def main():
     ta = tasks_copy(TMP / 'tasks_a')
     tb = tasks_copy(TMP / 'tasks_b')
     changelog = (tb / 'templates' / 'changelog.md').read_text()
-    (tb / 'templates' / 'changelog.md').write_text('## v3 — 2026-10-01\n- A newer thing.\n- And another.\n\n' + changelog)
+    (tb / 'templates' / 'changelog.md').write_text('## v4 — 2026-10-09\n- A newer thing.\n- And another.\n\n' + changelog)
     rule = (tb / 'templates' / 'rule.md').read_text()
     (tb / 'templates' / 'rule.md').write_text(rule.replace('<!-- task-status:end -->', '- A new rule line for testing.\n<!-- task-status:end -->'))
     with open(tb / 'skill' / 'SKILL.md', 'a') as f:
@@ -145,8 +145,8 @@ def main():
         serve(tb, 'b')
         rc, out, err = tc('ping')
         check("stdout and exit code are the command's own", rc == 0 and out == URL + '\n', (rc, out))
-        check('the exact notice ends stderr, with the changelog entries newer than its API version (v3)',
-              err.startswith('taskctl: ok: board at') and err.endswith(notice(DA, DB, '## v3 — 2026-10-01\n- A newer thing.\n- And another.')),
+        check('the exact notice ends stderr, with the changelog entries newer than its API version (v4)',
+              err.startswith('taskctl: ok: board at') and err.endswith(notice(DA, DB, '## v4 — 2026-10-09\n- A newer thing.\n- And another.')),
               err)
         for name in FILES:
             check(f'{name} is the board\'s copy now', (SKILL / name).read_bytes() == served(URL, name))
@@ -167,7 +167,7 @@ def main():
         serve(tb, 'b')
         rc, out, err = tc('--strict', 'show', 'zzzzzz')
         check('--strict show of an unknown id: exit 1, no stdout, the 404 error, then the notice', rc == 1 and out == ''
-              and 'error: board rejected GET /api/requests/zzzzzz: 404' in err and notice(DA, DB, '## v3').split('\n')[0] in err
+              and 'error: board rejected GET /api/requests/zzzzzz: 404' in err and notice(DA, DB, '## v4').split('\n')[0] in err
               and baked_docs() == DB, (rc, out, err))
 
         S.section('its own board under another spelling of its URL (the scheme\'s case, a trailing slash) is its own')
@@ -182,8 +182,8 @@ def main():
         serve(ta, 'a')
         rc, out, err = tc('list')
         entries = [line for line in err.splitlines() if line.startswith('## v')]
-        check("back to the older docs (API 2): what's new is its newest entry, v2, alone", rc == 0 and "taskctl: what's new:\n## v2 — " in err
-              and entries == [entries[0]] and entries[0].startswith('## v2 — ') and baked_docs() == DA, err[-800:])
+        check("back to the older docs (API 3): what's new is its newest entry, v3, alone", rc == 0 and "taskctl: what's new:\n## v3 — " in err
+              and entries == [entries[0]] and entries[0].startswith('## v3 — ') and baked_docs() == DA, err[-800:])
         check('a CLAUDE.md without the rule is left alone', (CC / 'CLAUDE.md').read_text() == '# no rule here\n')
 
         S.section('TASKS_NO_UPDATE, update, update --force, and moving the skill to another board')
