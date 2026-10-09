@@ -19,6 +19,9 @@ one `curl` line.
 - **Notifications**: per kind of event, a row highlight, an unread counter and blinking tab title,
   a chime and a desktop notification. Board-wide defaults live in a settings file; each browser can
   override them. Browsers on other machines need the optional [HTTPS listener](#https-for-notifications).
+- **Live stream**: one API call shows a network video or audio stream (a camera, an encoder) beside the
+  dashboard on every open page, below it on a portrait screen and to its right on a landscape one. See
+  [Live stream](#live-stream).
 - **Works offline**: when the board is unreachable, `taskctl` queues the reports on the agent's machine
   and replays them, with their original times, once the board is back.
 - **Keeps agents current**: when the board's agent instructions change, every installed `taskctl`
@@ -34,6 +37,7 @@ one `curl` line.
 - [Using it from Claude Code](#using-it-from-claude-code)
 - [The dashboard](#the-dashboard)
 - [Notifications and settings](#notifications-and-settings)
+- [Live stream](#live-stream)
 - [taskctl reference](#taskctl-reference)
 - [HTTP API](#http-api)
 - [Networking and security](#networking-and-security)
@@ -65,8 +69,9 @@ one `curl` line.
 
 ## Quickstart (board host)
 
-Requirements: Python 3.10+ (with SQLite 3.37+) and `curl` on the machine that runs the board. Agent
-machines need only Python 3.8+ and `curl`. `tasks.sh` is a bash script for Linux. On other systems,
+Requirements: Python 3.10+ (with SQLite 3.37+) and `curl` on the machine that runs the board, plus
+`ffmpeg` 5 or newer there (`sudo apt install ffmpeg`) if you want [live streams](#live-stream) and
+only then. Agent machines need only Python 3.8+ and `curl`. `tasks.sh` is a bash script for Linux. On other systems,
 run `python3 tasks/server.py` directly.
 
 ```sh
@@ -246,8 +251,9 @@ The full wording, including the template for agents that register themselves, is
   keep working while you look elsewhere. It follows the system's light or dark theme and works at
   phone width.
 - **Mark done**, **Mark failed** and **Delete** act on a request. **Clear** deletes the finished
-  requests listed. **Agent setup** opens `/api/usage`. The gear button opens the **Alerts**
-  settings, and the bell turns this device's sound on or off.
+  requests listed. **Agent setup** opens `/api/usage`. The gear button opens the **Settings** (alerts
+  and the live stream's sound), and the bell turns this device's sound on or off.
+- While a [live stream](#live-stream) is open, the dashboard shares the window with it and scrolls on its own.
 
 ## Notifications and settings
 
@@ -349,6 +355,54 @@ mkcert -cert-file tasks/data/board.pem -key-file tasks/data/board-key.pem \
 browser you change: open `chrome://flags/#unsafely-treat-insecure-origin-as-secure` (in Edge,
 `edge://flags/#unsafely-treat-insecure-origin-as-secure`), enter the board's address exactly as you
 open it, such as `http://192.168.1.10:8765`, set the flag to *Enabled* and relaunch the browser.
+
+## Live stream
+
+The board can play one network stream, video and audio, beside the dashboard on every open page, for
+a camera, an encoder or a screen capture on your network that you want to watch next to the agents'
+work. Open it with one call from any machine (`taskctl api POST /api/stream '{"url": "..."}'` does the
+same):
+
+```sh
+curl -sS --noproxy '*' -X POST http://<board-host>:8765/api/stream \
+  -H 'Content-Type: application/json' -d '{"url": "http://dell-cachyos:8554/"}'
+curl -sS --noproxy '*' http://<board-host>:8765/api/stream                  # what is open, and its state
+curl -sS --noproxy '*' -X DELETE http://<board-host>:8765/api/stream        # close it
+```
+
+A newer URL replaces the open one; posting the open URL again keeps it and retries at once. The URL is
+http, https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp, and it is the *board host* that connects to it,
+so the name must resolve and be reachable from there.
+
+- **How it plays**: the board host runs one `ffmpeg` for the open stream. The video is copied as it is,
+  the audio becomes AAC stereo, and the result goes to every page as fragmented MP4, which browsers play
+  with Media Source Extensions. No library and no transcoding of the picture, so it costs the board host
+  a few percent of one core, and the network the stream's bitrate for each open page (the source itself
+  is read once). A page that joins late starts at the latest keyframe, within a couple of seconds.
+- **Layout**: on a portrait screen the stream is below the dashboard, full width, as tall as its
+  aspect ratio makes it. On a landscape screen it is to the right, full height, as wide as its aspect
+  ratio makes it. Either way it never takes more than half the window, and black bars fill the pane when
+  the video is narrower or flatter than that. Until the video is playing, the pane is a black half of the
+  window that reads `connecting to <url>...` with a running timer under it. A stream with sound but no
+  picture shows `audio connected` in a black box of 15% of the window.
+- **Sound**: browsers keep sound off until you have clicked or tapped the page once, so a page that opened
+  by itself starts the stream muted and shows a *click for sound* button. **Settings > This device >
+  Live stream** switches the sound on or off for that device (the bell is separate) and sets its volume. A
+  display that nobody touches can be launched with the browser's autoplay restriction off: Chrome and
+  Edge with `--autoplay-policy=no-user-gesture-required`, Firefox with `media.autoplay.default` set to `0`
+  in `about:config`.
+- **Browsers**: anything with Media Source Extensions: Chrome, Edge, Firefox, Safari 17.1 and iOS 17.1
+  or newer (older iPhones have none). H.264 plays everywhere; HEVC and AV1 are passed through as they
+  are, so they play only where the browser can decode them, and otherwise the pane stays on
+  *connecting* with the reason in its tooltip and in `GET /api/stream`.
+- **Trouble**: a run of `ffmpeg` that fails or ends starts again after 1, 2, 4, 8 and then every 10
+  seconds, and the pane keeps showing *connecting* with its timer. The reason (`Connection refused`, `Server
+  returned 404`, `ffmpeg is not installed on the board host`) is the `error` of `GET /api/stream`. A source that announces audio
+  but never sends it, or stops sending it, is played without audio. The open stream is saved in
+  `tasks/data/tasks.stream.json` and reopens when the board restarts; only `DELETE` closes it.
+- **Limits**: 16 pages at a time; a tab that has been in the background for a minute lets go of the stream
+  and reconnects when you come back. `ffprobe http://<board-host>:8765/api/stream/media` shows what the pages
+  receive.
 
 ## taskctl reference
 
@@ -464,6 +518,8 @@ shapes, validation, errors and state rules, is the module docstring of
 | POST, DELETE | `/api/tasks/<tid>/attention` | Flag one task as waiting for input: `{message}`; clear it |
 | GET | `/api/events` | The event log since a cursor, plus what is waiting and what is stale (`?since=`, `?limit=`) |
 | GET, PUT, DELETE | `/api/settings` | The board-wide notification settings: read, change (`{settings: {...}}`), reset |
+| GET, POST, DELETE | `/api/stream` | The [live stream](#live-stream): read it, open one (`{url}`, replacing any open one), close it |
+| GET | `/api/stream/media` | The open stream as fragmented MP4, an endless response (`?id=`), which the dashboard plays |
 
 Requests and tasks have an `attention` field (`{message, since}` or null); a request also has
 `waiting` and `tasks_waiting`, and the list's counts have `waiting`. A write sent with the header
@@ -493,6 +549,14 @@ curl -sS --noproxy '*' -X POST http://<board-host>:8765/api/tasks/k3m9qa-2/progr
 - **Agent text is shown as text.** Titles, hints, questions and messages are rendered as plain text,
   never as HTML, so a report cannot inject script. A Host header is built into the served files only
   if it is a plain `host[:port]`.
+- **A live stream makes the board connect out.** `POST /api/stream` makes the board host open the URL
+  it is given, and anyone who can reach the board can ask for that, so it can be pointed at other
+  machines on the board host's network and its error text shows whether a port answered. Only
+  http(s), rtsp(s), rtmp(s), srt, udp and tcp URLs are accepted, `ffmpeg` is started with file, pipe and
+  concat protocols off and without a proxy, and `udp://`, `srt://...mode=listener` and `tcp://...?listen=1`
+  URLs make the board listen on a port. A `user:password@` in the URL is shown as `***@` by the API, the
+  page and the log, but `tasks/data/tasks.stream.json` (mode 600) and `ffmpeg`'s command line (`ps`) hold
+  it, and a query string is shown in full: keep secrets out of it.
 - **Agents stay on plain http.** Over the HTTPS listener, the board address built into the usage
   text and `taskctl.py` is still the plain http one (same host name, http port), because a
   self-signed or mkcert certificate would make an agent's `curl` or Python refuse the connection.
@@ -513,8 +577,8 @@ curl -sS --noproxy '*' -X POST http://<board-host>:8765/api/tasks/k3m9qa-2/progr
 
 ## Data and retention
 
-State lives in SQLite at `tasks/data/tasks.db`, next to the pidfiles and the settings file. The
-directory is gitignored. A database from an earlier version is upgraded in place on start.
+State lives in SQLite at `tasks/data/tasks.db`, next to the pidfiles, the settings file and, while a
+live stream is open, `tasks.stream.json`. The directory is gitignored. A database from an earlier version is upgraded in place on start.
 `tasks.sh --bg` logs to `.logs/tasks_server.log`, which is also gitignored. These server flags
 control aging:
 
