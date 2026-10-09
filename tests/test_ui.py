@@ -13,14 +13,32 @@ recorders, the detail view, an outage, the reminder, the settings panel, the per
 motion, and the guidance on an insecure page (with a link to the https listener when openssl can make
 a certificate for one).
 
+The live stream's cases (stream_cases) run on boards of their own too (a board has one stream), each with
+tests/lib/fake_ffmpeg.py first on its PATH as `ffmpeg`, so a stream's URL (http://fake.invalid/live, /hang,
+/audio, /hevc?audio=0, /live?die=30...) says how the "source" behaves. They load the boards in iframes of a
+/__frame page (the window each board sees is the iframe's, so any size and orientation can be had), with
+the media stub (__media=stub) standing in for the browser's MediaSource and media element: the page's real
+player code runs, against a stub that models what it depends on. The layout of the pane in every state and
+orientation, the sound the browser holds back and the click that releases it, the settings block, a
+replaced stream, a source that ends and restarts, an unplayable codec, the player's seek, jump, trim and
+failure paths, parking, going to a request and Back, and an outage. The streamplay case (when ffmpeg can
+encode H.264, and this Firefox can decode it) plays a real source with the real MediaSource. The existing
+list and detail checks are repeated with a stream open (stream_check_*).
+
+    python3 tests/test_ui.py [base] [v2] [stream]   only those groups of cases (all of them without arguments)
     FIREFOX=/path/to/firefox   use that binary
-    UI_SHOTS_DIR=DIR           keep every case's screenshot there, for a human look
+    UI_SHOTS_DIR=DIR           keep every case's screenshot there, for a human look (the stream cases then
+                               leave their frames and stream open, so the screenshot shows them)
+    UI_STREAM_URL=URL          also play this real source (a camera's, say) through a scratch board with the real
+                               ffmpeg, in a case of its own (streamreal); off by default, so the suite reaches no
+                               other host
 """
 from __future__ import annotations
 
 import concurrent.futures
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -28,11 +46,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 sys.dont_write_bytecode = True  # no __pycache__ in the checkout, even when run without run_all.sh
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
-from harness import (TESTS, ScratchServer, Suite, api, clean_env, free_port, scratch_home, self_signed_cert,  # noqa: E402
-                     skip_suite, tempdir)
+from harness import (TESTS, FakeUpstream, ScratchServer, Suite, api, clean_env, fake_ffmpeg_dir, find_procs, free_port,  # noqa: E402
+                     make_ts, real_ffmpeg_dir, scratch_home, self_signed_cert, skip_suite, tempdir)
 
 S = Suite('ui')
 check = S.check
@@ -180,7 +199,7 @@ def seed(base: str, db_path: Path) -> dict:
 # ---------------------------------------------------------------- firefox
 
 def firefox(name: str, base: str, path: str, width: int, theme: str, script: str, wait: int, extra: str = '',
-            prefs: tuple = ()) -> dict | None:
+            prefs: tuple = (), height: int = 900) -> dict | None:
     if STOPPING:
         return None
     prof = TMP / f'profile-{name}'
@@ -199,7 +218,7 @@ def firefox(name: str, base: str, path: str, width: int, theme: str, script: str
     url = f'{base}{page}{sep}__test={script}&__name={name}&__wait={wait}{extra}' + (f'#{frag}' if frag else '')
     env = clean_env(HOME=HOME, MOZ_CRASHREPORTER_DISABLE=1, XDG_CACHE_HOME=HOME / '.cache', XDG_CONFIG_HOME=HOME / '.config')
     shot = SHOTS / f'{name}.png'
-    proc = subprocess.Popen([FIREFOX, '--headless', '--no-remote', '--profile', str(prof), f'--window-size={width},900',
+    proc = subprocess.Popen([FIREFOX, '--headless', '--no-remote', '--profile', str(prof), f'--window-size={width},{height}',
                              '--screenshot', str(shot), url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     RUNNING.add(proc)
     try:
@@ -807,7 +826,513 @@ def assert_panel(r, srv):
           and fixed['notice'] is None, fixed)
 
 
+# ---------------------------------------------------------------- the live stream
+
+STREAM_JSON = {'Content-Type': 'application/json'}
+STREAM_NAMES = ('layout', 'audio', 'held', 'swap', 'retry', 'multi', 'panel', 'hevc', 'player', 'fault', 'life', 'nav', 'offline', 'odd', 'check')
+RESULTS_STREAM: dict = {}
+
+
+def secs(timer) -> int | None:
+    """The seconds a pane's timer shows ("12s"; the cases stay under a minute)."""
+    match = re.fullmatch(r'(\d+)s', timer or '')
+    return int(match.group(1)) if match else None
+
+
+def at(p, x, y, w, h, tol=1.0) -> bool:
+    """Whether the pane's box is (x, y, w, h), within tol pixels."""
+    r = p['rect']
+    return all(abs(r[k] - v) <= tol for k, v in (('x', x), ('y', y), ('w', w), ('h', h)))
+
+
+def stream_cases():
+    """The live stream's cases: a board each (a board has one stream), whose ffmpeg is tests/lib/fake_ffmpeg.py."""
+    fakebin = fake_ffmpeg_dir(TMP)
+    boards, play = {}, None
+    try:
+        for name in STREAM_NAMES:
+            env = clean_env(UI_RESULTS_DIR=RESULTS, PATH=f'{fakebin}{os.pathsep}{os.environ["PATH"]}', FAKE_FFMPEG_LOG=TMP / f'fake-{name}.log')
+            boards[name] = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', '600', script=UI / 'harness.py', name=f'ui-s{name}', env=env).start()
+        play = streamplay_setup()
+        if os.environ.get('UI_STREAM_URL'):     # a real source, only when asked for: a board of its own, the real ffmpeg
+            real = real_ffmpeg_dir(TMP)
+            if real:
+                play = dict(play or {}, real=ScratchServer(TMP, '--host', '127.0.0.1', script=UI / 'harness.py', name='ui-sreal',
+                            env=clean_env(UI_RESULTS_DIR=RESULTS, PATH=f'{real}{os.pathsep}{os.environ["PATH"]}')).start())
+            else:
+                S.skip('streamreal', 'UI_STREAM_URL needs ffmpeg')
+        _stream_cases(boards, play)
+    finally:
+        for srv in boards.values():
+            srv.stop()
+        for name, srv in boards.items():
+            check(f'the stream {name} board logged no tracebacks', 'Traceback' not in srv.log_text(), srv.log_text()[-1500:])
+        check('no ffmpeg (the fake) is left running by a stream board', not find_procs(str(fakebin)), find_procs(str(fakebin)))
+        for key, board in (('board', play and play.get('board')), ('real', play and play.get('real'))):
+            if board:
+                board.stop()
+                check(f'the real-ffmpeg board ({key}) logged no tracebacks', 'Traceback' not in board.log_text(), board.log_text()[-1500:])
+        if play:
+            if play.get('upstream'):
+                play['upstream'].close()
+            left = find_procs(str(real_ffmpeg_dir(TMP)))
+            check('no ffmpeg is left running by a real-ffmpeg board', not left, left)
+
+
+def streamplay_setup():
+    """What the real-playback case needs: a source made from ffmpeg's test patterns (an MPEG-TS served like the real
+    one) and a board of its own whose ffmpeg is the real one; None (the case is skipped) without ffmpeg and libx264."""
+    data = make_ts('av', 40)
+    if not data:
+        return None
+    real = real_ffmpeg_dir(TMP)
+    env = clean_env(UI_RESULTS_DIR=RESULTS, PATH=f'{real}{os.pathsep}{os.environ["PATH"]}')
+    board = ScratchServer(TMP, '--host', '127.0.0.1', script=UI / 'harness.py', name='ui-splay', env=env).start()
+    return {'board': board, 'upstream': FakeUpstream(data)}
+
+
+def _stream_cases(boards, play):
+    keep = '&__shot=1' if os.environ.get('UI_SHOTS_DIR') else ''
+    check_board = boards['check'].url
+    ids = seed_v2(check_board)
+    api(check_board, 'POST', '/api/stream', {'url': 'http://fake.invalid/hang'}, headers=STREAM_JSON)
+    n_requests = len(api(check_board, 'GET', '/api/requests')[1]['requests'])
+    wait_rows = len(api(check_board, 'GET', f"/api/requests/{ids['task_wait']}")[1]['tasks'])
+
+    def frame_case(name, wait):
+        return (f'stream{name}', boards[name].url, '/__frame', 1280, 'light', f'stream{name}', wait, keep, (), 900)
+
+    cases = [frame_case('fault', 75000), frame_case('retry', 40000), frame_case('player', 40000), frame_case('offline', 40000),
+             frame_case('layout', 36000), frame_case('nav', 30000), frame_case('life', 24000), frame_case('held', 30000),
+             frame_case('swap', 22000), frame_case('hevc', 20000), frame_case('odd', 32000), frame_case('audio', 14000),
+             frame_case('multi', 14000), frame_case('panel', 14000),
+             ('stream_check_390', check_board, '/', 390, 'light', 'check', 7000, '', (), 900),
+             ('stream_check_1280_dark', check_board, '/', 1280, 'dark', 'check', 7000, '', (), 900),
+             ('stream_check_844x390', check_board, '/', 844, 'light', 'check', 7000, '', (), 390),
+             ('stream_check_detail_390', check_board, f"/r/{ids['task_wait']}", 390, 'light', 'check', 7000, '', (), 900)]
+    if play and play.get('board'):    # real ffmpeg, the real MediaSource: the same pool, a board of its own
+        cases.insert(4, ('streamplay', play['board'].url, '/__frame', 1280, 'light', 'streamplay', 16000, f'&__src={quote(play["upstream"].url, safe="")}{keep}', (), 900))
+    if play and play.get('real'):     # UI_STREAM_URL: the same script, a real source
+        cases.insert(5, ('streamreal', play['real'].url, '/__frame', 1280, 'light', 'streamplay', 40000,
+                         f'&__src={quote(os.environ["UI_STREAM_URL"], safe="")}{keep}', (), 900))
+    res = in_parallel(cases)
+    RESULTS_STREAM.update(res)
+
+    assert_streamlayout(res['streamlayout'])
+    assert_streamaudio(res['streamaudio'])
+    assert_streamheld(res['streamheld'])
+    assert_streamswap(res['streamswap'])
+    assert_streamretry(res['streamretry'])
+    assert_streammulti(res['streammulti'])
+    assert_streampanel(res['streampanel'])
+    assert_streamhevc(res['streamhevc'])
+    assert_streamplayer(res['streamplayer'])
+    assert_streamfault(res['streamfault'])
+    assert_streamlife(res['streamlife'])
+    assert_streamnav(res['streamnav'])
+    assert_streamoffline(res['streamoffline'])
+    assert_streamodd(res['streamodd'])
+    S.section('stream: the list and detail checks, repeated with a stream open')
+    for name, theme, width, height, rows in (('stream_check_390', 'light', 390, 900, n_requests), ('stream_check_1280_dark', 'dark', 1280, 900, n_requests),
+                                             ('stream_check_844x390', 'light', 844, 390, n_requests), ('stream_check_detail_390', 'light', 390, 900, wait_rows)):
+        r = res[name]
+        assert_check(name, r, theme, rows=rows)
+        if r:
+            pane = r.get('pane') or {}
+            vh = r.get('innerHeight') or 0
+            if width > height:     # landscape: the pane on the right, half the width
+                ok = r['streaming'] and at({'rect': pane}, width / 2, 0, width / 2, vh) if pane else False
+            else:                  # portrait: the pane at the bottom, half the height
+                ok = r['streaming'] and at({'rect': pane}, 0, vh / 2, width, vh / 2) if pane else False
+            check(f'{name}: streaming, the pane is half the window ({"right" if width > height else "bottom"}); the board scrolls on its own, not sideways',
+                  ok and r['boardScroll'][0] <= r['boardScroll'][1], (r.get('streaming'), pane, vh, r.get('boardScroll')))
+            check(f'{name}: the phone layout follows the board\'s own width ({"yes" if width < 1000 else "no"})',
+                  r['setupWideHidden'] is (width < 1000), (width, r['setupWideHidden']))
+            check(f'{name}: the pane is black with light text in the {theme} theme', r['paneColors'] == ['rgb(0, 0, 0)', 'rgb(230, 237, 243)'], r.get('paneColors'))
+    S.section('stream: real playback (real ffmpeg, no stub)')
+    if play and play.get('board'):
+        assert_streamplay(res['streamplay'], play['upstream'])
+    else:
+        S.skip('streamplay', 'ffmpeg with libx264 is needed to make a source')
+    if play and play.get('real'):
+        assert_streamplay(res['streamreal'], None, name='streamreal')
+
+
+# ---- assertions
+
+def assert_streamlayout(r):
+    S.section('stream: where the pane goes, how big it is, and what it says')
+    if not got('streamlayout', r):
+        return
+    n, p, land, rel = r['none'], r['hangPortrait'], r['hangLandscape'], r['reloaded']
+    check('layout: with no stream there is no pane and no .streaming class, and the board has its old layout', n['hidden'] is True and n['streaming'] is False
+          and r['noneDoc'] == {'cls': '|', 'scrollW': 390, 'clientW': 390}, (n['hidden'], r['noneDoc']))
+    check('layout: a stream that does not connect: a black pane, half the window, below the board in portrait (390x844: 390x422)',
+          p['streaming'] and p['state'] == 'connecting' and at(p, 0, 422, 390, 422) and p['bg'] == 'rgb(0, 0, 0)' and p['board']['h'] == 422, p)
+    check('layout: the pane says exactly "connecting to <url>...", the timer on a line of its own, and nothing else',
+          p['line'] == 'connecting to http://fake.invalid/hang...' and secs(p['timer']) is not None and p['title'] is None and not p['chip'], (p['line'], p['timer'], p['title']))
+    check('layout: the timer counts (a status and a timer role, and a label on the pane)', None not in map(secs, r['hangTimer']) and secs(r['hangTimer'][1]) - secs(r['hangTimer'][0]) >= 1
+          and r['hangRoles'] == ['status', 'timer', 'Live stream'], (r['hangTimer'], r['hangRoles']))
+    check('layout: landscape (844x390): the pane is on the right, half the width, the board beside it (a phone layout in a 422px board)',
+          at(land, 422, 0, 422, 390) and land['bg'] == 'rgb(0, 0, 0)' and land['board']['w'] == 422 and land['setupWide'] == 'none'
+          and land['docScroll'] == 0 and land['boardScroll'] == 0, land)
+    check('layout: a reloaded board goes on from the server\'s clock: its timer has not started over',
+          rel['streaming'] and secs(rel['timer']) is not None and secs(rel['timer']) >= secs(land['timer']) and secs(rel['timer']) >= 4, (land['timer'], rel['timer']))
+    vl, vp, vw, vt = r['videoLandscape'], r['videoPortrait'], r['videoWide'], r['videoTall']
+    check('layout: the video, 16:9, landscape 844x390: half the width (the picture is letterboxed inside: object-fit contain)',
+          vl['state'] == 'video' and at(vl, 422, 0, 422, 390) and vl['fit'] == 'contain' and vl['line'] == '' and vl['videos'] == 1 and vl['video']['opacity'] == '1', vl)
+    check('layout: the video, 16:9, portrait 390x844: the whole width, the height the ratio gives (219.4), at the bottom',
+          at(vp, 0, 844 - 390 * 9 / 16, 390, 390 * 9 / 16) and abs(vp['board']['h'] + vp['rect']['h'] - 844) < 0.01 and vp['ar'] == '1.7778', vp)
+    check('layout: the video, 16:9, landscape 1280x800: half the width (640)', at(vw, 640, 0, 640, 800), vw)
+    check('layout: the video, 16:9, portrait 800x1280: the ratio gives 450 of the 640 allowed', at(vt, 0, 1280 - 450, 800, 450), vt)
+    tp, tw = r['sourceTallPortrait'], r['sourceTallWide']
+    check('layout: the video, 9:16, portrait 390x844: capped at half the window (422), the width of the window', tp['state'] == 'video' and at(tp, 0, 422, 390, 422) and tp['ar'] == '0.5625', tp)
+    check('layout: the video, 9:16, landscape 1280x800: as wide as the ratio asks (450 of the 640 allowed)', at(tw, 830, 0, 450, 800), tw)
+    mk = r['markup']
+    check('layout: markup in the URL is shown as text: the pane has the URL\'s characters, no <img>, no alert', mk['line'] == f"connecting to {mk['want']}..."
+          and mk['imgs'] == 0 and mk['alerts'] == [], (mk['line'], mk['imgs'], mk['alerts']))
+    sc = r['secret']
+    check('layout: a password in the URL is shown as ***@, in the pane and its tooltip', sc['line'] == 'connecting to http://***@fake.invalid/hang...'
+          and 'pw' not in sc['text'].replace('\n', ' ').split('http://***@')[-1].replace('fake.invalid/hang', ''), sc['text'])
+    c = r['closed']
+    check('layout: closed, the pane is gone and the board has the window again; no media request follows', r['deleteStatus'] == 200 and c['streaming'] is False and c['hidden'] is True
+          and c['doc'] == {'cls': '|', 'scrollW': 390, 'clientW': 390} and c['mediaRequests'] == 0, (r['deleteStatus'], c['doc'], c['mediaRequests']))
+    check('layout: no JS errors', r['errors'] == [[], []], r['errors'])
+
+
+def assert_streamaudio(r):
+    S.section('stream: audio only')
+    if not got('streamaudio', r):
+        return
+    p, l, ph, w = r['portrait'], r['landscape'], r['phone'], r['wide']
+    check('audio: an audio-only stream is "audio connected" (exactly), a black pane, no timer; the player asked for the audio MIME',
+          all(x['state'] == 'audio' and x['line'] == 'audio connected' and x['bg'] == 'rgb(0, 0, 0)' for x in (p, l, ph, w)) and r['timerShown'] == 'none'
+          and r['type'] == 'audio/mp4; codecs="mp4a.40.2"' and r['plays'] == [[False, 'ok']], (p['line'], r['timerShown'], r['type'], r['plays']))
+    check('audio: 15% of the window: the height in portrait 390x844 (126.6) at the bottom', at(p, 0, 844 - 126.6, 390, 126.6), p)
+    check('audio: 15% of the window: the width in landscape 844x390 (126.6) on the right', at(l, 844 - 126.6, 0, 126.6, 390), l)
+    check('audio: 15% of the window: 100 wide at 667x375, 192 at 1280x800', at(ph, 667 - 100.05, 0, 100.05, 375) and at(w, 1280 - 192, 0, 192, 800), (ph['rect'], w['rect']))
+    held = [r['heldPortrait'], r['heldLandscape'], r['heldPhone'], r['heldWide']]
+    check('audio: held by the browser: the chip says "click for sound" in every size', all(x['held'] == 'sound' and x['chip']['label'] == 'click for sound' for x in held), held)
+
+    def inside(x):
+        c, k = x['chip']['rect'], x['rect']
+        return c['x'] >= k['x'] - 0.5 and c['y'] >= k['y'] - 0.5 and c['x'] + c['w'] <= k['x'] + k['w'] + 0.5 and c['y'] + c['h'] <= k['y'] + k['h'] + 0.5
+    check('audio: the chip fits the pane in every size, as text where there is room (portrait, 1280 wide) and as its icon in the narrow ones',
+          all(inside(x) for x in held) and [x['chip']['textShown'] for x in held] == [True, False, False, True], [(x['chip']['rect'], x['rect'], x['chip']['textShown']) for x in held])
+    check('audio: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+def assert_streamheld(r):
+    S.section('stream: sound the browser holds back')
+    if not got('streamheld', r):
+        return
+    m, c = r['muted'], r['clicked']
+    check('held: where only muted playback may start, the video plays muted and the chip says "click for sound"; the unmuted try came first',
+          m['pane']['state'] == 'video' and m['pane']['held'] == 'sound' and m['pane']['chip']['text'] == 'click for sound' and m['pane']['video']['muted'] is True
+          and m['pane']['video']['paused'] is False and m['plays'] == [[False, 'NotAllowedError'], [True, 'ok']], m)
+    check('held: Escape does not let the sound out (it is no activation)', r['escape']['pane']['held'] == 'sound' and r['escape']['unmutes'] == 0, r['escape'])
+    check('held: nor does a click or a key with no activation (it would pause the video)', r['noActivation']['pane']['held'] == 'sound' and r['noActivation']['unmutes'] == 0
+          and r['noActivation']['pane']['video']['paused'] is False, r['noActivation'])
+    check('held: a click with activation lets it out: unmuted, playing, no chip, one unmute, and a play (unmuted, allowed) asked for with it', c['pane']['held'] is None
+          and c['pane']['chip'] is None and c['pane']['video']['muted'] is False and c['pane']['video']['paused'] is False and c['unmutes'] == [[True, False]]
+          and c['plays'] == [[False, 'NotAllowedError'], [True, 'ok'], [False, 'ok']], c)
+    check('held: so does a key (not Escape)', r['keyed']['pane']['held'] is None and r['keyed']['pane']['video']['muted'] is False and r['keyed']['unmutes'] == 1, r['keyed'])
+    b, bc = r['blocked'], r['blockedClicked']
+    check('held: where nothing may start, the video waits and the chip says "click to play" (unmuted try, muted try, both refused)',
+          b['pane']['held'] == 'play' and b['pane']['chip']['text'] == 'click to play' and b['pane']['video']['paused'] is True
+          and b['plays'] == [[False, 'NotAllowedError'], [True, 'NotAllowedError']], b)
+    check('held: the click starts it, with sound, and the chip goes', bc['pane']['held'] is None and bc['pane']['chip'] is None and bc['pane']['video']['paused'] is False
+          and bc['pane']['video']['muted'] is False and bc['plays'][-1] == [False, 'ok'], bc)
+    so, soc = r['soundOff'], r['soundOffClicked']
+    check('held: with the stream\'s sound off on this device: muted from the start, no unmuted try, no chip; a click changes nothing',
+          so['pane']['held'] is None and so['pane']['chip'] is None and so['pane']['video']['muted'] is True and so['plays'] == [[True, 'ok']]
+          and soc['unmutes'] == 0 and soc['pane']['video']['muted'] is True, (so, soc))
+    ob, obc = r['offBlocked'], r['offBlockedClicked']
+    check('held: sound off and nothing may start: "click to play", and the click plays it muted', ob['pane']['held'] == 'play' and ob['pane']['chip']['text'] == 'click to play'
+          and obc['pane']['held'] is None and obc['pane']['video']['paused'] is False and obc['pane']['video']['muted'] is True and obc['unmutes'] == 0, (ob, obc))
+    vo, vb, vc = r['videoOnly'], r['videoOnlyBlocked'], r['videoOnlyClicked']
+    check('held: a stream with no audio track (a camera\'s) is played muted at once: no unmuted try, no "click for sound" chip, nothing held', vo['pane']['state'] == 'video'
+          and vo['pane']['held'] is None and vo['pane']['chip'] is None and vo['pane']['video']['muted'] is True and vo['plays'] == [[True, 'ok']], vo)
+    check('held: nor is there any sound to click for where nothing may start: "click to play", and the click plays it muted', vb['pane']['held'] == 'play'
+          and vb['pane']['chip']['text'] == 'click to play' and vb['plays'] == [[True, 'NotAllowedError']] and vc['pane']['held'] is None and vc['pane']['video']['paused'] is False
+          and vc['pane']['video']['muted'] is True and vc['unmutes'] == 0, (vb, vc))
+    rf, rl = r['refused'], r['refusedLater']
+    check('held: a browser that pauses the video after an unmute it refused: muted again, playing again, held again, the chip back',
+          rf['pane']['held'] == 'sound' and rf['pane']['video']['muted'] is True and rf['pane']['video']['paused'] is False and rf['pane']['chip']['text'] == 'click for sound'
+          and rf['unmutes'] == 1, rf)
+    check('held: and it does not go on trying by itself', rl['unmutes'] == 1 and rl['plays'] == rf['plays'].__len__() and rl['held'] == 'sound', (rf['plays'], rl))
+    check('held: no JS errors (no unhandled play() rejection)', r['errors'] == [[]], r['errors'])
+
+
+def assert_streamswap(r):
+    S.section('stream: a newer URL replaces the stream')
+    if not got('streamswap', r):
+        return
+    a, b, c = r['a'], r['b'], r['c']
+    ids = r['ids']
+    check('swap: stream A plays in both boards, from fragments marked A; the board counts two viewers', a['f']['state'] == 'video' and a['g']['state'] == 'video'
+          and a['markers'] == ['A', 'A'] and a['viewers'] == 2, a['markers'])
+    check('swap: told of B (which never connects): both panes are "connecting to B" again, the timer started over, the video element gone, no viewer left',
+          all(x['state'] == 'connecting' and x['line'] == 'connecting to http://fake.invalid/hang...' and x['videos'] == 0 and secs(x['timer']) <= 4 for x in (b['f'], b['g']))
+          and b['viewers'] == 0, b)
+    check('swap: then C: both boards play it, one video element each, from C only after the swap (the fragments before were A\'s), two viewers',
+          c['f']['state'] == 'video' and c['g']['state'] == 'video' and c['f']['videos'] == c['g']['videos'] == 1 and c['markers'] == ['AC', 'AC']
+          and c['last'] == ['CCC', 'CCC'] and c['viewers'] == 2 and c['srcs'] == [2, 2] and c['loads'] == [1, 1], c)
+    log = r['log']
+    check('swap: the media requests are for A (one per board) and C (one per board): none for B, none for A after it was replaced',
+          log.count(ids['a']) == 2 and log.count(ids['c']) == 2 and ids['b'] not in log and len(log) == 4, (log, ids))
+    check('swap: no JS errors', r['errors'] == [[], []], r['errors'])
+
+
+def assert_streamretry(r):
+    S.section('stream: a source that ends every few seconds')
+    if not got('streamretry', r):
+        return
+    s = r['samples']
+    states = [x['state'] for x in s]
+    cycles = [i for i in range(1, len(states)) if states[i] == 'video' and states[i - 1] == 'connecting']
+    check('retry: the board plays, goes back to "connecting" when the media ends, and plays again: at least two cycles', len(cycles) >= 3 and 'video' in states[:3], states)
+    flips = [x for i, x in enumerate(s) if x['state'] == 'connecting' and i and s[i - 1]['state'] == 'video']
+    check('retry: where the media ended, the timer counts from the server\'s `since` (the end of the run) and the tooltip is the server\'s reason (the page\'s own, "the stream '
+          'ended", only until the board answers: the page asks at once)', flips and all(secs(x['timer']) <= 2 for x in flips)
+          and all(x['title'] in ('the source ended', 'the stream ended') for x in flips) and any(x['title'] == 'the source ended' for x in flips), flips)
+    fetches = [t for t, status in r['fetches']]
+    gaps = [b - a for a, b in zip(fetches, fetches[1:])]
+    check('retry: the page asks for the media again only when the board says live: every request 200, never two within a second', len(fetches) >= 3 and all(st == 200 for _, st in r['fetches'])
+          and all(g >= 1000 for g in gaps) and r['srcs'] == len(fetches), (r['fetches'], gaps))
+    check('retry: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+def assert_streammulti(r):
+    S.section('stream: two boards, one stream')
+    if not got('streammulti', r):
+        return
+    f, g = r['f'], r['g']
+    check('multi: a phone upright and one on its side: the same stream, each laid out for its own window (16:9: 390 wide, 219 high at the bottom; 422 wide on the right)',
+          f['state'] == g['state'] == 'video' and at(f, 0, 844 - 390 * 9 / 16, 390, 390 * 9 / 16) and at(g, 422, 0, 422, 390), (f['rect'], g['rect']))
+    check('multi: both are viewers of the one stream (one media request each); one going away leaves one', r['both']['id'] == r['id'] and r['both']['viewers'] == 2
+          and r['srcs'] == [1, 1] and r['one']['viewers'] == 1, (r['both'].get('viewers'), r['srcs'], r['one'].get('viewers')))
+    check('multi: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+def assert_streampanel(r):
+    S.section('stream: the settings panel\'s Live stream block (This device)')
+    if not got('streampanel', r):
+        return
+    st, o = r['start'], r['open']
+    check('panel: two boards play muted (held), nothing saved yet', st['a']['held'] == st['b']['held'] == 'sound' and st['stored'] == {}, st)
+    check('panel: the dialog is titled Settings (the gear too), has a Live stream block after Sound with the switch on, the volume at 100%, and the "muted by the browser" note',
+          o['dialog'] and o['title'] == 'Settings' and o['gear'] == 'Settings' and o['heading'][:2] == ['Sound', 'Live stream'] and o['checked'] is True and o['volume'] == '100'
+          and o['volumeText'] == '100%' and o['heldNote'] is True, o)
+    off = r['off']
+    check('panel: the switch off: saved as stream_audio false; both boards muted with nothing held; the slider and the note go', off['stored']['stream_audio'] is False and off['checkbox'] is False
+          and off['a']['held'] is None and off['b']['held'] is None and off['a']['video']['muted'] and off['b']['video']['muted'] and off['heldNote'] is False and off['sliderDisabled'] is True, off)
+    on = r['on']
+    check('panel: on again, with a click: this board\'s sound is out (one unmute, with a gesture); the other board, which got no gesture, holds it back with its chip',
+          on['stored']['stream_audio'] is True and on['a']['held'] is None and on['a']['video']['muted'] is False and on['unmutes'] == [[True], 0]
+          and on['b']['held'] == 'sound' and on['b']['video']['muted'] is True and on['b']['chip']['label'] == 'click for sound', on)
+    vol = r['volume']
+    check('panel: the volume slider: saved as stream_volume 0.4, shown as 40%, the volume of this board\'s video and of the other one\'s (by the storage event)',
+          vol['stored']['stream_volume'] == 0.4 and vol['text'] == '40%' and vol['a']['video']['volume'] == 0.4 and vol['b']['video']['volume'] == 0.4, vol)
+    junk = r['junk']
+    check('panel: a hand-edited, invalid saved value is ignored (the defaults: sound on, volume 1)', junk['b']['video']['volume'] == 1 and junk['b']['held'] == 'sound', junk)
+    check('panel: no JS errors', r['errors'] == [[], []], r['errors'])
+
+
+def assert_streamhevc(r):
+    S.section('stream: a codec the browser cannot play')
+    if not got('streamhevc', r):
+        return
+    e, late = r['early'], r['late']
+    check('hevc: the board has it live as hev1; the page makes no video, the pane stays "connecting" at half the window with the reason as its tooltip only',
+          r['server'] == {'state': 'live', 'video': 'hev1', 'audio': None} and e['state'] == 'connecting' and at(e, 0, 422, 390, 422) and e['videos'] == 0
+          and e['title'] == 'this browser cannot play this stream (hev1)' and e['line'] == 'connecting to http://fake.invalid/hevc?audio=0...' and r['srcs'] == 0, (r['server'], e))
+    check('hevc: the timer goes on, and the page asked once for the media and never again (no retry loop)', secs(late['timer']) >= secs(e['timer']) + 6
+          and r['requests'] == [1, 1] and r['supports'] == ['video/mp4; codecs="hev1"'], (e['timer'], late['timer'], r['requests'], r['supports']))
+    check('hevc: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+def assert_streamplayer(r):
+    S.section('stream: the player\'s seeks, jump and trim (stub MediaSource)')
+    if not got('streamplayer', r):
+        return
+    first = r['first']
+    s0 = first['seeks'][0] if first['seeks'] else None
+    inside = bool(s0 and s0['buffered'] and s0['buffered'][0][0] <= s0['to'] <= s0['buffered'][0][1])
+    check('player: a board that joins a running stream starts inside what the first append buffered, not at 0 (the GOP does not start there)',
+          len(first['seeks']) == 1 and inside and s0['to'] > 0 and s0['buffered'][0][0] > 0 and not s0['paused'], first['seeks'])
+    check('player: steady playback needs no further seek', len(first['seeks']) == 1 and first['snap']['paused'] is False and first['snap']['ready'] >= 3, first['snap'])
+    j = r['jump']['seeks']
+    lag = (j[1]['buffered'][0][1] - j[1]['from']) if len(j) > 1 else None
+    check('player: a playhead that falls behind (held) is brought to the live edge, 0.4s behind the newest frame, by one jump, when it was more than 1.5s behind',
+          len(j) == 2 and lag is not None and 1.5 < lag < 2.0 and abs(j[1]['to'] - (j[1]['buffered'][0][1] - 0.4)) < 0.05, j)
+    ch = r['chase']['seeks']
+    gaps = [b - a for a, b in zip(ch[1:], ch[2:])]
+    check('player: while it stays behind it jumps again only after two seconds, never faster', len(ch) >= 3 and all(g >= 1900 for g in gaps) and ch[1] - ch[0] > 0, gaps)
+    check('player: playhead caught up: no more jumps', r['steady']['after'] == r['steady']['before'], r['steady'])
+    p, pc = r['paused'], r['pausedClicked']
+    check('player: a video the browser would not start (paused) is never chased: one seek (the first) while the buffer grew by seconds', p['seeks'] == 1 and p['held'] == 'play'
+          and p['snap']['paused'] is True and p['snap']['buffered'][-1][1] - p['snap']['ct'] > 3, p)
+    pj = pc['seeks'][1] if len(pc['seeks']) > 1 else None
+    check('player: its click starts it, and it jumps to the live edge at once (one more seek)', len(pc['seeks']) == 2 and pc['held'] is None and pc['snap']['paused'] is False
+          and abs(pj['to'] - (pj['buffered'][0][1] - 0.4)) < 0.05, pc)
+    h, sh = r['hidden'], r['shown']
+    check('player: a hidden tab is not chased (no seek in 3.5s with the playhead held), and when it is shown it jumps once', h['to'] == h['from']
+          and len(sh['seeks']) == h['from'] + 1 and sh['seeks'][-1]['hidden'] is False, (h, [x['hidden'] for x in sh['seeks']]))
+
+    def removals(x):
+        return x['removes']
+    t = r['trim']
+    first_rm = removals(t)[0] if removals(t) else None
+    check('player: far behind the playhead (more than the trim threshold) it removes buffered media up to the playhead minus the margin, and the playing GOP is intact',
+          first_rm and abs(first_rm['end'] - (first_rm['ct'] - 3)) < 0.1 and first_rm['after'] and first_rm['after'][0][0] <= first_rm['ct'] <= first_rm['after'][0][1]
+          and first_rm['after'][0][0] >= first_rm['end'], removals(t)[:2])
+    check('player: and goes on playing through it (the playhead is in the buffer), once per 4s of playback rather than constantly', t['state'] == 'video'
+          and t['snap']['buffered'][0][0] <= t['snap']['ct'] <= t['snap']['buffered'][-1][1] and t['srcs'] == 1 and 1 <= len(removals(t)) <= 6, t)
+    cut = r['cut']
+    cut_rm = removals(cut)[0] if removals(cut) else None
+    check('player: the stub can tell: with no margin the same trim cuts the playing GOP (its removal runs on to a keyframe after the playhead)',
+          cut_rm and not (cut_rm['after'] and cut_rm['after'][0][0] <= cut_rm['ct'] <= cut_rm['after'][0][1]), removals(cut)[:1])
+    check('player: no JS errors', r['errors'] == [[], [], [], []], r['errors'])
+
+
+def assert_streamfault(r):
+    S.section('stream: faults (stub MediaSource)')
+    if not got('streamfault', r):
+        return
+    q = r['quota']
+    check('fault: a full browser buffer (QuotaExceededError): the pane is "connecting" with that as its tooltip, the page asks again after about a second, and plays again',
+          q['seen'] == ['video|', 'connecting|the browser buffer is full', 'video|'] and q['srcs'] == 2 and q['loads'] == 1 and q['after']['videos'] == 1
+          and 900 <= q['fetches'][1] <= 2500, q)
+    o = r['open']
+    gaps = [b - a for a, b in zip(o['fetches'], o['fetches'][1:])]
+    check('fault: a MediaSource that never opens: reconnect after the wait, again and again, slower each time (backoff), with the reason as the tooltip',
+          o['pane']['title'] == 'the browser did not open the media source' and o['srcs'] >= 3 and o['opens'] == 0 and all(a < b for a, b in zip(gaps, gaps[1:])), (o['srcs'], gaps, o['pane']['title']))
+    n = r['noMse']
+    check('fault: no MediaSource at all: "this browser cannot play live streams" as the tooltip, no request for the media, no element', n['pane']['title'] == 'this browser cannot play live streams'
+          and n['fetches'] == 0 and n['srcs'] == 0 and n['pane']['videos'] == 0 and n['pane']['state'] == 'connecting', n)
+    s = r['stall']
+    check('fault: a relay gone silent: reconnect, with "no data from the stream for Ns" as the tooltip', any(x.startswith('connecting|no data from the stream for') for x in s['seen'])
+          and s['srcs'] >= 2 and s['fetches'] >= 2, s)
+    fz, fl = r['frozen'], r['frozenLater']
+    check('fault: bytes arrive but the buffered end stands still (the audio stopped): reconnect, with "the video froze" as the tooltip; and it plays again',
+          fz['seen'][-1] == 'connecting|the video froze' and fl['seen'][-1] == 'video|', (fz, fl['seen']))
+    m, e, mr = r['mms'], r['mmsEnded'], r['mmsResumed']
+    check('fault: ManagedMediaSource only: it opens (the element has disableRemotePlayback), plays', m['pane']['state'] == 'video' and m['opens'] == 1 and m['srcs'] == 1 and m['fetches'] == 1 and m['viewers'] == 1, m)
+    check('fault: endstreaming: the page stops reading (the board loses its viewer), the element stays', e['fetches'] == 1 and e['viewers'] == 0 and e['loads'] == 0 and e['state'] == 'video', e)
+    check('fault: startstreaming: it reads again (a new request, a new init segment appended), without a new element, and the playhead moves on past the old end',
+          mr['fetches'] == 2 and mr['viewers'] == 1 and mr['loads'] == 0 and mr['state'] == 'video' and mr['inits'] == 2 and mr['snap']['ct'] > e['snap']['buffered'][-1][1] + 1, (e['snap'], mr))
+    check('fault: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+def assert_streamlife(r):
+    S.section('stream: parking, a page kept for Back, the browser coming back online')
+    if not got('streamlife', r):
+        return
+    check('life: two boards play; nothing parks early (1.2s hidden)', r['start'] == {'viewers': 2, 'm': 1, 's': 1} and r['early'] == {'m': 1, 'mLoads': 0, 'viewers': 2}, (r['start'], r['early']))
+    pk = r['parked']
+    check('life: hidden and muted past the park time, the tab lets its media connection go (the element gone, the board loses the viewer); the one with sound on goes on',
+          pk['m']['videos'] == 0 and pk['mLoads'] == 1 and pk['viewers'] == 1 and pk['s'] == 1 and pk['sLoads'] == 0, pk)
+    b = r['back']
+    check('life: shown again, the parked board takes the stream up again (a new request, a new element); the other one is as it was',
+          b['m']['state'] == 'video' and b['mSrcs'] == 2 and b['mFetches'] == 2 and b['s'] == 1 and b['sSrcs'] == 1 and b['viewers'] == 2, b)
+    check('life: a page kept for Back (pagehide persisted) stops its player; shown again (pageshow) it attaches again', r['pagehide'] == {'videos': 0, 'loads': 1}
+          and r['pageshow'] == {'state': 'video', 'srcs': 2}, (r['pagehide'], r['pageshow']))
+    on = r['online']
+    check('life: the browser coming back online cuts a retry\'s wait short (the third try came when it did, 0.3s after the second failed; its wait was 2s)',
+          250 <= on['waited'] <= 900 and 250 <= on['fetches'][-1] <= 900, on)
+    check('life: no JS errors', r['errors'] == [[], [], []], r['errors'])
+
+
+def assert_streamnav(r):
+    S.section('stream: reading position, deep links, Back, the deleted view')
+    if not got('streamnav', r):
+        return
+    check('nav: opening a stream keeps the reading position (the document at 300: the board at 300, the document at 0); closing it moves it back',
+          r['before'] == {'doc': 300, 'board': 0} and r['streaming']['doc'] == 0 and r['streaming']['board'] == 300 and r['streaming']['boardScrollH'] > r['streaming']['boardH']
+          and r['closed'] == {'doc': 300, 'board': 0}, (r['before'], r['streaming'], r['closed']))
+    h = r['hash']
+    check('nav: a #task deep link scrolls the task into view inside the board (not the document) and marks it', h['streaming'] and h['doc'] == 0 and h['board'] > 0 and h['target']
+          and h['row']['y'] >= h['boardRect']['y'] - 1 and h['row']['y'] + h['row']['h'] <= h['boardRect']['y'] + h['boardRect']['h'] + 1, h)
+    check('nav: to a request and Back: the board\'s scroll position is back (400), the stream still on', r['listScroll'] == 400 and r['detail']['path'].startswith('/r/')
+          and r['detail']['streaming'] and r['back']['path'] == '/' and r['back']['board'] == 400 and r['back']['streaming'] and r['back']['doc'] == 0, (r['listScroll'], r['back']))
+    d = r['deleted']
+    check('nav: a request deleted behind the page: the deleted view keeps the pane, and its timer counts on the board\'s clock (the browser\'s is an hour fast)',
+          d['title'] == 'This request was deleted.' and d['streaming'] and d['line'] == 'connecting to http://fake.invalid/hang...' and secs(d['later']) is not None
+          and secs(d['later']) - secs(d['first']) >= 1 and secs(d['later']) < 60, d)
+    u = r['unknown']
+    check('nav: a request that never existed: the same, and the timer is right with that clock too', u['title'] == 'Request not found' and u['streaming'] and secs(u['timer']) is not None
+          and secs(u['timer']) < 60, u)
+    check('nav: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+def assert_streamoffline(r):
+    S.section('stream: the board out of reach while a stream plays and is replaced')
+    if not got('streamoffline', r):
+        return
+    s = r['samples']
+    check('offline: the old media ends when the stream is replaced; the pane says so, then that the stream cannot be reached; the board shows offline',
+          r['playing']['state'] == 'video' and any(x['title'] == 'the stream ended' for x in s) and any(x['title'] == "can't reach the stream" for x in s)
+          and any(x['conn'] == 'offline' for x in s), s)
+    a = [x for x in r['fetches'] if x[1] == 'A']
+    check('offline: the retries meanwhile fail quietly and slowly (dropped like the polls, never more than one per second), and the one after is told the stream was replaced (410)',
+          2 <= len(a) <= 6 and [x[2] for x in a][1:3] == [-1, -1] and a[-1][2] == 410 and all(b[0] - c[0] >= 1000 for c, b in zip(a, a[1:])), r['fetches'])
+    check('offline: back in reach, the page takes the new stream (the new id, fragments marked B) without a reload', r['final']['state'] == 'video' and r['final']['videos'] == 1
+          and r['last'] == 'BBB' and r['markers'] == 'AB' and r['fetches'][-1][1] == 'B' and r['fetches'][-1][2] == 200 and r['viewers'] == 1, (r['final'], r['markers'], r['fetches']))
+    check('offline: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+def assert_streamodd(r):
+    S.section('stream: a board that answers oddly')
+    if not got('streamodd', r):
+        return
+    none = ('start', 'missing', 'string', 'noId')
+    check('odd: no stream (and so no pane): none in the events, a value that is not an object, an object without an id', all(r[k]['streaming'] is False and r[k]['hidden'] is True for k in none), {k: r[k]['streaming'] for k in none})
+    mn = r['minimal']
+    check('odd: only an id and a url: the pane is "connecting to <url>..." with a timer that starts at 0 (no `since` to count from)', mn['streaming'] and mn['state'] == 'connecting'
+          and mn['line'] == 'connecting to http://odd.invalid/s...' and at(mn, 0, 422, 390, 422) and secs(mn['timer']) is not None and secs(mn['timer']) <= 4, mn)
+    bg = r['bogus']
+    check('odd: an unknown state counts as connecting; its error is the tooltip, as text; a `since` an hour ahead gives a timer of 0s, never a negative or odd one',
+          bg['streaming'] and bg['state'] == 'connecting' and bg['title'] == '<img src=x onerror=alert(1)>' and bg['imgs'] == 0 and bg['alerts'] == [] and bg['timer'] == '0s', bg)
+    lv = r['live']
+    check('odd: a media path that is not this board\'s is ignored: the page asks this board\'s route, and plays', lv['state'] == 'video' and r['fetches'] == ['/api/stream/media?id=abc125'], (lv['state'], r['fetches']))
+    check('odd: a codec this browser cannot play blocks the stream (tooltip, no video); the same stream with codecs it can play lifts the block',
+          r['blocked']['state'] == 'connecting' and r['blocked']['title'] == 'this browser cannot play this stream (hev1)' and r['blocked']['videos'] == 0
+          and r['unblocked']['state'] == 'video' and r['unblocked']['videos'] == 1, (r['blocked'], r['unblocked']['state']))
+    check('odd: the key gone again: the pane goes, the video with it', r['gone']['streaming'] is False and r['gone']['videos'] == 0, r['gone'])
+    check('odd: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+def assert_streamplay(r, up, name='streamplay'):
+    """up: the generated source (FakeUpstream); None for a real one (UI_STREAM_URL), whose size and frame rate are not known here."""
+    if not got(name, r):
+        return
+    if not r['live']:
+        check(f'{name}: the board got the stream live', False, r['server'])
+        return
+    if r.get('skip'):
+        S.skip(f'{name}: real playback', r['skip'])
+        return
+    pre, play, srv = r['pre'], r['play'], r['server']
+    check(f'{name}: the board got the stream live (ffmpeg remuxed it: an H.264 video, and audio if the source has it), and a preflight page decodes what the board relays',
+          r['live'] and srv['video'].startswith('avc1.') and pre['decoded'] is True and pre['size'] == [srv['width'], srv['height']]
+          and (up is None or ((srv['width'], srv['height']) == (320, 180) and srv['audio'] == 'mp4a.40.2')), (srv, pre))
+    check(f'{name}: the board plays it with the real MediaSource: the picture has the source\'s size, the pane is 16:9 at the bottom, muted with the chip (autoplay is refused)',
+          r['pane']['state'] == 'video' and r['pane']['held'] == ('sound' if srv['audio'] else None) and r['pane']['videos'] == 1 and (play['w'], play['h']) == (srv['width'], srv['height'])
+          and play['muted'] is True and abs(r['pane']['rect']['h'] - 390 * srv['height'] / srv['width']) < 1.0, (r['pane'], play))
+    check(f'{name}: it moves: the playhead advances in real time, the frames are decoded (a frame rate of at least 10, none dropped for good), no error',
+          abs(play['advanced'] - play['seconds']) < 0.6 and play['frames'] > 10 * play['seconds'] and play['readyState'] >= 2 and play['error'] is None, play)
+    check(f'{name}: the buffer is one range, seconds long, not far from the live edge (lag under 2s)', play['ranges'] == 1 and play['span'] < 15 and 0 <= play['lag'] < 2, play)
+    if up is not None:
+        check(f'{name}: the source was read once, whatever the number of viewers', up.connections == 1, up.connections)
+    check(f'{name}: no JS errors', r['errors'] == [[]], r['errors'])
+
+
 if __name__ == '__main__':
+    # python3 tests/test_ui.py [base] [v2] [stream]: only those groups of cases (every one without arguments)
+    groups = set(sys.argv[1:]) or {'base', 'v2', 'stream'}
+    if groups - {'base', 'v2', 'stream'}:
+        sys.exit(f'usage: test_ui.py [base] [v2] [stream]   (no argument: all); not a group: {sorted(groups - {"base", "v2", "stream"})}')
     env = clean_env(UI_RESULTS_DIR=RESULTS)
     board = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', str(STALE_AFTER), script=UI / 'harness.py',
                           name='ui', env=env).start()
@@ -817,10 +1342,14 @@ if __name__ == '__main__':
         r = firefox('ping', empty.url, '/', 390, 'light', 'ping', 500)
         if not check('firefox loads a page and runs the injected test script', r and r.get('ok'), r):
             sys.exit(S.finish())
-        ids = seed(board.url, board.db)
-        read_only_cases(board.url, empty.url, ids)
-        stateful_cases(board.url, board, ids)
-        v2_cases(env)
+        if 'base' in groups:
+            ids = seed(board.url, board.db)
+            read_only_cases(board.url, empty.url, ids)
+            stateful_cases(board.url, board, ids)
+        if 'v2' in groups:
+            v2_cases(env)
+        if 'stream' in groups:
+            stream_cases()
     finally:
         board.stop()
         empty.stop()
@@ -830,5 +1359,6 @@ if __name__ == '__main__':
             for shot in SHOTS.glob('*.png'):
                 shutil.copy2(shot, keep)
             (Path(keep) / 'v2_results.json').write_text(json.dumps(RESULTS_V2, indent=1))
-            print(f'screenshots (and the v2 results) kept in {keep}')
+            (Path(keep) / 'stream_results.json').write_text(json.dumps(RESULTS_STREAM, indent=1))
+            print(f'screenshots (and the v2 and stream results) kept in {keep}')
     sys.exit(S.finish())

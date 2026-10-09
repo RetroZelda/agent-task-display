@@ -16,6 +16,16 @@
   board's settings (/api/settings, "All viewers") merged with this browser's overrides (localStorage,
   "This device") to four channels: a row highlight, the tab title and favicon, a synthesised chime and a
   browser notification. Events an agent queued while the board was unreachable (replayed) only highlight.
+
+  Live stream: when /api/events carries a "stream", the window splits into the board (then an inner scroller)
+  and a black pane: below the board in portrait, to its right in landscape. The pane reads "connecting to
+  <url>..." and a timer (on the server's clock, so every device and every reload agree) until the page has
+  video, then plays the board's relay of the source (stream.media: fragmented MP4 over one open response)
+  through Media Source Extensions. The <video> is made on attach and only after the window's load event, so
+  nothing in the markup or in flight holds that event. Sound is per device (Settings > This device): tried
+  unmuted first, else muted with a "click for sound" chip until a gesture the browser accepts. A tab that has
+  been hidden and muted for a minute lets its media connection go, and takes it up again when shown. The
+  unknown-path view never polls, so it shows no stream.
 -->
 <style>
 :root {
@@ -250,6 +260,45 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
 .legend .tri { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 20px; font-size: 12px;
     vertical-align: middle; cursor: default; }
 
+/* Live stream: only while one is open (html and body carry .streaming). The board becomes an inner scroller with
+   the pane below it in portrait and to its right in landscape; the pane is black in both colour schemes. Its
+   size by state: connecting, buffering or unsupported: half the window; video: the picture's aspect ratio
+   (--ar) up to half the window, black bars where the cap applies; audio only: 15% of it. */
+html.streaming { overflow: hidden; }
+body.streaming { height: 100vh; height: 100dvh; overflow: hidden; display: grid;
+    grid-template: "board" minmax(0, 1fr) "stream" auto / minmax(0, 1fr); }
+body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: contain; container: board / inline-size; }
+#stream { grid-area: stream; position: relative; overflow: hidden; container: stream / inline-size; background: #000; color: #e6edf3;
+    --ar: 1.7778; height: 50vh; height: 50dvh; }
+#stream[data-state=video] { height: min(50dvh, 100vw / var(--ar)); }
+#stream[data-state=audio] { height: 15dvh; }
+@media (orientation: landscape) {
+    body.streaming { grid-template: "board stream" minmax(0, 1fr) / minmax(0, 1fr) auto; }
+    #stream { height: auto; width: 50vw; }
+    #stream[data-state=video] { height: auto; width: min(50vw, 100dvh * var(--ar)); }
+    #stream[data-state=audio] { height: auto; width: 15vw; }
+}
+/* Transparent, not visibility: hidden, until there is a picture: Firefox may not decode a video it considers invisible. */
+#stream video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; opacity: 0; }
+#stream[data-state=video] video { opacity: 1; }
+.stream-msg { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 2px; padding: 12px 16px; text-align: center; }
+.stream-msg p { margin: 0; max-width: 100%; overflow-wrap: anywhere; }
+#stream[data-state=video] .stream-msg { display: none; }
+#stream-line { font-size: 15px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
+#stream-timer { font: 13px var(--mono); font-variant-numeric: tabular-nums; color: #8b949e; }
+#stream[data-state=audio] #stream-timer { display: none; }
+.stream-chip { position: absolute; right: 8px; bottom: 8px; z-index: 1; display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 10px; border: 1px solid #484f58; border-radius: 999px; background: rgba(13, 17, 23, .85); color: #e6edf3;
+    font: 500 12.5px/1.3 var(--sans); cursor: pointer; }
+.stream-chip:hover { border-color: #8b949e; }
+.stream-chip svg { flex: none; width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+/* The audio-only pane is only 100-127px wide beside a phone's board: the chip is then its icon alone. */
+@container stream (max-width: 170px) {
+    .stream-chip { padding: 6px; }
+    .stream-chip span { display: none; }
+}
+
 @media (max-width: 600px) {
     body { font-size: 14px; }
     .wrap { padding: 0 12px; }
@@ -273,6 +322,26 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
     .matrix { font-size: 13px; }
     .tri { width: 36px; }
 }
+/* The board's phone layout follows the board's own width where the pane takes part of the window (the board is a
+   container only then). These are the board's rules from the block above, which stays as it is: it speaks for
+   the whole window. The dialog's rules are not here: the dialog is outside the board and keeps the media query. */
+@container board (max-width: 600px) {
+    .top, #banner, main { font-size: 14px; }
+    .wrap { padding: 0 12px; }
+    .top .wrap { gap: 8px; }
+    .setup .wide { display: none; }
+    .row { padding: 9px 10px 9px 10px; }
+    .meta { font-size: 12px; }
+    .card { padding: 12px 12px 14px; }
+    .card .line1 { flex-wrap: wrap; row-gap: 6px; }
+    .card h1 { order: 3; flex-basis: 100%; font-size: 18px; }
+    .card .pct { margin-left: auto; font-size: 18px; }
+    .card .meta { font-size: 12px; }
+    .actions { margin-left: 0; }
+    .task .line1 { flex-wrap: wrap; row-gap: 4px; }
+    .task .title { order: 3; flex-basis: 100%; }
+    .task .pct { margin-left: auto; }
+}
 @media (prefers-reduced-motion: reduce) {
     .fill { transition: none; animation: none !important; }
     .row.target { animation: none; }
@@ -283,6 +352,7 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
 </style>
 </head>
 <body>
+<div id="board">
 <header class="top"><div class="wrap">
     <a class="brand" href="/">Task Status</a>
     <span id="conn" class="conn" data-state="connecting" role="status"><span class="dot"></span><span id="conn-text">connecting</span></span>
@@ -290,7 +360,7 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
     <button type="button" class="icon-btn" id="bell" aria-pressed="false" aria-label="Sound on this device" title="Sound on this device: off">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 6 2.5 8 2.5 8h-17S6 15 6 9"/><path d="M10 20.5a2.2 2.2 0 0 0 4 0"/><path class="slash" d="M3.5 3.5l17 17"/></svg>
     </button>
-    <button type="button" class="icon-btn" id="settings-btn" aria-haspopup="dialog" aria-label="Alert settings" title="Alerts: sounds, notifications, highlights">
+    <button type="button" class="icon-btn" id="settings-btn" aria-haspopup="dialog" aria-label="Settings" title="Settings: alerts, and the sound of the live stream">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.4" stroke-width="3.2" stroke-linecap="butt" stroke-dasharray="3.3 3.3"/><circle cx="12" cy="12" r="6.1"/><circle cx="12" cy="12" r="2.1"/></svg>
     </button>
     <a class="setup" href="/api/usage" title="Instructions for agents: the HTTP API, the taskctl CLI, the skill and the CLAUDE.md rule"><span class="wide">Agent </span>setup</a>
@@ -351,10 +421,19 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
         <p><a href="/">&larr; All requests</a> &middot; <a href="" id="nf-retry">Retry</a></p>
     </section>
 </main>
+</div>
+
+<section id="stream" hidden aria-label="Live stream" data-state="connecting">
+    <div class="stream-msg">
+        <p id="stream-line" role="status"></p>
+        <p id="stream-timer" role="timer"></p>
+    </div>
+    <button type="button" class="stream-chip" id="stream-sound" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 6v12l-4.5-3.5H4z"/><path d="M16 9.5a4 4 0 0 1 0 5"/><path d="M3.5 3.5l17 17"/></svg><span id="stream-chip-text"></span></button>
+</section>
 
 <dialog id="settings" aria-labelledby="settings-title">
     <div class="dlg-top"><div class="dlg-head">
-        <h2 id="settings-title">Alerts</h2>
+        <h2 id="settings-title">Settings</h2>
         <button type="button" class="icon-btn" id="settings-close" aria-label="Close" title="Close (Esc)">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
         </button>
@@ -374,6 +453,10 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
             <button type="button" class="btn small" data-chime="success">Success</button><button type="button" class="btn small" data-chime="info">Info</button></span></div>
         <div class="field"><label class="label" for="dev-remind">Remind</label><select id="dev-remind"></select>
             <span class="inline-note">repeat the needs-input chime while a question waits</span></div>
+
+        <h3>Live stream</h3>
+        <div class="field"><label class="check"><input type="checkbox" id="dev-stream-audio"> Play the stream's sound on this device</label><span id="dev-stream-held" class="inline-note" hidden>muted by the browser until you click or tap this page</span></div>
+        <div class="field"><span class="label">Volume</span><input type="range" id="dev-stream-volume" min="0" max="100" step="5" aria-label="Stream volume on this device"><span id="dev-stream-volume-val" class="mono inline-note"></span></div>
 
         <h3>Browser notifications</h3>
         <p class="note" id="dev-notify-state"></p>
@@ -447,6 +530,21 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
     const FINISHED_OPEN_KEY = 'taskstatus.finishedOpen';
     const LOCAL_KEY = 'taskstatus.settings.local';
     const CLAIMS_KEY = 'taskstatus.claims';
+    // Live stream
+    const STREAM_RETRY_MS = [1000, 2000, 4000, 8000, 10000]; // this page's reconnects, on the worker clock
+    const STREAM_WATCH_MS = 1000;       // how often an attached player is checked for a stall
+    const STREAM_OPEN_MS = 5000;        // a MediaSource that has not opened by then: reconnect
+    const STREAM_STALL_MS = 15000;      // no bytes from the relay for this long: reconnect
+    const STREAM_FROZEN_MS = 5000;      // bytes arrive but the buffered end stands still this long: reconnect
+    const STREAM_START_MS = 15000;      // data appended but no picture this long after: the pane's tooltip says so
+    const STREAM_LAG_MAX_S = 1.5;       // playing further behind the newest buffered frame than this: jump ...
+    const STREAM_LAG_TARGET_S = 0.4;    // ... to this far behind it
+    const STREAM_JUMP_GAP_MS = 2000;    // after a jump, wait this long before chasing the live edge again
+    const STREAM_TRIM_S = 60;           // more than this buffered behind the playhead (paused: in all): trim to ...
+    const STREAM_KEEP_S = 30;           // ... this much. A removal runs on to the next keyframe, so it stays far from the playhead
+    const STREAM_QUEUE_MAX = 8 << 20;   // bytes waiting for the SourceBuffer; more means it cannot keep up: reconnect
+    const STREAM_PARK_MS = 60000;       // hidden and muted this long: the media connection is let go until the tab is shown
+    const STREAM_UNMUTE_MS = 1500;      // a pause this soon after an unmute means the browser refused it
     const LABELS = { running: 'running', stale: 'stale', done: 'done', failed: 'failed', pending: 'queued', cancelled: 'cancelled' };
     const WAITING_LABEL = 'needs input';
     // A favicon cannot read CSS variables, so the ring uses fixed mid-tone colours.
@@ -536,6 +634,19 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
     let tlsPort = null;
     const notes = new Map();    // notification tag -> Notification, so an answered question's one can be closed
     const flashTimers = new WeakMap();
+
+    // Live stream state
+    let stream = null;          // the /api/events "stream" (checked), or null: nothing is open
+    let splitLayout = false;    // html and body carry .streaming: the board is an inner scroller beside the pane
+    let player = null;          // the attached media, see startPlayer; null: none
+    let pageLoaded = document.readyState === 'complete';  // the player attaches only after the load event
+    let streamWait = 0;         // server-clock seconds at which the wait for the picture began; 0: not waiting
+    let streamRetries = 0;      // failed attaches in a row (they pick the backoff)
+    let streamRetry = 0;        // the pending retry's clock id; 0: none
+    let streamNote = '';        // why the last attach failed (the pane's tooltip)
+    let streamBlocked = null;   // {key, text}: this browser cannot play this stream; nothing retries until its codecs change
+    let streamParked = false;   // hidden and muted for STREAM_PARK_MS: the media is let go until the tab is shown
+    let parkTimer = 0;
 
     // Timers that keep their pace in a background tab. Browsers throttle a hidden tab's own timers (Chrome
     // to once a minute after a few minutes), not a worker's, so a tiny worker keeps the time; plain
@@ -814,7 +925,7 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
 
     // done({ok, body, error}); body null when there is nothing to process (an older board, a new baseline).
     function getEvents(done) {
-        xhrGet('/api/events' + (cursor === null ? '' : '?since=' + cursor), (status, body, error) => {
+        xhrGet('/api/events' + (cursor === null ? '' : '?since=' + cursor), (status, body, error, t0, t1) => {
             if (status === 404 || status === 405) {        // an older board: no events, no alerts
                 eventsOk = false;
                 eventsRetryAt = Date.now() + EVENTS_RETRY_MS;
@@ -828,6 +939,7 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
             } else if (!body || typeof body.cursor !== 'number' || !Array.isArray(body.events)) {
                 done({ ok: false, body: null, error: 'bad response' });
             } else {
+                if (typeof body.now === 'number') clockOffset = body.now - (t0 + t1) / 2000;  // a not-found view has no other clock
                 done({ ok: true, body });
             }
         });
@@ -875,6 +987,11 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
             if (events) onEvents(events, wasOffline);
         } catch (e) {
             console.error('alerts failed', e);
+        }
+        try {
+            if (events) applyStream(events.stream || null);     // an older board has no stream key
+        } catch (e) {
+            console.error('stream failed', e);
         }
         if (missing) renderNotFound(missing === 404 ? (loaded ? 'deleted' : 'unknown') : 'invalid', error);
         if (notFound) {
@@ -944,6 +1061,7 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
         lastData = data;
         if (view === 'list') renderList(data);
         else renderDetail(data);
+        restoreBoardScroll();
         loaded = true;
         tick(true);
     }
@@ -1216,6 +1334,7 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
         const now = serverNow();
         for (const row of rows.values()) row.tick(row, now);
         if (view === 'detail' && headRefs && lastData) tickHeader(now);
+        tickStream(now);
         updateBanner();
     }
 
@@ -1238,7 +1357,7 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
 
     // This browser's overrides (localStorage); anything malformed falls back to "inherit" or the default.
     function loadLocal() {
-        const out = { events: {}, sound_enabled: false, notify_enabled: false, volume: null, remind_every: 120 };
+        const out = { events: {}, sound_enabled: false, notify_enabled: false, volume: null, remind_every: 120, stream_audio: true, stream_volume: 1 };
         let raw = null;
         try {
             raw = JSON.parse(localStorage.getItem(LOCAL_KEY) || 'null');
@@ -1259,6 +1378,8 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
         if (typeof raw.remind_every === 'number' && Number.isFinite(raw.remind_every) && raw.remind_every >= 0) {
             out.remind_every = Math.round(raw.remind_every);
         }
+        if (typeof raw.stream_audio === 'boolean') out.stream_audio = raw.stream_audio;
+        if (typeof raw.stream_volume === 'number' && raw.stream_volume >= 0 && raw.stream_volume <= 1) out.stream_volume = raw.stream_volume;
         return out;
     }
 
@@ -1731,6 +1852,12 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
         $('dev-volume-board').checked = local.volume === null;
         setText($('dev-volume-board-text'), "the board's (" + Math.round(globalSettings.sound.volume * 100) + '%)');
         setHidden($('dev-held'), !soundHeld());
+        $('dev-stream-audio').checked = local.stream_audio;
+        const streamVol = $('dev-stream-volume'), streamPct = Math.round(local.stream_volume * 100);
+        if (document.activeElement !== streamVol) streamVol.value = String(streamPct);
+        streamVol.disabled = !local.stream_audio;
+        setText($('dev-stream-volume-val'), streamPct + '%');
+        setHidden($('dev-stream-held'), !(player && player.held === 'sound'));
 
         const remind = $('dev-remind');
         if (![...remind.options].some((o) => o.value === String(local.remind_every))) {
@@ -1986,6 +2113,18 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
             local.remind_every = Number(e.target.value) || 0;
             saveLocal();
         });
+        $('dev-stream-audio').addEventListener('change', (e) => {
+            local.stream_audio = e.target.checked;
+            saveLocal();
+            applyStreamAudio(true);
+            refreshPanel();
+        });
+        $('dev-stream-volume').addEventListener('input', (e) => {
+            local.stream_volume = Number(e.target.value) / 100;
+            saveLocal();
+            setText($('dev-stream-volume-val'), e.target.value + '%');
+            applyStreamAudio(true);
+        });
         $('dev-notify').addEventListener('click', enableNotifications);
         $('dev-notify-test').addEventListener('click', () => {
             notify('taskstatus:test', 'Test notification', 'Board events show up like this.', null, false);
@@ -2016,6 +2155,7 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
             local = loadLocal();
             refreshPanel();
             updateAttention();
+            applyStreamAudio(false);
         });
         // Browsers keep audio locked until the page has had a gesture; any one unlocks it once sound is on.
         const unlock = () => {
@@ -2086,6 +2226,576 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
         for (const key of ['markDone', 'markFailed', 'del']) headRefs[key].disabled = disabled;
     }
 
+    // Live stream: the board's relay of a network stream, fragmented MP4 over one open HTTP response, played in
+    // a pane beside the board through Media Source Extensions. /api/events says what is open and whether the relay
+    // is live. The page attaches only then and only after the window's load event (a pending media request would
+    // hold it), and makes the <video> on attach: there is none in the markup.
+
+    // The split layout: html and body carry .streaming and the board becomes an inner scroller, so the reading
+    // position moves from the document to the board (and back) with the layout.
+    function switchLayout(on) {
+        const board = $('board'), doc = document.scrollingElement || document.documentElement;
+        const y = splitLayout ? board.scrollTop : doc.scrollTop;
+        splitLayout = on;
+        document.documentElement.classList.toggle('streaming', on);
+        document.body.classList.toggle('streaming', on);
+        setHidden($('stream'), !on);
+        if (on) board.scrollTop = y;
+        else doc.scrollTop = y;
+    }
+
+    // Going to a request and coming Back keeps the board's scroll position: the browser restores the document's,
+    // not an inner scroller's, so it is kept in this history entry (on leaving, and when a link is followed).
+    function saveBoardScroll() {
+        if (!splitLayout) return;
+        try {
+            history.replaceState(Object.assign({}, history.state, { boardScroll: $('board').scrollTop }), '');
+        } catch (e) { /* no history access: the board opens at the top */ }
+    }
+
+    // Only for the first render: a stream that opens later has no saved position to go back to.
+    function restoreBoardScroll() {
+        if (loaded || !splitLayout) return;
+        const y = history.state && history.state.boardScroll;
+        if (view === 'list' && typeof y === 'number' && y > 0) $('board').scrollTop = y;
+    }
+
+    // The server's stream object, checked field by field (an odd answer never breaks the page); null if it is none.
+    function cleanStream(s) {
+        if (!s || typeof s !== 'object' || typeof s.id !== 'string' || !s.id || typeof s.url !== 'string') return null;
+        const num = (v) => typeof v === 'number' && Number.isFinite(v) ? v : null;
+        const str = (v) => typeof v === 'string' && v ? v : null;
+        const media = typeof s.media === 'string' && /^\/[^/]/.test(s.media) ? s.media : '/api/stream/media?id=' + encodeURIComponent(s.id);
+        return { id: s.id, url: s.url, state: s.state === 'live' ? 'live' : 'connecting', since: num(s.since), error: str(s.error) || '',
+                 video: str(s.video), audio: str(s.audio), width: num(s.width), height: num(s.height), media };
+    }
+
+    const codecKey = (s) => (s.video || '') + '|' + (s.audio || '');
+
+    // Every events answer: the stream is opened, replaced, closed, or just reported again.
+    function applyStream(raw) {
+        const s = cleanStream(raw);
+        if ((s ? s.id : '') !== (stream ? stream.id : '')) resetStream();
+        const was = stream !== null;
+        stream = s;
+        if (was !== (s !== null)) switchLayout(s !== null);
+        if (!s) {
+            streamParked = false;
+            return;
+        }
+        if (streamBlocked && streamBlocked.key !== '*' && s.state === 'live' && streamBlocked.key !== codecKey(s)) streamBlocked = null;
+        if (!(player && player.connected)) {
+            // Waiting since the server's outage began, or else since this page began to wait for its picture.
+            const since = s.state === 'connecting' && s.since !== null ? s.since : serverNow();
+            streamWait = streamWait ? Math.min(streamWait, since) : since;
+        }
+        renderStream();
+        maybeAttach();
+    }
+
+    // A different stream, or none: the media, the pending retry and what was learnt about the old one go.
+    function resetStream() {
+        stopPlayer();
+        clock.clear(streamRetry);
+        streamRetry = 0;
+        streamRetries = 0;
+        streamWait = 0;
+        streamNote = '';
+        streamBlocked = null;
+    }
+
+    // The pane shows exactly the two lines of the spec while it waits; why it waits (the server's error, a failed
+    // attach, an unsupported codec) is only its tooltip.
+    function renderStream() {
+        if (!stream) return;
+        const pane = $('stream'), p = player;
+        const state = p && p.connected ? (p.audioOnly ? 'audio' : 'video') : 'connecting';
+        setAttr(pane, 'data-state', state);
+        setText($('stream-line'), state === 'audio' ? 'audio connected' : state === 'video' ? '' : 'connecting to ' + stream.url + '...');
+        setAttr(pane, 'title', state !== 'connecting' ? null : streamBlocked ? streamBlocked.text
+                               : stream.state === 'connecting' && stream.error ? stream.error : streamNote);
+        const held = p ? p.held : '';
+        const chip = $('stream-sound');
+        setAttr(pane, 'data-held', held);
+        setHidden(chip, !held);
+        if (held) {
+            const text = held === 'play' ? 'click to play' : 'click for sound';
+            setText($('stream-chip-text'), text);
+            setAttr(chip, 'aria-label', text);
+        }
+        tickStream(serverNow());
+        if (panelBuilt && $('settings').open) setHidden($('dev-stream-held'), held !== 'sound');
+    }
+
+    function tickStream(now) {
+        if (!stream || !streamWait || (player && player.connected)) return;
+        setText($('stream-timer'), fmtDur(now - streamWait));
+    }
+
+    function maybeAttach() {
+        if (!stream || player || streamRetry || !pageLoaded || streamBlocked || stream.state !== 'live') return;
+        if (streamParked && document.hidden) return;
+        streamParked = false;
+        startPlayer(stream);
+    }
+
+    // This browser cannot play this stream: the pane stays "connecting" with the reason as its tooltip, and nothing
+    // retries until the stream's codecs change (key) or, with key '*', never.
+    function blockStream(key, text) {
+        stopPlayer();
+        streamBlocked = { key, text };
+        streamNote = '';
+        if (!streamWait) streamWait = serverNow();
+        renderStream();
+    }
+
+    // The attach failed or broke: the media goes, the pane is "connecting" again and says why, and the page tries
+    // again after a backoff on the worker clock (a hidden tab keeps its pace). It asks the board how things stand at
+    // once: a stream that was replaced or closed is dropped by that answer, long before the retry would ask the
+    // media route for it.
+    function playerFailed(p, reason) {
+        if (player !== p) return;
+        stopPlayer();
+        streamNote = reason;
+        if (!streamWait) streamWait = serverNow();
+        clock.clear(streamRetry);
+        streamRetry = clock.set(() => {
+            streamRetry = 0;
+            maybeAttach();
+        }, STREAM_RETRY_MS[Math.min(streamRetries++, STREAM_RETRY_MS.length - 1)]);
+        renderStream();
+        pollSoon();
+    }
+
+    function retryStreamNow() {
+        if (!streamRetry) return;
+        clock.clear(streamRetry);
+        streamRetry = 0;
+        maybeAttach();
+    }
+
+    // Full teardown: the fetch, the timers, the element and the MediaSource's object URL.
+    function stopPlayer() {
+        const p = player;
+        if (!p) return;
+        player = null;
+        clock.clear(p.watch);
+        clock.clear(p.openTimer);
+        try {
+            p.ctrl.abort();
+        } catch (e) { /* already aborted */ }
+        const v = p.video;
+        if (v) {
+            try {
+                v.pause();
+            } catch (e) { /* detached */ }
+            v.removeAttribute('src');
+            try {
+                v.load();
+            } catch (e) { /* detached */ }
+            v.remove();
+        }
+        if (p.url) {
+            try {
+                URL.revokeObjectURL(p.url);
+            } catch (e) { /* already revoked */ }
+        }
+    }
+
+    // p: {id, media, MS, key, codecs, hasAudio, ctrl, queue, queued, video, ms, sb, url, type, audioOnly, connected, held,
+    // unmutedAt, seeked, jumpedAt, trimmedAt, suspended, bytes, lastData, lastEnd, endMovedAt, firstAppendAt, watch, openTimer}.
+    // held: '' | 'sound' (playing muted until a gesture) | 'play' (the browser refuses even muted playback).
+    // hasAudio: the stream has an audio track; one without (a camera's) is played muted and never held for sound.
+    function startPlayer(s) {
+        const MS = window.ManagedMediaSource || window.MediaSource;
+        if (typeof MS !== 'function') {
+            blockStream('*', 'this browser cannot play live streams');
+            return;
+        }
+        const now = Date.now();
+        const p = { id: s.id, media: s.media, MS, key: codecKey(s), codecs: [s.video, s.audio].filter(Boolean).join(', '), hasAudio: !!s.audio,
+                    ctrl: new AbortController(), queue: [], queued: 0, video: null, ms: null, sb: null, url: '', type: '',
+                    audioOnly: false, connected: false, held: '', unmutedAt: 0, seeked: false, jumpedAt: 0, trimmedAt: 0,
+                    suspended: false, bytes: 0, lastData: now, lastEnd: 0, endMovedAt: now, firstAppendAt: 0, watch: 0, openTimer: 0 };
+        player = p;
+        p.watch = clock.set(() => watchPlayer(p), STREAM_WATCH_MS);
+        if (document.hidden) armPark();
+        runMedia(p);
+    }
+
+    function runMedia(p) {
+        connectMedia(p).catch((e) => {
+            console.error('stream failed', e);
+            playerFailed(p, 'the page could not start the video');
+        });
+    }
+
+    // One fetch of the relay: its headers say what is coming, its body is read until it ends. Called again to
+    // resume after a ManagedMediaSource asked the page to stop (endstreaming).
+    async function connectMedia(p) {
+        let res;
+        try {
+            res = await fetch(p.media, { cache: 'no-store', signal: p.ctrl.signal });
+        } catch (e) {
+            if (player === p && !p.suspended) playerFailed(p, "can't reach the stream");
+            return;
+        }
+        if (player !== p) return;
+        if (!res.ok) {
+            const body = await res.json().catch(() => null);
+            if (player === p) playerFailed(p, (body && body.error) || 'HTTP ' + res.status);
+            return;
+        }
+        if (!p.video) {
+            const type = res.headers.get('Content-Type') || '';
+            let ok = false;
+            try {
+                ok = !!type && p.MS.isTypeSupported(type);
+            } catch (e) { /* treated as unsupported */ }
+            if (!ok) {
+                blockStream(p.key, 'this browser cannot play this stream (' + (p.codecs || type || 'unknown codec') + ')');
+                return;
+            }
+            buildPlayer(p, type);
+        } else {
+            p.queue = [];                   // resumed: the relay starts over with an init segment
+            p.queued = 0;
+            try {
+                if (p.sb) p.sb.abort();     // forget a half-appended fragment
+            } catch (e) { /* not open */ }
+        }
+        await readMedia(p, res);
+    }
+
+    async function readMedia(p, res) {
+        const reader = res.body.getReader();
+        for (;;) {
+            let r;
+            try {
+                r = await reader.read();
+            } catch (e) {
+                if (player === p && !p.suspended) playerFailed(p, 'lost the stream');
+                return;
+            }
+            if (player !== p) return;
+            if (r.done) {
+                if (!p.suspended) playerFailed(p, 'the stream ended');
+                return;
+            }
+            p.lastData = Date.now();
+            p.bytes += r.value.length;
+            p.queue.push(r.value);
+            p.queued += r.value.length;
+            if (p.queued > STREAM_QUEUE_MAX) {
+                playerFailed(p, 'the browser cannot keep up with the stream');
+                return;
+            }
+            pump(p);
+        }
+    }
+
+    // The element and its MediaSource. The picture counts as connected on loadeddata (see onPicture).
+    function buildPlayer(p, type) {
+        p.type = type;
+        p.audioOnly = /^audio\//i.test(type);
+        const v = document.createElement('video');
+        v.playsInline = true;
+        v.setAttribute('playsinline', '');
+        v.disableRemotePlayback = true;                     // a ManagedMediaSource plays only with this set
+        v.muted = !(local.stream_audio && p.hasAudio);
+        v.volume = local.stream_volume;
+        v.setAttribute('aria-label', 'Live stream');
+        p.video = v;
+        v.addEventListener('loadeddata', () => onPicture(p));
+        v.addEventListener('canplay', () => onPicture(p));
+        v.addEventListener('resize', () => onPicture(p));
+        v.addEventListener('playing', () => {
+            const r = player === p && p.sb && lastRange(p.sb);
+            if (r) chase(p, r, false);
+        });
+        v.addEventListener('pause', () => onPause(p));
+        v.addEventListener('error', () => {
+            playerFailed(p, 'the browser could not play the stream' + (v.error && v.error.message ? ' (' + v.error.message + ')' : ''));
+        });
+        let ms;
+        try {
+            ms = new p.MS();
+        } catch (e) {
+            blockStream('*', 'this browser cannot play live streams');
+            return;
+        }
+        p.ms = ms;
+        ms.addEventListener('sourceopen', () => onSourceOpen(p));
+        ms.addEventListener('endstreaming', () => {         // ManagedMediaSource: the browser has enough for now
+            if (player !== p || p.suspended) return;
+            p.suspended = true;
+            p.queue = [];
+            p.queued = 0;
+            try {
+                p.ctrl.abort();
+            } catch (e) { /* already aborted */ }
+        });
+        ms.addEventListener('startstreaming', () => {       // ... and wants more again
+            if (player !== p || !p.suspended) return;
+            p.suspended = false;
+            p.ctrl = new AbortController();
+            p.lastData = Date.now();
+            runMedia(p);
+        });
+        p.url = URL.createObjectURL(ms);
+        p.openTimer = clock.set(() => playerFailed(p, 'the browser did not open the media source'), STREAM_OPEN_MS);
+        $('stream').prepend(v);
+        v.src = p.url;
+        v.volume = local.stream_volume;
+        playPlayer(p);
+    }
+
+    function onSourceOpen(p) {
+        if (player !== p || p.sb) return;
+        clock.clear(p.openTimer);
+        p.openTimer = 0;
+        try {
+            URL.revokeObjectURL(p.url);
+        } catch (e) { /* already revoked */ }
+        try {
+            p.sb = p.ms.addSourceBuffer(p.type);
+        } catch (e) {
+            blockStream(p.key, 'this browser cannot play this stream (' + (p.codecs || p.type) + ')');
+            return;
+        }
+        p.sb.addEventListener('updateend', () => pump(p));
+        p.sb.addEventListener('error', () => playerFailed(p, 'the browser rejected the stream data'));
+        pump(p);
+    }
+
+    // The newest buffered range of a SourceBuffer (and where the oldest one starts), or null.
+    function lastRange(sb) {
+        try {
+            const b = sb.buffered, n = b.length;
+            return n ? { first: b.start(0), start: b.start(n - 1), end: b.end(n - 1) } : null;
+        } catch (e) {
+            return null;                    // detached
+        }
+    }
+
+    function takeQueue(p) {
+        let data = p.queue[0];
+        if (p.queue.length > 1) {
+            data = new Uint8Array(p.queued);
+            let at = 0;
+            for (const chunk of p.queue) {
+                data.set(chunk, at);
+                at += chunk.length;
+            }
+        }
+        p.queue = [];
+        p.queued = 0;
+        return data;
+    }
+
+    // A SourceBuffer takes one operation at a time (until its updateend), so each pass does one: the housekeeping,
+    // else the append of whatever has arrived. Housekeeping is the first seek (into the data, not to 0), the chase
+    // of the live edge, and the trim of what is far behind.
+    function pump(p) {
+        if (player !== p || !p.sb || p.sb.updating || p.ms.readyState !== 'open') return;
+        const sb = p.sb, v = p.video, now = Date.now();
+        const r = lastRange(sb);
+        if (r) {
+            if (r.end > p.lastEnd + 0.01) {
+                p.lastEnd = r.end;
+                p.endMovedAt = now;
+            }
+            if (!p.seeked) {
+                if (!p.queue.length) {      // the first data is all in: start inside it
+                    p.seeked = true;
+                    p.jumpedAt = now;
+                    v.currentTime = Math.max(r.start, r.end - STREAM_LAG_TARGET_S);
+                }
+            } else {
+                chase(p, r, false);
+            }
+            // Only far behind the playhead: a removal also runs on to the next keyframe, which must not be one near it.
+            // Paused (the playhead stands still), the newest data is the anchor.
+            const anchor = v.paused ? r.end : v.currentTime;
+            if (anchor - r.first > STREAM_TRIM_S && now - p.trimmedAt > 1000) {
+                p.trimmedAt = now;
+                try {
+                    sb.remove(r.first, anchor - STREAM_KEEP_S);
+                } catch (e) {
+                    playerFailed(p, 'the browser could not trim its buffer');
+                }
+                return;
+            }
+        }
+        if (!p.queue.length) return;
+        if (!p.firstAppendAt) p.firstAppendAt = now;
+        try {
+            sb.appendBuffer(takeQueue(p));
+        } catch (e) {
+            playerFailed(p, e && e.name === 'QuotaExceededError' ? 'the browser buffer is full' : 'the browser rejected the stream data');
+        }
+    }
+
+    // Playing and visible, further behind the newest buffered frame than STREAM_LAG_MAX_S: jump close to it, at most
+    // every STREAM_JUMP_GAP_MS. Never while paused (the playhead stands still, so every append would look like lag)
+    // or hidden (a seek decodes up to a whole GOP): a seek storm.
+    function chase(p, r, force) {
+        const v = p.video;
+        if (!p.seeked || v.paused || v.seeking || document.hidden) return;
+        const now = Date.now();
+        if (!force && now - p.jumpedAt < STREAM_JUMP_GAP_MS) return;
+        if (r.end - v.currentTime > STREAM_LAG_MAX_S) {
+            p.jumpedAt = now;
+            v.currentTime = Math.max(r.start, r.end - STREAM_LAG_TARGET_S);
+        }
+    }
+
+    // Every STREAM_WATCH_MS: a relay that went quiet, or one whose bytes arrive without the buffered end moving (the
+    // intersection of the audio and video ranges stands still when one of them stops), is reconnected.
+    function watchPlayer(p) {
+        if (player !== p) return;
+        p.watch = clock.set(() => watchPlayer(p), STREAM_WATCH_MS);
+        if (p.suspended) return;
+        const now = Date.now(), quiet = now - p.lastData;
+        if (quiet > STREAM_STALL_MS) {
+            playerFailed(p, 'no data from the stream for ' + Math.round(quiet / 1000) + 's');
+        } else if (p.sb && p.lastEnd && quiet < 2 * STREAM_WATCH_MS && now - p.endMovedAt > STREAM_FROZEN_MS) {
+            playerFailed(p, 'the video froze');
+        } else if (!p.connected && p.firstAppendAt && now - p.firstAppendAt > STREAM_START_MS && !streamNote) {
+            streamNote = 'the browser has not shown a picture yet';
+            renderStream();
+        }
+    }
+
+    // A first picture (or, for audio alone, the first playable data): the pane switches from "connecting" to the video.
+    function onPicture(p) {
+        if (player !== p) return;
+        const v = p.video;
+        if (!p.audioOnly && !(v.videoWidth > 0)) return;
+        const w = v.videoWidth || (stream && stream.width) || 0, h = v.videoHeight || (stream && stream.height) || 0;
+        if (w > 0 && h > 0) $('stream').style.setProperty('--ar', Math.min(5, Math.max(0.2, w / h)).toFixed(4));
+        if (p.connected) return;
+        p.connected = true;
+        streamRetries = 0;
+        streamWait = 0;
+        streamNote = '';
+        renderStream();
+    }
+
+    // Sound. The video is tried unmuted first (if this device wants the sound); a browser that refuses (its autoplay
+    // policy, NotAllowedError) gets it muted, and the sound waits for a gesture; if even muted playback is refused
+    // the video itself waits for one. Every play() has a catch: a refusal is the policy at work, not an error.
+    function playPlayer(p) {
+        const v = p.video;
+        let result;
+        try {
+            result = v.play();
+        } catch (e) {
+            result = Promise.reject(e);
+        }
+        Promise.resolve(result).then(() => {
+            if (player === p && p.held === 'play') {
+                p.held = v.muted && local.stream_audio && p.hasAudio ? 'sound' : '';
+                renderStream();
+            }
+        }).catch((e) => {
+            if (player !== p || !e || e.name === 'AbortError') return;      // torn down or reloaded meanwhile
+            if (e.name !== 'NotAllowedError') {
+                playerFailed(p, 'the browser could not start the video');
+                return;
+            }
+            if (v.muted) {
+                p.held = 'play';
+            } else {
+                v.muted = true;
+                p.held = 'sound';
+                playPlayer(p);
+            }
+            renderStream();
+        });
+    }
+
+    const streamActivation = () => !navigator.userActivation || navigator.userActivation.isActive;
+
+    // Inside a gesture the browser accepts: lets the sound out, and starts a video the browser would not start. The
+    // play() is asked for in every case: a browser that wants the gesture for the sound wants it for the play too.
+    function releaseStream(p) {
+        const v = p.video;
+        p.held = p.held === 'play' ? 'play' : '';
+        if (local.stream_audio && p.hasAudio && v.muted) {
+            v.volume = local.stream_volume;
+            p.unmutedAt = Date.now();
+            v.muted = false;
+        }
+        playPlayer(p);
+        renderStream();
+    }
+
+    // A click, a lifted pointer or a key (not Escape, which is no activation; and no pointerdown: a touch that starts
+    // a scroll is not one either) anywhere on the page. Only with the activation the browser reports, where it does:
+    // an unmute without one would pause the video.
+    function onStreamGesture(e) {
+        const p = player;
+        if (!p || !p.video || (!p.held && !p.video.paused)) return;
+        if (e.type === 'keydown' && e.key === 'Escape') return;
+        if (!streamActivation()) return;
+        releaseStream(p);
+    }
+
+    // The browser paused the video right after an unmute: it refused. Muted again, playing again, held again.
+    function onPause(p) {
+        if (player !== p || !p.unmutedAt || Date.now() - p.unmutedAt > STREAM_UNMUTE_MS || p.video.muted) return;
+        p.unmutedAt = 0;
+        p.video.muted = true;
+        p.held = 'sound';
+        playPlayer(p);
+        renderStream();
+    }
+
+    // The device's settings changed (gesture: by a click or a drag in this page; otherwise from another tab).
+    function applyStreamAudio(gesture) {
+        const p = player;
+        if (!p || !p.video) return;
+        const v = p.video;
+        v.volume = local.stream_volume;
+        if (!local.stream_audio || !p.hasAudio) {
+            v.muted = true;
+            if (p.held === 'sound') p.held = '';
+        } else if (v.muted && p.held !== 'play') {
+            if (gesture && streamActivation()) releaseStream(p);
+            else p.held = 'sound';          // nothing to unmute in: the chip and the next click do it
+        }
+        renderStream();
+    }
+
+    function armPark() {
+        clock.clear(parkTimer);
+        parkTimer = clock.set(parkStream, STREAM_PARK_MS);
+    }
+
+    // A tab nobody sees or hears (hidden and muted for STREAM_PARK_MS) lets its media connection go: the relay's
+    // bandwidth, and one of the browser's few connections per host. It comes back when the tab is shown.
+    function parkStream() {
+        parkTimer = 0;
+        const p = player;
+        if (!document.hidden || !p || !p.video.muted) return;       // with sound on, a tab kept for listening goes on
+        stopPlayer();
+        streamParked = true;
+        renderStream();
+    }
+
+    function streamShown() {
+        clock.clear(parkTimer);
+        parkTimer = 0;
+        if (streamParked) {
+            streamParked = false;
+            maybeAttach();
+            return;
+        }
+        const p = player, r = p && p.sb && lastRange(p.sb);
+        if (r) chase(p, r, true);           // a hidden tab's video may have fallen behind
+        if (p && p.video.paused && p.held !== 'play') playPlayer(p);
+    }
     // Boot
 
     function route() {
@@ -2169,18 +2879,36 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
                 if (!busy) schedule(Math.max(HIDDEN_POLL_MS, nextPollAt - Date.now()));
+                if (player) armPark();
             } else {
                 unread = 0;
                 updateAttention();
+                streamShown();
                 pollSoon();
             }
         });
         addEventListener('pageshow', (e) => {
-            if (e.persisted) pollSoon();
+            if (e.persisted) pollSoon();    // the next answer attaches the stream again, if one is still open
+        });
+        addEventListener('pagehide', (e) => {
+            saveBoardScroll();
+            if (e.persisted) stopPlayer();  // a page kept for Back must not go on playing
         });
         addEventListener('online', () => {  // the network is back: no need to wait out the backoff
             pollSoon();
+            retryStreamNow();
         });
+        // The player attaches only after the load event: a media request in flight would hold it.
+        if (!pageLoaded) {
+            addEventListener('load', () => {
+                pageLoaded = true;
+                maybeAttach();
+            }, { once: true });
+        }
+        for (const type of ['click', 'pointerup', 'keydown']) addEventListener(type, onStreamGesture, true);
+        $('board').addEventListener('click', (e) => {
+            if (e.target instanceof Element && e.target.closest('a[href]')) saveBoardScroll();
+        }, true);
         setInterval(tick, TICK_MS);
         clock.set(alertTick, ALERT_TICK_MS);
         loadSettings();

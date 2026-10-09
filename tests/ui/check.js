@@ -6,6 +6,8 @@
 //   5. the running-time ticker advances
 //   6. what waits for input (API waiting / attention) is marked (data-waiting, the "needs input" badge,
 //      the question), sorts first in Active and leads the summary
+// While a stream is open (body.streaming) the board is an inner scroller beside the pane: check 1 then holds
+// the board to its own right edge (and no sideways scroll of its own), and the result records the pane's box.
 // Problems go into result.problems; test_ui.py fails on any.
 __t.run(async () => {
     const { sleep, $ } = __t;
@@ -17,15 +19,28 @@ __t.run(async () => {
     out.bodyBg = getComputedStyle(document.body).backgroundColor;
 
     // 1. Horizontal overflow
-    const de = document.documentElement, vw = de.clientWidth;
+    const de = document.documentElement, vw = de.clientWidth, board = $('board');
+    const streaming = document.body.classList.contains('streaming');
     out.viewport = vw;
     out.scrollWidth = de.scrollWidth;
+    out.streaming = streaming;
+    out.setupWideHidden = getComputedStyle(document.querySelector('.setup .wide')).display === 'none';   // the phone layout
     if (de.scrollWidth > vw) bad('page scrolls horizontally: scrollWidth ' + de.scrollWidth + ' > ' + vw);
+    let edge = vw;                       // what the board's own elements may not pass
+    if (streaming) {
+        edge = board.getBoundingClientRect().left + board.clientWidth;
+        out.boardScroll = [board.scrollWidth, board.clientWidth];
+        if (board.scrollWidth > board.clientWidth) bad('the board scrolls horizontally: scrollWidth ' + board.scrollWidth + ' > ' + board.clientWidth);
+        const pr = $('stream').getBoundingClientRect(), pcs = getComputedStyle($('stream'));
+        out.pane = { x: pr.left, y: pr.top, w: pr.width, h: pr.height };
+        out.paneColors = [pcs.backgroundColor, getComputedStyle($('stream-line')).color];    // black with light text, whatever the theme
+        out.innerHeight = innerHeight;
+    }
     for (const el of document.querySelectorAll('body *')) {
-        if (el.closest('[hidden]') || el.closest('.hint') || (el.tagName === 'IMG' && el.src.includes('__slow'))) continue;  // .hint clips with an ellipsis
+        if (el === board || el.closest('[hidden]') || el.closest('.hint') || (el.tagName === 'IMG' && el.src.includes('__slow'))) continue;  // .hint clips with an ellipsis
         const r = el.getBoundingClientRect();
         if (!r.width) continue;
-        if (r.right > vw + 0.5) bad('past the viewport: ' + el.tagName + '.' + el.className + ' [' + (el.dataset.ref || '') + '] right=' + r.right.toFixed(1) + ' "' + el.textContent.slice(0, 30) + '"');
+        if (r.right > (board.contains(el) ? edge : vw) + 0.5) bad('past the ' + (streaming && board.contains(el) ? 'board' : 'viewport') + ': ' + el.tagName + '.' + el.className + ' [' + (el.dataset.ref || '') + '] right=' + r.right.toFixed(1) + ' "' + el.textContent.slice(0, 30) + '"');
         const box = el.parentElement && el.parentElement.closest('.row, .card');
         if (box) {
             const b = box.getBoundingClientRect(), cs = getComputedStyle(box);
