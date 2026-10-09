@@ -60,7 +60,7 @@ def phase_api():
     try:
         check('pidfile holds pid', srv.pidfile.read_text().strip() == str(srv.proc.pid))
         s, h, b = call('GET', '/api/health')
-        check('health', s == 200 and b['ok'] is True and b['service'] == 'tasks' and b['version'] == '2'
+        check('health', s == 200 and b['ok'] is True and b['service'] == 'tasks' and b['version'] == '3'
               and b['pid'] == srv.proc.pid and 'now' in b and 'started_at' in b and b['requests_running'] == 0
               and b['docs_version'] == docs_version() and b['tls_port'] is None and b['config_path'] == str(srv.config), b)
         check('json headers', h.get('x-content-type-options') == 'nosniff' and h.get('cache-control') == 'no-store'
@@ -460,7 +460,7 @@ def phase_templates():
         s, h, b = call('GET', '/', headers={'Accept': '*/*'})
         check('GET / otherwise: usage text, no-store, Vary', s == 200 and h['content-type'] == 'text/plain; charset=utf-8'
               and h.get('vary') == 'Accept' and h.get('cache-control') == 'no-store' and f'curl http://127.0.0.1:{P}/api/usage' in b, b)
-        check('render is a literal replace of the four tokens only', f'Dashboard: http://127.0.0.1:{P}\n' in b and 'Version 2\n' in b
+        check('render is a literal replace of the four tokens only', f'Dashboard: http://127.0.0.1:{P}\n' in b and 'Version 3\n' in b
               and f'Docs {docs_version(tree)}\n' in b and '{{UNKNOWN}}' in b and '{"json": {"braces": 1}}' in b and '${SHELL}' in b, b)
         for path in ('/api', '/api/usage', '/api/'):
             s, h, b2 = call('GET', path)
@@ -470,7 +470,7 @@ def phase_templates():
         s, h, b = call('GET', '/api/changelog')
         check('changelog rendered, text/plain, no-store', s == 200 and h['content-type'] == 'text/plain; charset=utf-8'
               and h.get('cache-control') == 'no-store'
-              and b == f'## v2 — 2026-09-28\n- served by http://127.0.0.1:{P} (API 2, docs {docs_version(tree)})\n', b)
+              and b == f'## v2 — 2026-09-28\n- served by http://127.0.0.1:{P} (API 3, docs {docs_version(tree)})\n', b)
         s, h, b = call('GET', '/api/skill/SKILL.md')
         check('SKILL.md served unrendered', s == 200 and '{{BASE_URL}}' in b and h['content-type'] == 'text/plain; charset=utf-8', b)
         s, h, b = call('GET', '/api/skill/taskctl')

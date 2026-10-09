@@ -55,8 +55,8 @@ def main_listener():
         check('the https listener is logged, dual-stack, with its certificate', m and m.group(1) == want and m.group(2) == str(CERT), log)
         check('...before the listening line', log.find('https listener on') < log.find('tasks server listening on'), log)
         s, h, b = tcall(tp, 'GET', '/api/health')
-        check('https health: tls_port, version 2, both headers', s == 200 and b['tls_port'] == tp and b['version'] == '2'
-              and h.get('x-tasks-version') == '2' and h.get('x-tasks-docs') == b['docs_version'], (s, b))
+        check('https health: tls_port, version 3, both headers', s == 200 and b['tls_port'] == tp and b['version'] == '3'
+              and h.get('x-tasks-version') == '3' and h.get('x-tasks-docs') == b['docs_version'], (s, b))
         check('the http listener reports tls_port too', srv.call('GET', '/api/health')[2]['tls_port'] == tp)
         if has_ipv6():
             s, h, b = tcall(tp, 'GET', '/api/health', addr='::1')
@@ -82,7 +82,7 @@ def main_listener():
         s, h, b = tcall(tp, 'POST', '/api/requests', {'title': 'x'}, headers={'Origin': 'https://evil.example'})
         check('a foreign Origin over https: 403', s == 403, b)
         s, h, b = tcall(tp, 'GET', '/nope')
-        check('a 404 over https: JSON, both headers, the hint on https', s == 404 and h.get('x-tasks-version') == '2'
+        check('a 404 over https: JSON, both headers, the hint on https', s == 404 and h.get('x-tasks-version') == '3'
               and b['hint'] == f'GET https://127.0.0.1:{tp}/api/usage', (s, h, b))
 
         S.section('agents stay on plain http: what the https listener renders')

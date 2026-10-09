@@ -767,6 +767,9 @@ banner() {
     fi
     echo "  database    $db"
     echo "  settings    $(settings_line "$config" "$settings")"
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        echo "  live stream needs ffmpeg, which is not installed (sudo apt install ffmpeg)"
+    fi
     if [ "$mode" = fg ]; then
         echo "  log         this terminal"
     else

@@ -7,19 +7,20 @@
 
 Env fallbacks: TASKS_HOST, TASKS_PORT, TASKS_DB, TASKS_PUBLIC_URL, TASKS_CONFIG, TASKS_TLS_PORT,
 TASKS_TLS_CERT, TASKS_TLS_KEY. The pidfile defaults to <db dir>/server-<port>.pid and the settings file
-to <db dir>/settings.json. Standard library only; needs Python >= 3.10 and SQLite >= 3.37.
+to <db dir>/settings.json. Standard library only; needs Python >= 3.10 and SQLite >= 3.37 (and ffmpeg, only
+for live streams).
 A wildcard --host (0.0.0.0, ::, * or empty) listens dual-stack, IPv4 and IPv6 on one socket, so a
 hostname that resolves to an IPv6 address works too; without IPv6 it falls back to IPv4 only. A
 specific address is bound as given. --tls-port, --tls-cert and --tls-key (all three or none) add an
 HTTPS listener on the same host, by the same rules: the same routes over the same database, for
 browsers, which only allow notifications in a secure context.
 
-Wire contract, version 2 (every component is built against it; v1 clients keep working)
+Wire contract, version 3 (every component is built against it; v1 and v2 clients keep working)
 
 IDs: a request id is 6 chars of 23456789abcdefghjkmnpqrstuvwxyz (k3m9qa); a task id is {rid}-{seq}
 (k3m9qa-3). Case-insensitive, returned lowercase. The wrong kind of id on a route is a 400 with a hint.
 
-Every response, success or error (http.server's own included), carries X-Tasks-Version: 2 and
+Every response, success or error (http.server's own included), carries X-Tasks-Version: 3 and
 X-Tasks-Docs: <docs_version>. docs_version = sha256 over skill/SKILL.md, templates/usage.md,
 templates/rule.md, templates/changelog.md, taskctl and taskctl.py, in that order, each as relpath + NUL +
 bytes + NUL (a missing file: relpath + NUL only), hex[:12]: it changes whenever the agent instructions do.
@@ -35,7 +36,7 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
   GET    /api/skill/taskctl        taskctl (sh wrapper), text/plain
   GET    /api/skill/taskctl.py     taskctl.py, rendered, text/plain
   GET    /favicon.ico              204
-  GET    /api/health               {ok, service: "tasks", version: "2", pid, now, started_at, requests_running,
+  GET    /api/health               {ok, service: "tasks", version: "3", pid, now, started_at, requests_running,
                                    docs_version, tls_port (int | null), config_path}
   POST   /api/requests             {title, origin?, tasks?: [str], id?} -> 201 Request + tasks + now + existing
                                    (false). id is a client-made request id (else the server makes one; not an
@@ -61,10 +62,14 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
   POST   /api/tasks/{tid}/attention  {message} -> Task + now; a closed task is a 409 {error, status}
   DELETE /api/tasks/{tid}/attention  -> Task + now (idempotent)
   GET    /api/events               ?since=N&limit=1..1000 (500) -> {now, cursor, events, truncated, waiting,
-                                   stale, settings_version} (see Events)
+                                   stale, settings_version, stream} (see Events and Stream)
   GET    /api/settings             {now, path, version, exists, error, settings, defaults} (see Settings)
   PUT    /api/settings             {settings: {...}, partial} -> the GET shape
   DELETE /api/settings             removes the file (the defaults again) -> the GET shape
+  GET    /api/stream               {now, stream, ffmpeg} (see Stream)
+  POST   /api/stream               {url} -> 201 the GET shape + existing: false; the url already open: 200, existing: true
+  DELETE /api/stream               -> the GET shape + closed: bool (idempotent)
+  GET    /api/stream/media?id=<id> the open stream as fragmented MP4, an endless body (see Stream)
 Rendering literally replaces {{BASE_URL}}, {{PUBLIC_URL}}, {{VERSION}} and {{DOCS_VERSION}}. Files are
 re-read per request; a missing one is a 500 {"error": "template missing: <path>"}. On the HTTPS listener
 BASE_URL is http://<the Host's hostname>:<http port> (agents stay on plain http, which a self-signed
@@ -88,7 +93,8 @@ Shapes (every key always present, null when absent; times are float epoch second
   url = <public>/r/<rid>, plus #<tid> for a task.
 
 Errors are {error, field?, hint?}: 400 validation, 403 cross-origin write, 404 unknown id/route, 405
-(+Allow), 409 state conflict, 411 chunked, 413 body > 64 KiB, 500, 503 database busy (+Retry-After: 1).
+(+Allow), 409 state conflict, 410 a stream that was replaced or closed, 411 chunked, 413 body > 64 KiB, 500,
+503 database busy (+Retry-After: 1), or a stream not connected yet, full or shutting down (+Retry-After).
 http.server's own rejections (malformed request line 400, 414, 431, unknown method 501) are JSON too.
 Success bodies gain "warnings": [str] only when something was truncated, clamped or ignored.
 
@@ -121,7 +127,7 @@ are the entity's after the change (the request's for request-level events), time
   last one returned) or events after since were pruned; otherwise cursor = the last event id. waiting =
   [{request_id, request_title, task_id | null, task_title | null, message, since}] for every attention
   open in a running request, oldest first; stale = [{request_id, request_title}] of running requests
-  stale now; settings_version = the settings' version.
+  stale now; settings_version = the settings' version; stream = the open stream's object, or null (see Stream).
 
 Replays: taskctl queues writes while the board is unreachable and replays them later with the header
 X-Tasks-Replay: 1. On create request, request and task complete, progress and attention set/clear such a
@@ -139,11 +145,33 @@ mtime or size changes:
   current settings and writes the full result atomically. version = sha256 of the settings as compact
   JSON with sorted keys, hex[:12].
 
+Stream: one network stream can be open at a time, shown beside the board on every open page. POST /api/stream
+  {url} opens it: a newer url replaces the open one, the url already open is kept and retried at once. url:
+  http, https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp, up to 2048 characters, no spaces or controls (else
+  400 with field url). DELETE closes it. The board runs one ffmpeg for it (found on PATH at each start, so
+  installing it later needs no restart; until then error says so): video copied, audio made AAC stereo,
+  written as fragmented MP4 in pieces of about 200 ms. Only network protocols are read (no file:, pipe:,
+  concat:). A run that ends or fails starts again after 1, 2, 4, 8, then 10 s of waiting.
+  The object (in /api/events "stream", GET /api/stream and the replies): {id (12 hex, new for every
+  stream), url (a user:password@ is shown as ***@ everywhere), opened_at, state: "connecting" | "live",
+  since, error, video, audio, width, height, viewers, media}. live = a keyframe has gone out; since = when it
+  went live, or while connecting when the trouble began (failed retries keep it); error = why the last run
+  ended (null while live); video and audio = codec strings (avc1.42C028, mp4a.40.2), width and height those
+  of the video; all null until ffmpeg has written its header, or when there is no such track. media = the
+  path of GET /api/stream/media?id=<id>: 200, Content-Type video/mp4 (audio/mp4 without video) with the
+  codecs, no Content-Length, fragmented MP4: the header, the fragments since the last keyframe, then live
+  ones. It ends whenever a run ends and when the stream is replaced or closed; a page then asks again. 404 no
+  stream, 410 another id, 503 (+Retry-After) not connected yet, 16 viewers or shutting down. A viewer more
+  than 64 fragments behind is dropped. HEAD sends the headers only. The open stream is kept in
+  <db>.stream.json (mode 600; --db tasks/data/tasks.db gives tasks/data/tasks.stream.json) and reopened
+  after a restart; only DELETE removes it.
+
 Writes (POST, PUT, DELETE) carrying an Origin header are refused unless Origin equals Host and Host names
 this machine (IP literal, [IPv6] included, localhost, its hostname, the --public-url host). No auth.
 """
 
 import argparse
+import collections
 import copy
 import difflib
 import errno
@@ -153,22 +181,26 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import secrets
+import shutil
 import signal
 import socket
 import sqlite3
 import ssl
+import struct
+import subprocess
 import sys
 import threading
 import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 
-VERSION = '2'
+VERSION = '3'
 SCHEMA_VERSION = 2
 TASKS_DIR = Path(__file__).resolve().parent
 # The agent-facing files; X-Tasks-Docs hashes them so an installed skill can tell it is out of date.
@@ -195,6 +227,30 @@ REPLAY_WINDOW = 86400
 EVENTS_MAX_AGE = 7 * 86400
 EVENTS_KEEP = 10000
 EVENTS_PER_CALL = 1000
+# Live stream (the Stream paragraph of the docstring): what the board may open, and how patient it is with it.
+STREAM_URL_MAX = 2048
+STREAM_SCHEMES = ('http', 'https', 'rtsp', 'rtsps', 'rtmp', 'rtmps', 'srt', 'udp', 'tcp')
+# What ffmpeg may open for an input: network protocols only, never file, pipe, fd, concat, subfile, data or cache.
+STREAM_PROTOCOLS = 'http,https,tls,tcp,udp,rtp,rtsp,rtsps,rtmp,rtmps,srt,crypto'
+STREAM_IO_TIMEOUT = 10          # s of silence before ffmpeg gives up on a source (-rw_timeout; rtsp -timeout)
+# (analyzeduration in microseconds, probesize in bytes): how long ffmpeg looks at a source before it writes its
+# header. A run moves to the next pair when the source needs a longer look (a long GOP joined mid-way).
+STREAM_PROBES = ((1000000, 500000), (5000000, 5000000), (15000000, 20000000))
+STREAM_NO_INIT = 10             # s past the analysis time without a header: audio that is announced but never sent. With the
+                                # analysis time it must outlast STREAM_IO_TIMEOUT, or a source that takes the connection and
+                                # then says nothing (busy, single-client) is given up on, and its audio dropped, before ffmpeg's own timeout
+STREAM_FIRST_DATA = 30          # s from the header to the first keyframe
+STREAM_STALL = 15               # s without output from a live run
+STREAM_AUDIO_GAP = 3            # s of video without any audio before the run restarts without audio
+STREAM_BACKOFF = (1, 2, 4, 8, 10)  # s between failed runs in a row
+STREAM_HEALTHY = 10             # s live: the run counts as healthy and the backoff starts over
+STREAM_KILL_AFTER = 2           # s from SIGTERM to SIGKILL for ffmpeg
+STREAM_VIEWERS_MAX = 16
+STREAM_QUEUE_MAX = 64           # fragments a viewer may lag behind (about 13 s) before it is dropped
+STREAM_GOP_MAX = 8 << 20        # bytes of fragments kept for late joiners
+STREAM_BOX_MAX = 64 << 20       # a box claiming more than this is corrupt output
+STREAM_INIT_WAIT = 10           # s the media route waits for a restarting ffmpeg's header
+STREAM_ERROR_LINES = 8          # lines of ffmpeg's stderr kept from the start and from the end of a run
 STATUS_ALIASES = {
     'done': 'done', 'ok': 'done', 'success': 'done', 'complete': 'done', 'completed': 'done',
     'failed': 'failed', 'fail': 'failed', 'error': 'failed',
@@ -515,6 +571,883 @@ class Settings:
             except OSError as exc:
                 raise ApiError(500, f'cannot remove {self.path}: {exc.strerror or exc}') from None
             self._load(self._file_stamp())
+
+
+# Live stream
+
+# One ffmpeg per open stream remuxes the source to fragmented MP4 and the pages play it (see the Stream paragraph
+# of the docstring). Nothing here waits for a viewer: they are fed through bounded queues.
+
+STREAM_BAD_URL_RE = re.compile(r'[\s\x00-\x1f\x7f-\x9f]')
+_USERINFO_RE = re.compile(r'(://)[^/\s]+@')
+STREAM_PREFIX_RE = re.compile(r'^\[([^\]@]*?)\s*@ 0x[0-9a-f]+\]\s*')
+# ffmpeg's decoders chatter while a copy joins a stream mid-way; none of it says why a run failed.
+STREAM_NOISY_TAGS = frozenset(('h264', 'hevc', 'mpeg2video', 'mpeg4', 'aac', 'mp2', 'mp3'))
+STREAM_NOISE_RE = re.compile(
+    r'^(?:no frame!|non-existing PPS|Last message repeated|Error opening input file|Conversion failed|'
+    r'decode_slice_header|co located POCs|Missing reference|error while decoding)', re.IGNORECASE)
+STREAM_CAUSE_RE = re.compile(
+    r'refused|timed out|timeout|resolve|Server returned|HTTP error|not on whitelist|Protocol not found|'
+    r'Option .* not found|dimensions not set|Could not find codec parameters|Invalid data found|'
+    r'does not contain any stream|Connection reset|unreachable|No route to host|End of file|'
+    r'Input/output error|Permission denied|Unauthorized|Forbidden', re.IGNORECASE)
+# Errors that mean the source needs a longer look before ffmpeg knows its streams.
+STREAM_PROBE_RE = re.compile(
+    r'dimensions not set|Could not find codec parameters|unspecified size|Could not write header', re.IGNORECASE)
+
+
+def clean_stream_url(value):
+    """The URL of a stream to open: one of ffmpeg's network schemes, returned with the scheme in lower case."""
+    if value is None:
+        raise ApiError(400, 'url is required', field='url', hint='send {"url": "http://camera.lan:8554/"}')
+    if not isinstance(value, str):
+        raise ApiError(400, 'url must be a string', field='url')
+    url = value.strip()
+    if not url:
+        raise ApiError(400, 'url must not be empty', field='url')
+    if len(url) > STREAM_URL_MAX:
+        raise ApiError(400, f'url is longer than {STREAM_URL_MAX} characters', field='url')
+    if STREAM_BAD_URL_RE.search(url):
+        raise ApiError(400, 'url must not contain spaces or control characters', field='url',
+                       hint='percent-encode them')
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        raise ApiError(400, 'url has an invalid address or port', field='url') from None
+    if parts.scheme not in STREAM_SCHEMES:  # urlsplit lower-cases the scheme
+        raise ApiError(400, f'url scheme must be one of {", ".join(STREAM_SCHEMES)}', field='url')
+    if not host:
+        raise ApiError(400, 'url needs a host', field='url')
+    if port == 0:
+        raise ApiError(400, 'url has an invalid address or port', field='url')
+    return parts.scheme + url[len(parts.scheme):]
+
+
+def redact_url(url):
+    """The URL with any user:password@ shown as ***@: the board shows it to everyone who can open the page."""
+    try:
+        parts = urlsplit(url)
+        if not (parts.username or parts.password):
+            return url
+        return urlunsplit((parts.scheme, '***@' + parts.netloc.rpartition('@')[2], parts.path, parts.query,
+                           parts.fragment))
+    except ValueError:
+        return _USERINFO_RE.sub(r'\1***@', url)
+
+
+def redact_text(text, url):
+    """text (ffmpeg's stderr, say) with the stream's URL redacted and any other user:password@ hidden."""
+    return _USERINFO_RE.sub(r'\1***@', text.replace(url, redact_url(url)))
+
+
+def find_ffmpeg():
+    return shutil.which('ffmpeg')
+
+
+def _ffmpeg_env():
+    # The board is for a LAN: no proxy from the environment, whatever case it is spelled in.
+    return {key: value for key, value in os.environ.items() if not key.lower().endswith('_proxy')}
+
+
+_ffmpeg_majors = {}
+
+
+def ffmpeg_major(exe):
+    """ffmpeg's major version (5 for 5.1.6); None when it cannot be told (a git build), which counts as new."""
+    try:
+        st = os.stat(exe)
+    except OSError:
+        return None
+    key = (exe, st.st_mtime_ns, st.st_size)
+    if key not in _ffmpeg_majors:
+        major = None
+        try:
+            out = subprocess.run([exe, '-version'], stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
+                                 env=_ffmpeg_env()).stdout
+            match = re.search(rb'version n?(\d+)', out)
+            major = int(match.group(1)) if match else None
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _ffmpeg_majors[key] = major
+    return _ffmpeg_majors[key]
+
+
+def ffmpeg_argv(exe, url, level=0, audio=True, major=None):
+    """The ffmpeg command line for a stream: the video copied, the audio made AAC stereo, fragmented MP4 on stdout.
+    level picks how long ffmpeg looks at the source first (a long GOP joined mid-way needs more); audio=False
+    leaves the audio out."""
+    scheme = url.partition(':')[0].lower()
+    analyze, probe = STREAM_PROBES[min(max(level, 0), len(STREAM_PROBES) - 1)]
+    micros = str(STREAM_IO_TIMEOUT * 1000000)
+    argv = [exe, '-hide_banner', '-nostdin', '-nostats', '-loglevel', 'error', '-protocol_whitelist', STREAM_PROTOCOLS]
+    if scheme in ('rtsp', 'rtsps'):
+        # RTSP is a demuxer, not a protocol, so -rw_timeout would be an unused option and ffmpeg refuses those.
+        # Before ffmpeg 5, -timeout meant "listen for a connection"; the socket timeout was -stimeout.
+        argv += ['-rtsp_transport', 'tcp', '-stimeout' if major is not None and major < 5 else '-timeout', micros]
+    else:
+        argv += ['-rw_timeout', micros]  # never -timeout here: for rtmp it makes ffmpeg listen
+    argv += ['-fflags', '+nobuffer', '-analyzeduration', str(analyze), '-probesize', str(probe), '-i', url,
+             '-map', '0:v:0?']
+    argv += ['-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k', '-ac', '2'] if audio else ['-an']
+    # A short interleave delta keeps one silent track from holding the other back.
+    argv += ['-c:v', 'copy', '-max_interleave_delta', '1000000', '-f', 'mp4',
+             '-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-frag_duration', '200000', 'pipe:1']
+    return argv
+
+
+def _stderr_text(raw):
+    """One stderr line without its [module @ 0x...] prefix; None when it is empty or decoder noise."""
+    line = raw.strip()
+    tag = ''
+    match = STREAM_PREFIX_RE.match(line)
+    if match:
+        tag, line = match.group(1), line[match.end():]
+    line = _squash(line)
+    if not line or tag in STREAM_NOISY_TAGS or STREAM_NOISE_RE.search(line):
+        return None
+    return line
+
+
+def ffmpeg_error(lines, url, rc=None):
+    """One line saying why a run failed, from ffmpeg's stderr: the first line that names a known cause, else the
+    first that is not noise. Redacted and shortened. None when there is nothing to show, or the run ended cleanly."""
+    if rc == 0:
+        return None
+    cleaned = [line for line in map(_stderr_text, lines) if line]
+    pick = next((line for line in cleaned if STREAM_CAUSE_RE.search(line)), cleaned[0] if cleaned else None)
+    if pick is None:
+        return None
+    pick = redact_text(pick, url)
+    return pick if len(pick) <= 200 else pick[:199] + '…'
+
+
+# Fragmented MP4, as much as the board needs of it
+
+def mp4_boxes(data, start=0, end=None):
+    """The boxes in data[start:end] as (type, payload_start, box_end). Stops at a truncated box; a size that is
+    smaller than the box's own header raises ValueError."""
+    end = len(data) if end is None else end
+    pos = start
+    while pos + 8 <= end:
+        size, kind = struct.unpack_from('>I4s', data, pos)
+        header = 8
+        if size == 1:
+            if pos + 16 > end:
+                return
+            size, header = struct.unpack_from('>Q', data, pos + 8)[0], 16
+        elif size == 0:
+            size = end - pos
+        if size < header:
+            raise ValueError('a box smaller than its header')
+        if pos + size > end:
+            return
+        yield kind.decode('latin-1'), pos + header, pos + size
+        pos += size
+
+
+def _mp4_find(data, start, end, *path):
+    """The (payload_start, box_end) of the first box named by the last item of path, looked up level by level."""
+    for name in path:
+        for kind, payload, stop in mp4_boxes(data, start, end):
+            if kind == name:
+                start, end = payload, stop
+                break
+        else:
+            return None
+    return start, end
+
+
+def _mp4_esds_codec(data, pos, end):
+    """mp4a.<object type>.<audio object type> from an esds box's descriptors (pos is after its version and flags)."""
+    oti = aot = None
+    while pos < end:
+        tag = data[pos]
+        pos += 1
+        length = 0
+        for _ in range(4):
+            byte = data[pos]
+            pos += 1
+            length = (length << 7) | (byte & 0x7f)
+            if not byte & 0x80:
+                break
+        if tag == 0x03:  # ES_Descriptor: ES_ID and flags, then optional fields, then the descriptors inside
+            flags = data[pos + 2]
+            pos += 3
+            if flags & 0x80:
+                pos += 2
+            if flags & 0x40:
+                pos += 1 + data[pos]
+            if flags & 0x20:
+                pos += 2
+        elif tag == 0x04:  # DecoderConfigDescriptor: object type, then 12 bytes before the descriptors inside
+            oti = data[pos]
+            pos += 13
+        elif tag == 0x05:  # DecoderSpecificInfo: the AudioSpecificConfig starts with the audio object type
+            aot = data[pos] >> 3
+            if aot == 31:
+                aot = 32 + (((data[pos] & 7) << 3) | (data[pos + 1] >> 5))
+            break
+        else:
+            pos += length
+    if oti is None:
+        return 'mp4a'
+    return f'mp4a.{oti:x}.{aot}' if aot is not None else f'mp4a.{oti:x}'
+
+
+def _mp4_codec(data, kind, payload, stop):
+    if kind in ('avc1', 'avc3'):
+        found = _mp4_find(data, payload + 78, stop, 'avcC')  # a video sample entry has 78 bytes before its boxes
+        if found:
+            return '%s.%02X%02X%02X' % (kind, *data[found[0] + 1:found[0] + 4])
+    elif kind == 'mp4a':
+        found = _mp4_find(data, payload + 28, stop, 'esds')  # an audio sample entry has 28
+        if found:
+            return _mp4_esds_codec(data, found[0] + 4, found[1])
+    return kind  # hev1, hvc1, av01...: named bare, which a browser will most likely refuse
+
+
+def _mp4_track(data, start, end):
+    tkhd = _mp4_find(data, start, end, 'tkhd')
+    hdlr = _mp4_find(data, start, end, 'mdia', 'hdlr')
+    stsd = _mp4_find(data, start, end, 'mdia', 'minf', 'stbl', 'stsd')
+    if not (tkhd and hdlr and stsd):
+        return None
+    track_id = struct.unpack_from('>I', data, tkhd[0] + (20 if data[tkhd[0]] == 1 else 12))[0]
+    width, height = (value >> 16 for value in struct.unpack_from('>II', data, tkhd[1] - 8))  # 16.16 fixed point
+    entries = list(mp4_boxes(data, stsd[0] + 8, stsd[1]))
+    return track_id, {'kind': bytes(data[hdlr[0] + 8:hdlr[0] + 12]).decode('latin-1'),
+                      'codec': _mp4_codec(data, *entries[0]) if entries else '?', 'width': width, 'height': height}
+
+
+def mp4_init_info(moov):
+    """What a moov box (with its header) says: {'tracks': {id: {'kind', 'codec', 'width', 'height'}}, 'trex':
+    {id: default sample flags}}. kind is the handler (vide, soun) and codec an RFC 6381 string (avc1.42C028,
+    mp4a.40.2), or the bare sample entry code. ValueError for a moov it cannot read."""
+    try:
+        root = _mp4_find(moov, 0, len(moov), 'moov')
+        if root is None:
+            raise ValueError('not a moov box')
+        tracks, trex = {}, {}
+        for kind, payload, stop in mp4_boxes(moov, *root):
+            if kind == 'mvex':
+                for sub, start, _ in mp4_boxes(moov, payload, stop):
+                    if sub == 'trex':
+                        track_id, _, _, _, flags = struct.unpack_from('>5I', moov, start + 4)
+                        trex[track_id] = flags
+            elif kind == 'trak':
+                track = _mp4_track(moov, payload, stop)
+                if track:
+                    tracks[track[0]] = track[1]
+        return {'tracks': tracks, 'trex': trex}
+    except (struct.error, IndexError) as exc:
+        raise ValueError(f'unreadable moov: {exc}') from None
+
+
+def _first_sample_sync(data, pos, default):
+    """Whether the first sample of a trun box (pos is its payload) is a sync sample; default is the flags the
+    track fragment header or the trex gave."""
+    flags = int.from_bytes(data[pos + 1:pos + 4], 'big')
+    count = struct.unpack_from('>I', data, pos + 4)[0]
+    pos += 8 + (4 if flags & 0x1 else 0)  # the data offset
+    if count == 0:
+        return False
+    if flags & 0x4:  # first_sample_flags
+        first = struct.unpack_from('>I', data, pos)[0]
+    elif flags & 0x400:  # per-sample flags, after the sample's duration and size
+        first = struct.unpack_from('>I', data, pos + (4 if flags & 0x100 else 0) + (4 if flags & 0x200 else 0))[0]
+    else:
+        first = default
+    return not first & 0x10000  # sample_is_non_sync_sample
+
+
+def mp4_fragment_info(moof, trex=None):
+    """The tracks a moof box (with its header) carries: {track_id: whether its first sample is a sync sample,
+    that is a keyframe}. ValueError for a moof it cannot read."""
+    try:
+        root = _mp4_find(moof, 0, len(moof), 'moof')
+        if root is None:
+            raise ValueError('not a moof box')
+        out = {}
+        for kind, payload, stop in mp4_boxes(moof, *root):
+            if kind != 'traf':
+                continue
+            tfhd = _mp4_find(moof, payload, stop, 'tfhd')
+            if tfhd is None:
+                continue
+            flags = int.from_bytes(moof[tfhd[0] + 1:tfhd[0] + 4], 'big')
+            track_id = struct.unpack_from('>I', moof, tfhd[0] + 4)[0]
+            pos = tfhd[0] + 8
+            for bit, size in ((0x1, 8), (0x2, 4), (0x8, 4), (0x10, 4)):  # fields before default_sample_flags
+                if flags & bit:
+                    pos += size
+            default = struct.unpack_from('>I', moof, pos)[0] if flags & 0x20 else (trex or {}).get(track_id, 0)
+            trun = _mp4_find(moof, payload, stop, 'trun')
+            out[track_id] = trun is not None and _first_sample_sync(moof, trun[0], default)
+        return out
+    except (struct.error, IndexError) as exc:
+        raise ValueError(f'unreadable moof: {exc}') from None
+
+
+def stream_mime(tracks):
+    """The MIME type, with codecs, that a MediaSource needs for these tracks (video first)."""
+    ordered = sorted(tracks.values(), key=lambda track: track['kind'] != 'vide')
+    kind = 'video' if any(track['kind'] == 'vide' for track in ordered) else 'audio'
+    return f'{kind}/mp4; codecs="{",".join(track["codec"] for track in ordered)}"'
+
+
+class BoxSplitter:
+    """Cuts a byte stream into top-level MP4 boxes."""
+
+    def __init__(self):
+        self.buf = bytearray()
+
+    def feed(self, chunk):
+        """The boxes now complete, as (type, bytes); ValueError for a size that cannot be right."""
+        buf = self.buf
+        buf += chunk
+        out, pos = [], 0
+        while len(buf) - pos >= 8:
+            size, kind = struct.unpack_from('>I4s', buf, pos)
+            header = 8
+            if size == 1:
+                if len(buf) - pos < 16:
+                    break
+                size, header = struct.unpack_from('>Q', buf, pos + 8)[0], 16
+            if size < header or size > STREAM_BOX_MAX:
+                raise ValueError(f'a box of {size} bytes')
+            if len(buf) - pos < size:
+                break
+            out.append((kind.decode('latin-1'), bytes(buf[pos:pos + size])))
+            pos += size
+        del buf[:pos]
+        return out
+
+
+class FragmentReader:
+    """Turns ffmpeg's fragmented MP4 into one init segment (ftyp and moov) and then fragments (a moof and its mdat)."""
+
+    def __init__(self):
+        self.splitter = BoxSplitter()
+        self.ftyp = b''
+        self.moof = None
+        self.init = self.mime = None
+        self.tracks, self.trex = {}, {}
+        self.video = self.audio = None  # track ids
+
+    def feed(self, chunk):
+        """-> [('init', init_bytes, mime, tracks) or ('fragment', bytes, sync, track_ids)]. A fragment is sync when
+        the video track's first sample is a keyframe (every fragment of an audio-only stream is). ValueError for
+        output that is not fragmented MP4 as ffmpeg writes it."""
+        events = []
+        for kind, box in self.splitter.feed(chunk):
+            if kind == 'ftyp':
+                self.ftyp = box
+            elif kind == 'moov':
+                info = mp4_init_info(box)
+                if not info['tracks']:
+                    raise ValueError('a moov without tracks')
+                self.tracks, self.trex = info['tracks'], info['trex']
+                self.video = next((i for i, track in self.tracks.items() if track['kind'] == 'vide'), None)
+                self.audio = next((i for i, track in self.tracks.items() if track['kind'] == 'soun'), None)
+                self.init, self.mime = self.ftyp + box, stream_mime(self.tracks)
+                events.append(('init', self.init, self.mime, self.tracks))
+            elif kind == 'moof':
+                self.moof = box
+            elif kind == 'mdat' and self.moof is not None and self.init is not None:
+                info = mp4_fragment_info(self.moof, self.trex)
+                sync = True if self.video is None else info.get(self.video, False)
+                events.append(('fragment', self.moof + box, sync, tuple(info)))
+                self.moof = None
+            # mfra, free and the like are not needed
+        return events
+
+
+def _stop_process(proc):
+    """Ask ffmpeg to stop and kill it if it has not by STREAM_KILL_AFTER seconds; -> its exit status."""
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(STREAM_KILL_AFTER)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait()
+    return proc.returncode
+
+
+def _close_pipes(proc):
+    for pipe in (proc.stdout, proc.stderr):
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+class StreamViewer:
+    """One media connection's queue of fragments. The supervisor offers to it and never waits for it."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.items = collections.deque()
+        self.closed = self.dropped = False
+
+    def offer(self, data):
+        """False once the viewer is closed, or when it fell too far behind and was closed for it."""
+        with self.cond:
+            if self.closed:
+                return False
+            if len(self.items) >= STREAM_QUEUE_MAX:
+                self.closed = self.dropped = True
+                self.items.clear()
+                self.cond.notify_all()
+                return False
+            self.items.append(data)
+            self.cond.notify()
+            return True
+
+    def end(self):
+        with self.cond:
+            self.closed = True
+            self.items.clear()
+            self.cond.notify_all()
+
+    def next(self, timeout):
+        """The next fragment; b'' when none came within timeout seconds; None once the viewer is closed."""
+        with self.cond:
+            if not self.items and not self.closed:
+                self.cond.wait(timeout)
+            if self.items:
+                return self.items.popleft()
+            return None if self.closed else b''
+
+
+class StreamChannel:
+    """One open stream. A supervisor thread keeps an ffmpeg running for its URL, cuts the output into fragments and
+    hands them to the viewers (one per page). It lives until stop() and is never reused."""
+
+    def __init__(self, sid, url, opened_at):
+        self.id, self.url, self.shown, self.opened_at = sid, url, redact_url(url), opened_at
+        self.cond = threading.Condition()  # guards what follows, down to stopping
+        self.state, self.since, self.error = 'connecting', ts(), None
+        self.init = self.mime = self.gop = None  # gop: the fragments since the last keyframe fragment
+        self.gop_bytes = 0
+        self.tracks = {}
+        self.viewers = set()
+        self.waiting = 0  # media requests waiting in attach() for an init segment
+        self.proc = None
+        self.stopped = False
+        self.audio = True  # False once the source proved to have no usable audio
+        self.level = 0  # how long ffmpeg looks at the source first (STREAM_PROBES)
+        self.restart = False  # the same URL was posted again to try the audio again
+        self.stopping = threading.Event()
+        self.wake = threading.Event()  # cuts a backoff wait short
+        self.thread = self.after = None
+
+    def start(self, after=None):
+        """Start the supervisor. With after (the channel this one replaces) it first waits for that one's ffmpeg to
+        be gone, so a source that serves a single client does not turn the new connection away."""
+        self.after = after
+        self.thread = threading.Thread(target=self._supervise, name=f'stream-{self.id}', daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """Ask the channel to end; does not wait for it. Every viewer ends now."""
+        self.stopping.set()
+        self.wake.set()
+        with self.cond:
+            self.stopped = True
+            proc, viewers = self.proc, list(self.viewers)
+            self.viewers.clear()
+            self.cond.notify_all()
+        for viewer in viewers:
+            viewer.end()
+        if proc is not None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+    def kick(self):
+        """The same URL was posted again: try now if it is not live; if it is live without the audio it lost, try
+        the audio again."""
+        with self.cond:
+            if self.state == 'live':
+                if self.audio:
+                    return
+                self.audio, self.restart = True, True
+            else:
+                self.audio, self.level = True, 0
+        self.wake.set()
+
+    def snapshot(self):
+        with self.cond:
+            tracks = self.tracks.values()
+            video = next((track for track in tracks if track['kind'] == 'vide'), None)
+            audio = next((track for track in tracks if track['kind'] == 'soun'), None)
+            return {'id': self.id, 'url': self.shown, 'opened_at': self.opened_at, 'state': self.state,
+                    'since': self.since, 'error': self.error, 'video': video and video['codec'],
+                    'audio': audio and audio['codec'], 'width': video and video['width'],
+                    'height': video and video['height'], 'viewers': len(self.viewers),
+                    'media': f'/api/stream/media?id={self.id}'}
+
+    def attach(self, timeout):
+        """Register a viewer once there is an init segment (waiting up to timeout seconds for a restarting ffmpeg's).
+        -> (viewer, init segment, the cached fragments, mime). Taking the cache and registering happen under one
+        lock, so the viewer sees every fragment once and in order."""
+        with self.cond:
+            if len(self.viewers) + self.waiting >= STREAM_VIEWERS_MAX:
+                raise ApiError(503, f'the stream has {STREAM_VIEWERS_MAX} viewers already', {'Retry-After': '10'})
+            self.waiting += 1
+            try:
+                self.cond.wait_for(lambda: self.stopped or self.init is not None, timeout)
+            finally:
+                self.waiting -= 1
+            if self.stopped:
+                raise ApiError(410, 'the stream was replaced or closed')
+            if self.init is None:
+                extra = {'hint': self.error} if self.error else {}
+                raise ApiError(503, 'the stream is not connected yet', {'Retry-After': '2'}, **extra)
+            viewer = StreamViewer()
+            self.viewers.add(viewer)
+            return viewer, self.init, list(self.gop or ()), self.mime
+
+    def detach(self, viewer):
+        with self.cond:
+            self.viewers.discard(viewer)
+
+    def _supervise(self):
+        after, self.after = self.after, None
+        if after is not None and after.thread is not None:
+            deadline = time.monotonic() + STREAM_KILL_AFTER + 1
+            while after.thread.is_alive() and time.monotonic() < deadline and not self.stopping.is_set():
+                time.sleep(0.05)
+        attempt = 0
+        while not self.stopping.is_set():
+            self.wake.clear()
+            try:
+                exe = find_ffmpeg()
+                if exe is None:
+                    self._end_run('ffmpeg is not installed on the board host (sudo apt install ffmpeg)')
+                    wait = 10
+                else:
+                    attempt = 0 if self._run(exe) else attempt + 1
+                    wait = STREAM_BACKOFF[min(max(attempt - 1, 0), len(STREAM_BACKOFF) - 1)]
+            except Exception:  # whatever it was, it counts as a failed run: the supervisor itself must not die
+                if self.stopping.is_set():
+                    break
+                log.exception('stream %s: the supervisor failed', self.id)
+                self._end_run('internal error (see the board log)')
+                attempt += 1
+                wait = STREAM_BACKOFF[min(attempt - 1, len(STREAM_BACKOFF) - 1)]
+            self.wake.wait(wait)
+
+    def _run(self, exe):
+        """One ffmpeg process, from its start to its end. True when it was live for at least STREAM_HEALTHY seconds."""
+        analyze = STREAM_PROBES[min(self.level, len(STREAM_PROBES) - 1)][0] / 1e6
+        argv = ffmpeg_argv(exe, self.url, self.level, self.audio, ffmpeg_major(exe))
+        log.debug('stream %s: %s', self.id, redact_text(' '.join(argv), self.url))
+        self.restart = False
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    bufsize=0, env=_ffmpeg_env(), start_new_session=True)
+        except OSError as exc:
+            self._end_run(f'cannot run {exe}: {exc.strerror or exc}')
+            return False
+        with self.cond:
+            stopped = self.stopped
+            if not stopped:
+                self.proc = proc
+        if stopped:  # stop() came in before the process was registered, so it could not stop it
+            _stop_process(proc)
+            _close_pipes(proc)
+            return False
+
+        chunks = queue.Queue()  # unbounded on purpose: the pump must never wait, or it would never see the end
+        head, tail = [], collections.deque(maxlen=STREAM_ERROR_LINES)  # the first and the last lines of stderr
+
+        def pump():
+            try:
+                while True:
+                    data = os.read(proc.stdout.fileno(), 65536)
+                    if not data:
+                        break
+                    chunks.put(data)
+            except OSError:
+                pass
+            finally:
+                chunks.put(None)
+
+        def drain():
+            rest = b''
+            try:
+                while True:
+                    data = os.read(proc.stderr.fileno(), 4096)
+                    if not data:
+                        break
+                    *lines, rest = (rest + data).split(b'\n')
+                    rest = rest[-2000:]
+                    for raw in lines:
+                        keep(raw)
+            except OSError:
+                pass
+            keep(rest)
+
+        def keep(raw):
+            line = _stderr_text(raw.decode('utf-8', 'replace'))
+            if line:
+                (head if len(head) < STREAM_ERROR_LINES else tail).append(line)
+
+        threads = [threading.Thread(target=pump, daemon=True), threading.Thread(target=drain, daemon=True)]
+        for thread in threads:
+            thread.start()
+
+        reader = FragmentReader()
+        started = last_data = time.monotonic()
+        init_at = live_at = last_audio = last_video = None
+        error, rc = None, None
+        try:
+            while not self.stopping.is_set():
+                try:
+                    chunk = chunks.get(timeout=1)
+                except queue.Empty:
+                    chunk = b''
+                now = time.monotonic()
+                if chunk is None:
+                    break
+                if chunk:
+                    last_data = now
+                    for event in reader.feed(chunk):
+                        if event[0] == 'init':
+                            init_at = now
+                            self._set_init(event[1], event[2], event[3])
+                            continue
+                        _, data, sync, ids = event
+                        if sync and live_at is None:
+                            live_at = last_audio = last_video = now
+                        if reader.audio in ids:
+                            last_audio = now
+                        if reader.video in ids:
+                            last_video = now
+                        self._publish(data, sync)
+                if self.restart:
+                    error = 'restarting to try the audio again'
+                elif init_at is None and now - started > analyze + STREAM_NO_INIT:
+                    # Nothing came out: a source that announces audio it never sends keeps ffmpeg from writing the
+                    # header. Look at the video alone next time.
+                    error = f'no output after {int(now - started)}s' + ('; trying again without audio' if self.audio else '')
+                    self.audio = False
+                elif init_at is not None and live_at is None and now - init_at > STREAM_FIRST_DATA:
+                    error = f'no keyframe from the source within {STREAM_FIRST_DATA}s'
+                elif live_at is not None and now - last_data > STREAM_STALL:
+                    error = f'no data from the source for {STREAM_STALL}s'
+                elif (live_at is not None and reader.audio is not None and reader.video is not None
+                      and now - last_audio > STREAM_AUDIO_GAP and now - last_video <= 1):
+                    # The browser plays only what both tracks have buffered, so audio that stops would freeze the video.
+                    self.audio = False
+                    error = 'the source stopped sending audio; showing video only'
+                if error:
+                    break
+        except ValueError as exc:
+            error = 'ffmpeg produced unreadable output'
+            log.info('stream %s: %s (%s)', self.id, error, exc)
+        finally:
+            rc = _stop_process(proc)
+            for thread in threads:
+                thread.join(1)
+            _close_pipes(proc)
+
+        if error is None and not self.stopping.is_set():
+            error = (ffmpeg_error(head + list(tail), self.url, rc)
+                     or ('the source ended' if rc == 0 else f'ffmpeg exited with status {rc}'))
+        healthy = live_at is not None and time.monotonic() - live_at >= STREAM_HEALTHY
+        if healthy:
+            self.level = 0
+        elif error and STREAM_PROBE_RE.search(' '.join(head + list(tail))):
+            self.level = min(self.level + 1, len(STREAM_PROBES) - 1)
+        self._end_run(error)
+        return healthy
+
+    def _set_init(self, init, mime, tracks):
+        with self.cond:
+            if self.stopped:
+                return
+            self.init, self.mime, self.tracks = init, mime, tracks
+            self.gop, self.gop_bytes = None, 0
+            self.cond.notify_all()
+
+    def _publish(self, frag, sync):
+        with self.cond:
+            if self.stopped:
+                return
+            if sync:
+                self.gop, self.gop_bytes = [frag], len(frag)
+                if self.state != 'live':
+                    self.state, self.since, self.error = 'live', ts(), None
+                    log.info('stream %s live: %s (%s)', self.id, self.shown,
+                             ', '.join(track['codec'] for track in self.tracks.values()))
+            elif self.gop is not None:
+                self.gop.append(frag)
+                self.gop_bytes += len(frag)
+                if self.gop_bytes > STREAM_GOP_MAX:
+                    self.gop = None  # a late joiner then starts at the next keyframe
+            for viewer in list(self.viewers):
+                if not viewer.offer(frag):
+                    self.viewers.discard(viewer)
+                    if viewer.dropped:
+                        log.info('stream %s: dropped a viewer that fell %d fragments behind', self.id, STREAM_QUEUE_MAX)
+
+    def _end_run(self, error):
+        """A run is over: its viewers end (their pages reconnect to the next one) and the channel is connecting again."""
+        was_live = changed = False
+        with self.cond:
+            self.proc = self.init = self.mime = self.gop = None
+            self.gop_bytes = 0
+            self.tracks = {}
+            viewers = list(self.viewers)
+            self.viewers.clear()
+            if not self.stopped:
+                was_live = self.state == 'live'
+                if was_live:
+                    self.state, self.since = 'connecting', ts()
+                changed = error != self.error
+                self.error = error
+            self.cond.notify_all()
+        for viewer in viewers:
+            viewer.end()
+        if not self.stopped and error:
+            (log.info if was_live or changed else log.debug)('stream %s: %s', self.id, error)
+
+
+class StreamHub:
+    """The board's one open stream (or none), saved to a file so a restart reopens it."""
+
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()  # guards the fields below; held only for quick, non-blocking work
+        self._chan = None
+        self._retired = []  # replaced or closed channels, until their threads are gone
+        self._closing = False
+
+    def snapshot(self):
+        chan = self._chan  # no lock: a poll never waits behind a file write
+        return chan.snapshot() if chan else None
+
+    def channel(self, sid):
+        chan = self._chan
+        if chan is None:
+            raise ApiError(404, 'no stream is open', hint='POST /api/stream {"url": "..."} opens one')
+        if sid and sid != chan.id:
+            raise ApiError(410, f'stream {sid} was replaced or closed')
+        return chan
+
+    def open(self, url):
+        """Open url, replacing any stream. -> (channel, existing, warnings); the same URL as the open one is kept."""
+        with self._lock:
+            if self._closing:
+                raise ApiError(503, 'the board is shutting down', {'Retry-After': '5'})
+            old = self._chan
+            if old is not None and old.url == url:
+                old.kick()
+                return old, True, []
+            chan = StreamChannel(secrets.token_hex(6), url, ts())
+            warnings = self._save(chan)
+            self._chan = chan
+            if old is not None:
+                old.stop()
+                self._retire(old)
+            chan.start(after=old)  # under the lock, so no one can see a channel that was not started
+        log.info('stream %s opened: %s%s', chan.id, chan.shown, f' (replacing {old.id})' if old else '')
+        return chan, False, warnings
+
+    def close(self):
+        """-> (whether a stream was open, warnings)."""
+        with self._lock:
+            chan, self._chan = self._chan, None
+            warnings = self._forget()
+            if chan is not None:
+                chan.stop()
+                self._retire(chan)
+        if chan is not None:
+            log.info('stream %s closed', chan.id)
+        return chan is not None, warnings
+
+    def _retire(self, chan):
+        self._retired = [c for c in self._retired if c.thread is not None and c.thread.is_alive()] + [chan]
+
+    def _save(self, chan):
+        text = json.dumps({'id': chan.id, 'url': chan.url, 'opened_at': chan.opened_at}) + '\n'
+        temp = self.path.with_name(f'.{self.path.name}.{os.getpid()}.tmp')
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w', encoding='utf-8') as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp, self.path)
+        except OSError as exc:
+            temp.unlink(missing_ok=True)
+            return [f'the stream was not saved for restarts: {exc.strerror or exc}']
+        return []
+
+    def _forget(self):
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError as exc:
+            return [f'could not remove {self.path}: {exc.strerror or exc}']
+        return []
+
+    def restore(self):
+        """Reopen the stream a previous run left in the file; anything wrong with the file is logged and ignored."""
+        try:
+            raw = self.path.read_bytes()  # decoded by json.loads, whose ValueError (UnicodeDecodeError too) is caught below
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            log.warning('stream file %s: cannot read it: %s', self.path, exc.strerror or exc)
+            return
+        try:
+            data = json.loads(raw)
+            url = clean_stream_url(data['url'])
+            sid = data.get('id')
+            opened_at = data.get('opened_at')
+        except (ValueError, KeyError, TypeError, RecursionError, ApiError) as exc:  # RecursionError: JSON nested too deep
+            log.warning('stream file %s ignored: %s', self.path, exc)
+            return
+        if not (isinstance(sid, str) and re.fullmatch(r'[0-9a-f]{12}', sid)):
+            sid = secrets.token_hex(6)
+        if isinstance(opened_at, bool) or not isinstance(opened_at, (int, float)) or not math.isfinite(opened_at):
+            opened_at = ts()
+        with self._lock:
+            if self._closing or self._chan is not None:
+                return
+            chan = self._chan = StreamChannel(sid, url, opened_at)
+            chan.start()
+        log.info('stream %s reopened after a restart: %s', chan.id, chan.shown)
+        if find_ffmpeg() is None:
+            log.warning('ffmpeg is not installed, so the stream cannot play (sudo apt install ffmpeg)')
+
+    def shutdown(self, timeout=4):
+        """Stop every channel, ffmpeg included, and wait for them; the saved file stays, for the next start."""
+        try:
+            with self._lock:
+                self._closing = True
+                chans = ([self._chan] if self._chan is not None else []) + list(self._retired)
+            for chan in chans:
+                chan.stop()
+            deadline = time.monotonic() + timeout
+            for chan in chans:
+                try:
+                    chan.thread.join(max(0.0, deadline - time.monotonic()))
+                except (AttributeError, RuntimeError):  # never started
+                    pass
+        except Exception:
+            log.exception('stopping the stream failed')
 
 
 # Storage
@@ -1065,6 +1998,10 @@ ROUTES = (
     _route('GET', r'/api/settings', 'get_settings'),
     _route('PUT', r'/api/settings', 'put_settings'),
     _route('DELETE', r'/api/settings', 'delete_settings'),
+    _route('GET', r'/api/stream', 'get_stream'),
+    _route('POST', r'/api/stream', 'open_stream'),
+    _route('DELETE', r'/api/stream', 'close_stream'),
+    _route('GET', r'/api/stream/media', 'stream_media'),
     _route('GET', r'/api/requests', 'list_requests'),
     _route('POST', r'/api/requests', 'create_request'),
     _route('GET', r'/api/requests/(?P<rid>[^/]+)', 'get_request'),
@@ -1571,7 +2508,7 @@ class Handler(BaseHTTPRequestHandler):
         version = self.server.settings.current_version()
         now = ts()
         self._reply(200, {'now': now, **self.server.store.events(since, limit, now, self.server.stale_after),
-                          'settings_version': version})
+                          'settings_version': version, 'stream': self.server.stream.snapshot()})
 
     def h_get_settings(self):
         self._reply(200, self.server.settings.snapshot(ts()))
@@ -1589,6 +2526,68 @@ class Handler(BaseHTTPRequestHandler):
         self.server.settings.reset()
         log.info('settings reset to the defaults (%s removed)', self.server.settings.path)
         self._reply(200, self.server.settings.snapshot(ts()))
+
+    def _stream_payload(self, **extra):
+        return {'now': ts(), 'stream': self.server.stream.snapshot(), 'ffmpeg': find_ffmpeg(), **extra}
+
+    def h_get_stream(self):
+        self._reply(200, self._stream_payload())
+
+    def h_open_stream(self):
+        body = self._body({'url'})
+        _, existing, warnings = self.server.stream.open(clean_stream_url(body.get('url')))
+        self.warnings.extend(warnings)
+        if find_ffmpeg() is None:
+            self.warnings.append('ffmpeg is not installed on the board host; the stream starts once it is '
+                                 '(sudo apt install ffmpeg)')
+        self._reply(200 if existing else 201, self._stream_payload(existing=existing))
+
+    def h_close_stream(self):
+        closed, warnings = self.server.stream.close()
+        self.warnings.extend(warnings)
+        self._reply(200, self._stream_payload(closed=closed))
+
+    def _stream_headers(self, mime):
+        self.send_response(200)
+        self.send_header('Content-Type', mime)
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Tasks-Version', VERSION)
+        self.send_header('X-Tasks-Docs', docs_version())
+        self.send_header('Connection', 'close')
+        self.end_headers()
+
+    def h_stream_media(self):
+        """The open stream as fragmented MP4: no Content-Length, the body ends when the channel's run does."""
+        chan = self.server.stream.channel(self._query('id'))
+        if self.command == 'HEAD':  # routed as GET; it only says what a GET would send
+            if chan.mime is None:
+                raise ApiError(503, 'the stream is not connected yet', {'Retry-After': '2'})
+            self._stream_headers(chan.mime)
+            return
+        viewer, init, gop, mime = chan.attach(STREAM_INIT_WAIT)
+        sent, started = 0, time.monotonic()
+        try:
+            self._stream_headers(mime)
+            for part in (init, *gop):
+                self.wfile.write(part)
+                sent += len(part)
+            while True:
+                part = viewer.next(5)
+                if part is None:
+                    break
+                if part:
+                    self.wfile.write(part)
+                    sent += len(part)
+        except OSError:
+            pass  # the page went away, or stopped reading for Handler.timeout seconds
+        except Exception:  # _dispatch would write a JSON 500 into the middle of the media
+            log.exception('stream %s: a media request failed', chan.id)
+        finally:
+            chan.detach(viewer)
+            self.close_connection = True
+            log.info('%s GET /api/stream/media %s: %d bytes in %s%s', self.address_string(), chan.id, sent,
+                     humanise(time.monotonic() - started), ' (dropped: too slow)' if viewer.dropped else '')
 
 
 def _printable(text):
@@ -1780,11 +2779,12 @@ def main(argv=None):
 
     settings = Settings(Path(os.path.abspath(args.config or args.db.parent / 'settings.json')))
     settings.current_version()  # read it now, so a broken file is reported at startup
+    streams = StreamHub(Path(os.path.abspath(args.db)).with_suffix('.stream.json'))
     local_names = frozenset(name.lower() for name in (
         'localhost', socket.gethostname(), urlsplit(args.public_url or '').hostname) if name)
     started_at = ts()
     for server in servers:
-        server.store, server.settings = store, settings
+        server.store, server.settings, server.stream = store, settings, streams
         server.public_url = args.public_url
         server.stale_after = args.stale_after
         server.started_at = started_at
@@ -1801,12 +2801,14 @@ def main(argv=None):
     log.info('tasks server listening on %s (db %s, pid %d, public url %s, settings %s)', _shown(httpd, 'http'),
              args.db, os.getpid(), args.public_url or 'from Host header', settings.path)
     try:
+        streams.restore()
         httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         log.info('shutting down')
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         stop.set()
+        streams.shutdown()
         for server in servers[1:]:
             server.shutdown()
         for server in servers:

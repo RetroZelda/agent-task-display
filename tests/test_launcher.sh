@@ -107,7 +107,7 @@ check "health answers" curl -fsS --noproxy '*' --max-time 2 -o /dev/null "http:/
 check "banner dashboard url" has "$OUT" "  dashboard   http://127.0.0.1:$P/"
 check "banner LAN line: blocked" has "$OUT" "  LAN         http://$FAKE_LAN_IP:$P/  (blocked by ufw, see below)"
 check "banner hostname line: IPv6 blocked" has "$OUT" "  hostname    http://$HN:$P/  (IPv6 blocked by ufw, see below)"
-check "banner health line" has "$OUT" "  health      ok, version 2, up "
+check "banner health line" has "$OUT" "  health      ok, version 3, up "
 check "banner database" has "$OUT" "  database    $DB"
 check "banner log" has "$OUT" "  log         $R/.logs/tasks_server.log"
 check "banner skill missing, with the fix" has "$OUT" "  skill       missing -> $T --install-skill --port $P"
@@ -132,11 +132,23 @@ check "--bg with a different --db: banner shows the running db" has "$OUT" "  da
 run "$T" --port "$P" --status
 check "--status running exits 0" [ "$RC" = 0 ]
 check "--status running headline" has "$OUT" "tasks board: running (pid $PID1, port $P)"
-check "--status health" has "$OUT" "  health      ok, version 2"
+check "--status health" has "$OUT" "  health      ok, version 3"
 check "--status shows the running db (from its command line)" has "$OUT" "  database    $DB"
 check "--status shows the ufw box" has "$OUT" "sudo ufw allow from $FAKE_LAN_NET to any port $P proto tcp"
 run env TASKS_PORT="$P" "$T" --status
 check "TASKS_PORT honoured" [ "$RC" = 0 ]
+
+# The live stream needs ffmpeg on the board host; the banner says so only while it is missing.
+mkdir -p "$TMP/ffbin"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/ffbin/ffmpeg"
+chmod +x "$TMP/ffbin/ffmpeg"
+run env PATH="$TMP/ffbin:$PATH" "$T" --port "$P" --status
+check "--status: no ffmpeg advisory while ffmpeg is on PATH" hasnt "$OUT" "live stream needs ffmpeg"
+if command -v ffmpeg >/dev/null 2>&1; then
+    skip "the ffmpeg advisory (ffmpeg is installed on this machine)"
+else
+    check "--status: the live stream needs ffmpeg" has "$OUT" "  live stream needs ffmpeg, which is not installed (sudo apt install ffmpeg)"
+fi
 
 section "foreground refused while running"
 run timeout 10 "$T" --port "$P" --db "$DB"
