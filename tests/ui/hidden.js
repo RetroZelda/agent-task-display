@@ -12,8 +12,8 @@ __t.run(async () => {
     __t.hide(true);
     const hiddenAt = Date.now() - t0;
     await sleep(11500);
+    const shownAt = Date.now() - t0;    // before the show: the poll it triggers is stamped within the same millisecond, or later
     __t.hide(false);
-    const shownAt = Date.now() - t0;
     await sleep(2500);
     await __t.post({ hiddenAt, shownAt, polls, errors: window.__errors });
 });
