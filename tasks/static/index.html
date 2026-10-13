@@ -26,7 +26,18 @@
   unmuted first, else muted with a "click for sound" chip until a gesture the browser accepts. A tab that has
   been hidden and muted for a minute lets its media connection go, and takes it up again when shown. The
   unknown-path view never polls, so it shows no stream.
+
+  Theme: the colours follow the system's light or dark setting unless this device chose one (Settings > This
+  device > Appearance: System, Light or Dark, kept in this browser). A choice is the data-theme attribute on
+  <html>, which the colour tokens below key on; a script in <head> sets it before the first paint, so a device
+  that stays dark never flashes light.
 -->
+<script>
+try {
+    const t = (JSON.parse(localStorage.getItem('taskstatus.settings.local')) || {}).theme;
+    if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+} catch (e) { /* no storage, or garbage in it: the system's theme */ }
+</script>
 <style>
 :root {
     color-scheme: light dark;
@@ -37,14 +48,23 @@
     --sans: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, "Noto Sans", sans-serif;
     --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
 }
+/* The dark tokens are written twice, for the system's dark theme and for a device that chose Dark: keep them in step. */
 @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme=light]) {
         --bg: #0e1116; --surface: #161b22; --surface-2: #1c222b; --text: #e6edf3; --muted: #8b949e;
         --border: #2b323b; --track: #262c35;
         --running: #58a6ff; --done: #3fb950; --failed: #f85149; --stale: #d29922; --pending: #8b949e;
         --cancelled: #8b949e; --warn: #d29922; --waiting: #e879f9; --on-waiting: #2a0a30;
     }
 }
+:root[data-theme=dark] {
+    color-scheme: dark;
+    --bg: #0e1116; --surface: #161b22; --surface-2: #1c222b; --text: #e6edf3; --muted: #8b949e;
+    --border: #2b323b; --track: #262c35;
+    --running: #58a6ff; --done: #3fb950; --failed: #f85149; --stale: #d29922; --pending: #8b949e;
+    --cancelled: #8b949e; --warn: #d29922; --waiting: #e879f9; --on-waiting: #2a0a30;
+}
+:root[data-theme=light] { color-scheme: light; }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; }
@@ -226,7 +246,7 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
 .field { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin: 0 0 10px; font-size: 14px; }
 .field > .label { min-width: 5.5em; font-weight: 600; }
 .check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
-.pane input[type=checkbox], .pane input[type=range] { accent-color: var(--running); }
+.pane input[type=checkbox], .pane input[type=range], .pane input[type=radio] { accent-color: var(--running); }
 .pane input[type=range] { width: 150px; max-width: 100%; }
 .pane select { font: inherit; font-size: 14px; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--border);
     background: var(--surface-2); color: var(--text); }
@@ -444,6 +464,13 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     </div></div>
 
     <div class="pane" id="pane-device" role="tabpanel" aria-labelledby="tab-device">
+        <h3>Appearance</h3>
+        <div class="field" role="radiogroup" aria-labelledby="dev-theme-label"><span class="label" id="dev-theme-label">Theme</span>
+            <label class="check"><input type="radio" name="dev-theme" value="system"> System</label>
+            <label class="check"><input type="radio" name="dev-theme" value="light"> Light</label>
+            <label class="check"><input type="radio" name="dev-theme" value="dark"> Dark</label>
+            <span id="dev-theme-note" class="inline-note"></span></div>
+
         <h3>Sound</h3>
         <div class="field"><label class="check"><input type="checkbox" id="dev-sound"> Play sounds on this device</label><span id="dev-held" class="inline-note" hidden>held by the browser until you click or tap this page</span></div>
         <div class="field"><span class="label">Volume</span><input type="range" id="dev-volume" min="0" max="100" step="5" aria-label="Volume on this device"><span id="dev-volume-val" class="mono inline-note"></span>
@@ -529,6 +556,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     const CLAIM_MS = 120000;
     const FINISHED_OPEN_KEY = 'taskstatus.finishedOpen';
     const LOCAL_KEY = 'taskstatus.settings.local';
+    const THEMES = ['system', 'light', 'dark'];     // this device's theme: the system's own, or Light or Dark whatever it says
     const CLAIMS_KEY = 'taskstatus.claims';
     // Live stream
     const STREAM_RETRY_MS = [1000, 2000, 4000, 8000, 10000]; // this page's reconnects, on the worker clock
@@ -1357,7 +1385,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
 
     // This browser's overrides (localStorage); anything malformed falls back to "inherit" or the default.
     function loadLocal() {
-        const out = { events: {}, sound_enabled: false, notify_enabled: false, volume: null, remind_every: 120, stream_audio: true, stream_volume: 1 };
+        const out = { events: {}, sound_enabled: false, notify_enabled: false, volume: null, remind_every: 120, stream_audio: true, stream_volume: 1, theme: 'system' };
         let raw = null;
         try {
             raw = JSON.parse(localStorage.getItem(LOCAL_KEY) || 'null');
@@ -1378,6 +1406,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         if (typeof raw.remind_every === 'number' && Number.isFinite(raw.remind_every) && raw.remind_every >= 0) {
             out.remind_every = Math.round(raw.remind_every);
         }
+        if (THEMES.includes(raw.theme)) out.theme = raw.theme;
         if (typeof raw.stream_audio === 'boolean') out.stream_audio = raw.stream_audio;
         if (typeof raw.stream_volume === 'number' && raw.stream_volume >= 0 && raw.stream_volume <= 1) out.stream_volume = raw.stream_volume;
         return out;
@@ -1388,6 +1417,14 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             localStorage.setItem(LOCAL_KEY, JSON.stringify(local));
         } catch (e) { /* storage unavailable: this page keeps them until it is closed */ }
     }
+
+    // Light or Dark is the attribute the colour tokens key on; System leaves the page to the system's own setting.
+    function applyTheme() {
+        if (local.theme === 'light' || local.theme === 'dark') document.documentElement.dataset.theme = local.theme;
+        else delete document.documentElement.dataset.theme;
+    }
+
+    const systemDark = () => matchMedia('(prefers-color-scheme: dark)').matches;
 
     const ownSetting = (key, ch) => local.events[key] && typeof local.events[key][ch] === 'boolean' ? local.events[key][ch] : null;
     const boardSetting = (key, ch) => !!globalSettings.events[key][ch];
@@ -1843,6 +1880,9 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     }
 
     function refreshDevice() {
+        for (const radio of document.querySelectorAll('input[name=dev-theme]')) radio.checked = radio.value === local.theme;
+        setText($('dev-theme-note'), local.theme === 'system' ? 'follows the system (' + (systemDark() ? 'dark' : 'light') + ' now)'
+                                                              : 'stays ' + local.theme + ' whatever the system says');
         $('dev-sound').checked = local.sound_enabled;
         const vol = Math.round(effVolume() * 100);
         const volume = $('dev-volume');
@@ -2091,6 +2131,19 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             $('tab-' + next).focus();
         });
 
+        for (const radio of document.querySelectorAll('input[name=dev-theme]')) {
+            radio.addEventListener('change', (e) => {
+                if (!e.target.checked) return;
+                local.theme = e.target.value;
+                saveLocal();
+                applyTheme();
+                refreshPanel();
+            });
+        }
+        // The system changed its theme while the panel shows what "System" means right now.
+        matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+            if (panelBuilt && $('settings').open) refreshDevice();
+        });
         $('dev-sound').addEventListener('change', (e) => setSound(e.target.checked));
         $('dev-volume').addEventListener('input', (e) => {
             local.volume = Number(e.target.value) / 100;
@@ -2153,6 +2206,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         addEventListener('storage', (e) => {
             if (e.key !== LOCAL_KEY) return;
             local = loadLocal();
+            applyTheme();
             refreshPanel();
             updateAttention();
             applyStreamAudio(false);
@@ -2821,6 +2875,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         const r = route();
         view = r.view;
         rid = r.rid || null;
+        applyTheme();
         initPanel();
         $('nf-retry').addEventListener('click', (e) => {
             e.preventDefault();

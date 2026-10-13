@@ -13,6 +13,10 @@ recorders, the detail view, an outage, the reminder, the settings panel, the per
 motion, and the guidance on an insecure page (with a link to the https listener when openssl can make
 a certificate for one).
 
+The theme cases load the base board under each system theme (Firefox's own setting) with a theme chosen on the device
+(or not, or an unknown one): the page must look the chosen theme, the radios and the attribute must say so, every radio
+must work, and another document of the browser changing the choice must be followed.
+
 The live stream's cases (stream_cases) run on boards of their own too (a board has one stream), each with
 tests/lib/fake_ffmpeg.py first on its PATH as `ffmpeg`, so a stream's URL (http://fake.invalid/live, /hang,
 /audio, /hevc?audio=0, /live?die=30...) says how the "source" behaves. They load the boards in iframes of a
@@ -25,7 +29,7 @@ failure paths, parking, going to a request and Back, and an outage. The streampl
 encode H.264, and this Firefox can decode it) plays a real source with the real MediaSource. The existing
 list and detail checks are repeated with a stream open (stream_check_*).
 
-    python3 tests/test_ui.py [base] [v2] [stream]   only those groups of cases (all of them without arguments)
+    python3 tests/test_ui.py [base] [v2] [stream] [theme]   only those groups of cases (all of them without arguments)
     FIREFOX=/path/to/firefox   use that binary
     UI_SHOTS_DIR=DIR           keep every case's screenshot there, for a human look (the stream cases then
                                leave their frames and stream open, so the screenshot shows them)
@@ -436,6 +440,54 @@ def stateful_cases(base, srv, ids):
 # ---------------------------------------------------------------- v2: needs input, alerts, settings
 
 V2_WAIT = 'The staging database has 3 unmigrated rows.\nDrop them, or keep them and migrate by hand?'
+
+
+# The device's theme (tests/ui/theme.js): the case's system theme (Firefox's own setting), and the choice stored on the device
+THEME_CASES = (('theme_sys_light', 'light', None), ('theme_sys_dark', 'dark', None), ('theme_dark_on_light', 'light', 'dark'),
+               ('theme_light_on_dark', 'dark', 'light'), ('theme_junk', 'dark', 'sepia'))
+BODY_TEXT = {'light': 'rgb(28, 33, 40)', 'dark': 'rgb(230, 237, 243)'}
+SURFACE = {'light': 'rgb(255, 255, 255)', 'dark': 'rgb(22, 27, 34)'}
+
+
+def theme_cases(base):
+    res = in_parallel([(name, base, '/', 390, system, 'theme', 6500, '&__local=' + quote(json.dumps({'theme': stored})) if stored else '')
+                       for name, system, stored in THEME_CASES])
+    for name, system, stored in THEME_CASES:
+        assert_theme(name, res[name], system, stored)
+
+
+def assert_theme(name, r, system, stored):
+    S.section(f'theme: the system is {system}, the device has {stored!r} stored')
+    if not got(name, r):
+        return
+    chosen = stored if stored in ('light', 'dark') else None  # an unknown stored value counts as System
+
+    def looks(label, step, theme, attr, radio, note):
+        check(f'{name}: {label}: the page is {theme} (body, text and dialog colours), the colour scheme is {attr or "light dark"}',
+              step['bodyBg'] == BG[theme] and step['bodyColor'] == BODY_TEXT[theme] and step['dialogBg'] == SURFACE[theme]
+              and step['scheme'] == (attr or 'light dark'), step)
+        check(f'{name}: {label}: the attribute is {attr!r} and the {radio} radio is checked; the note says "{note}"',
+              step['attr'] == attr and step['radio'] == radio and step['note'] == note, step)
+
+    follows = f'follows the system ({system} now)'
+    ini = r['initial']
+    check(f'{name}: the browser\'s own theme is the one the case set; the radios are System, Light, Dark', ini['systemDark'] is (system == 'dark')
+          and ini['radios'] == ['system', 'light', 'dark'], ini)
+    looks('at load', ini, chosen or system, chosen, chosen or 'system', f'stays {chosen} whatever the system says' if chosen else follows)
+    looks('Dark picked', r['dark'], 'dark', 'dark', 'dark', 'stays dark whatever the system says')
+    looks('Light picked', r['light'], 'light', 'light', 'light', 'stays light whatever the system says')
+    looks('System picked', r['system'], system, None, 'system', follows)
+    check(f'{name}: the choices are stored on the device', [r['dark']['stored'], r['light']['stored'], r['system']['stored']] == ['dark', 'light', 'system'],
+          [r['dark']['stored'], r['light']['stored'], r['system']['stored']])
+    looks('another tab chose Dark', r['otherDark'], 'dark', 'dark', 'dark', 'stays dark whatever the system says')
+    looks('another tab chose Light', r['otherLight'], 'light', 'light', 'light', 'stays light whatever the system says')
+    looks('another tab chose System', r['otherSystem'], system, None, 'system', follows)
+    looks('another tab stored an unknown theme: System', r['otherJunk'], system, None, 'system', follows)
+    looks('back to the first choice', r['back'], chosen or system, chosen, chosen or 'system', f'stays {chosen} whatever the system says' if chosen else follows)
+    check(f'{name}: the script that applies the stored choice is in the head, before the stylesheet', r['headScriptFirst'] is True)
+    check(f'{name}: and it does: a stored Light or Dark is on <html> before the body exists, so there is no flash of the other theme; nothing is set for System',
+          (r['firstSet'] == {'value': chosen, 'bodyYet': False}) if chosen else r['firstSet'] is None, r['firstSet'])
+    check(f'{name}: no JS errors', r['errors'] == [], r['errors'])
 
 
 def seed_v2(base: str) -> dict:
@@ -1122,7 +1174,7 @@ def assert_streampanel(r):
     st, o = r['start'], r['open']
     check('panel: two boards play muted (held), nothing saved yet', st['a']['held'] == st['b']['held'] == 'sound' and st['stored'] == {}, st)
     check('panel: the dialog is titled Settings (the gear too), has a Live stream block after Sound with the switch on, the volume at 100%, and the "muted by the browser" note',
-          o['dialog'] and o['title'] == 'Settings' and o['gear'] == 'Settings' and o['heading'][:2] == ['Sound', 'Live stream'] and o['checked'] is True and o['volume'] == '100'
+          o['dialog'] and o['title'] == 'Settings' and o['gear'] == 'Settings' and 'Sound' in o['heading'] and o['heading'][o['heading'].index('Sound'):][:2] == ['Sound', 'Live stream'] and o['checked'] is True and o['volume'] == '100'
           and o['volumeText'] == '100%' and o['heldNote'] is True, o)
     off = r['off']
     check('panel: the switch off: saved as stream_audio false; both boards muted with nothing held; the slider and the note go', off['stored']['stream_audio'] is False and off['checkbox'] is False
@@ -1329,10 +1381,11 @@ def assert_streamplay(r, up, name='streamplay'):
 
 
 if __name__ == '__main__':
-    # python3 tests/test_ui.py [base] [v2] [stream]: only those groups of cases (every one without arguments)
-    groups = set(sys.argv[1:]) or {'base', 'v2', 'stream'}
-    if groups - {'base', 'v2', 'stream'}:
-        sys.exit(f'usage: test_ui.py [base] [v2] [stream]   (no argument: all); not a group: {sorted(groups - {"base", "v2", "stream"})}')
+    # python3 tests/test_ui.py [base] [v2] [stream] [theme]: only those groups of cases (every one without arguments)
+    every = {'base', 'v2', 'stream', 'theme'}
+    groups = set(sys.argv[1:]) or every
+    if groups - every:
+        sys.exit(f'usage: test_ui.py [base] [v2] [stream] [theme]   (no argument: all); not a group: {sorted(groups - every)}')
     env = clean_env(UI_RESULTS_DIR=RESULTS)
     board = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', str(STALE_AFTER), script=UI / 'harness.py',
                           name='ui', env=env).start()
@@ -1346,6 +1399,8 @@ if __name__ == '__main__':
             ids = seed(board.url, board.db)
             read_only_cases(board.url, empty.url, ids)
             stateful_cases(board.url, board, ids)
+        if 'theme' in groups:
+            theme_cases(board.url)
         if 'v2' in groups:
             v2_cases(env)
         if 'stream' in groups:

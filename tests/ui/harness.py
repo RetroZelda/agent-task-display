@@ -17,7 +17,8 @@ Hooks:
   POST /__settings_file    writes the posted bytes into the board's settings file, as a hand edit would
   GET  /__test/NAME.js     serves tests/ui/NAME.js
   A page URL with ?__test=NAME[&__wait=MS] is served with, injected: a shim at the top of <head>
-  that records alert/confirm calls (confirm answers yes) and JS errors, and before </body> the
+  that records alert/confirm calls (confirm answers yes) and JS errors (and, as window.__themeFirst, when <html>
+  first got a data-theme: its value, and whether <body> existed yet), and before </body> the
   test script (after _lib.js, its helpers) plus the slow <img>. More query options for the shim:
     __stub=1               Notification and AudioContext replaced by recorders (window.__rec: notes,
                            closes, tones, nodes, perms); __perm=default|granted|denied (default granted);
@@ -92,6 +93,18 @@ window.alert = function (m) { __alerts.push('alert:' + m); };
 window.confirm = function (m) { __alerts.push('confirm:' + m); return true; };
 addEventListener('error', function (e) { __errors.push(String(e.message)); });
 addEventListener('unhandledrejection', function (e) { __errors.push('rejection: ' + String(e.reason)); });
+// When <html> first gets a data-theme, and whether <body> existed yet: the head script must set a stored theme before the page is built.
+try {
+    new MutationObserver(function (records, observer) {
+        for (var i = 0; i < records.length; i++) {
+            if (records[i].attributeName === 'data-theme') {
+                window.__themeFirst = { value: document.documentElement.getAttribute('data-theme'), bodyYet: !!document.body };
+                observer.disconnect();
+                return;
+            }
+        }
+    }).observe(document.documentElement, { attributes: true });
+} catch (e) { /* no observer: the case that reads it fails, loudly */ }
 (function () {
     var q = new URLSearchParams(location.search);
     try { if (!q.get('__keep')) localStorage.clear(); if (q.get('__local')) localStorage.setItem('taskstatus.settings.local', q.get('__local')); } catch (e) {}

@@ -13,7 +13,7 @@ one `curl` line.
 ## Features
 
 - **Live progress**: requests and their tasks, with percent, hint, ETA, elapsed time, X/Y counts and
-  stale detection, on a dashboard that works on a phone and follows the system's dark mode.
+  stale detection, on a dashboard that works on a phone and follows the system's dark mode (or stays light or dark, as you choose per device).
 - **Needs input**: an agent that stops to ask you something flags it first (`taskctl ask`). The
   request pulses, shows the question and sorts to the top until the agent resumes.
 - **Notifications**: per kind of event, a row highlight, an unread counter and blinking tab title,
@@ -248,11 +248,11 @@ The full wording, including the template for agents that register themselves, is
   system asks for reduced motion), carry a *needs input* badge and show the agent's question. The
   summary line starts with how many are waiting for you.
 - The page polls every 1.5 s, and every 5 s in a background tab, so notifications and the tab title
-  keep working while you look elsewhere. It follows the system's light or dark theme and works at
-  phone width.
+  keep working while you look elsewhere. It follows the system's light or dark theme, unless this
+  device's Settings say Light or Dark, and works at phone width.
 - **Mark done**, **Mark failed** and **Delete** act on a request. **Clear** deletes the finished
-  requests listed. **Agent setup** opens `/api/usage`. The gear button opens the **Settings** (alerts
-  and the live stream's sound), and the bell turns this device's sound on or off.
+  requests listed. **Agent setup** opens `/api/usage`. The gear button opens the **Settings** (the
+  theme, alerts and the live stream's sound), and the bell turns this device's sound on or off.
 - While a [live stream](#live-stream) is open, the dashboard shares the window with it and scrolls on its own.
 
 ## Notifications and settings
@@ -287,7 +287,10 @@ The **Alerts** settings (the gear button in the top bar) have two tabs:
   board-wide value until you set it on or off. Sound and notifications are also off on every device
   until you switch them on there, because a browser only plays sound or asks for notification
   permission after you click something. This tab also has the volume, a test sound and the remind
-  interval.
+  interval, and the **theme**: *System* follows the browser's own light or dark setting (the
+  default), *Light* and *Dark* stay as chosen whatever it says. The choice is kept per browser, so a
+  wall display can stay dark while a laptop follows its desktop; other tabs of the same browser follow
+  it at once.
 
 Writes replayed from an agent's [offline queue](#offline-queue) highlight their rows but never chime
 or notify: they are old news.
