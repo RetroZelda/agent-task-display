@@ -168,7 +168,7 @@ a:focus-visible, button:focus-visible, .row:focus-visible { outline: 2px solid v
 .seq:hover { color: var(--text); text-decoration: underline; }
 .bar { height: 8px; margin: 8px 0 6px; background: var(--track); border-radius: 4px; overflow: hidden; }
 .fill { height: 100%; width: 0; background-color: var(--c); border-radius: inherit; transition: width .6s ease, background-color .3s; }
-/* The stripes move by a timer (stepStripes), not a CSS animation: see there. */
+/* The stripes move once a second from the page's tick (stepStripes), not by a CSS animation: see there. */
 [data-status=running] > .bar > .fill, .bar.indeterminate > .fill {
     background-image: linear-gradient(45deg, rgba(255,255,255,.22) 25%, transparent 25%, transparent 50%,
         rgba(255,255,255,.22) 50%, rgba(255,255,255,.22) 75%, transparent 75%, transparent);
@@ -589,8 +589,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     const WRITE_TIMEOUT_MS = 10000;
     const BANNER_AFTER_FAILS = 2;
     const TICK_MS = 500;
-    const STRIPE_STEP_MS = 125;         // the running bars' stripes move this often (stepStripes)
-    const STRIPED = '[data-status=running] > .bar > .fill, .bar.indeterminate > .fill';   // the bars with stripes (the CSS's)
+    const STRIPED ='[data-status=running] > .bar > .fill, .bar.indeterminate > .fill';   // the bars with stripes (the CSS's)
     const ALERT_TICK_MS = 1500;         // the tab title alternates and the reminder is checked at this pace
     const CHIME_GAP_MS = 2000;          // sounds never start closer together than this
     const HELD_CHIME_MS = 60000;        // a chime asked for while the browser held the audio plays on the unlock this soon after
@@ -936,15 +935,17 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         setAttr(bar, 'aria-valuenow', indeterminate ? null : String(Math.floor(percent)));
     }
 
-    // The stripes of the running bars move 2px at a time, 8 times a second, from this one timer (the CSS puts them
-    // at --stripe, and keeps them still where they should not move). A CSS animation, of the background or of a
-    // transform, has the browser draw the page at the screen's full rate for as long as a bar runs: on a slow device
-    // (a photo frame) that took three times what everything else did, a live video included. A step now and then
-    // costs a fraction of it and still reads as moving.
-    let stripeX = 0;
-    function stepStripes() {
-        if (document.hidden) return;
-        stripeX = (stripeX + 2) % 16;
+    // The stripes of the running bars move 4px a second, from tick(), in the same update as the clock and the running
+    // timers (the CSS puts them at --stripe, and keeps them still where they should not move). What a slow device (a
+    // photo frame) pays for is each repaint of the board, not its size: a CSS animation, of the background or of a
+    // transform, repaints at the screen's full rate for as long as a bar runs, and even 8 steps a second took 40% of
+    // that frame's main thread. A step in a repaint the second's new time makes anyway costs next to nothing.
+    let stripeX = 0, stripeSecond = 0;
+    function stepStripes(now) {
+        const second = Math.floor(now);
+        if (second === stripeSecond) return;
+        stripeSecond = second;
+        stripeX = (stripeX + 4) % 16;
         for (const fill of document.querySelectorAll(STRIPED)) fill.style.setProperty('--stripe', stripeX + 'px');
     }
 
@@ -1500,6 +1501,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         if (view === 'detail' && headRefs && lastData) tickHeader(now);
         tickStream(now);
         renderClock(now);
+        stepStripes(now);
         updateBanner();
     }
 
@@ -3158,7 +3160,6 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             if (e.target instanceof Element && e.target.closest('a[href]')) saveBoardScroll();
         }, true);
         setInterval(tick, TICK_MS);
-        setInterval(stepStripes, STRIPE_STEP_MS);
         clock.set(alertTick, ALERT_TICK_MS);
         loadSettings();
         poll();
