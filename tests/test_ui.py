@@ -881,7 +881,8 @@ def assert_panel(r, srv):
 # ---------------------------------------------------------------- the live stream
 
 STREAM_JSON = {'Content-Type': 'application/json'}
-STREAM_NAMES = ('layout', 'audio', 'held', 'swap', 'retry', 'multi', 'panel', 'hevc', 'player', 'fault', 'life', 'nav', 'offline', 'odd', 'check')
+STREAM_NAMES = ('layout', 'audio', 'held', 'swap', 'retry', 'multi', 'panel', 'hevc', 'player', 'fault', 'life', 'nav', 'offline', 'odd', 'check',
+                'layoutold', 'audioold')
 RESULTS_STREAM: dict = {}
 
 
@@ -958,6 +959,9 @@ def _stream_cases(boards, play):
              frame_case('layout', 36000), frame_case('nav', 30000), frame_case('life', 24000), frame_case('held', 30000),
              frame_case('swap', 22000), frame_case('hevc', 20000), frame_case('odd', 32000), frame_case('audio', 14000),
              frame_case('multi', 14000), frame_case('panel', 30000),
+             # the same two scripts on boards read as a browser without dvh units reads them (Chrome before 108)
+             ('streamlayoutold', boards['layoutold'].url, '/__frame', 1280, 'light', 'streamlayout', 36000, keep + '&__nodvh=1', (), 900),
+             ('streamaudioold', boards['audioold'].url, '/__frame', 1280, 'light', 'streamaudio', 14000, keep + '&__nodvh=1', (), 900),
              ('stream_check_390', check_board, '/', 390, 'light', 'check', 7000, '', (), 900),
              ('stream_check_1280_dark', check_board, '/', 1280, 'dark', 'check', 7000, '', (), 900),
              ('stream_check_844x390', check_board, '/', 844, 'light', 'check', 7000, '', (), 390),
@@ -972,6 +976,8 @@ def _stream_cases(boards, play):
 
     assert_streamlayout(res['streamlayout'])
     assert_streamaudio(res['streamaudio'])
+    assert_streamlayout(res['streamlayoutold'], 'streamlayoutold', 'layout without dvh', ' (a browser without dvh units)')
+    assert_streamaudio(res['streamaudioold'], 'streamaudioold', 'audio without dvh', ' (a browser without dvh units)')
     assert_streamheld(res['streamheld'])
     assert_streamswap(res['streamswap'])
     assert_streamretry(res['streamretry'])
@@ -1012,66 +1018,66 @@ def _stream_cases(boards, play):
 
 # ---- assertions
 
-def assert_streamlayout(r):
-    S.section('stream: where the pane goes, how big it is, and what it says')
-    if not got('streamlayout', r):
+def assert_streamlayout(r, name='streamlayout', tag='layout', note=''):
+    S.section('stream: where the pane goes, how big it is, and what it says' + note)
+    if not got(name, r):
         return
     n, p, land, rel = r['none'], r['hangPortrait'], r['hangLandscape'], r['reloaded']
-    check('layout: with no stream there is no pane and no .streaming class, and the board has its old layout', n['hidden'] is True and n['streaming'] is False
+    check(f'{tag}: with no stream there is no pane and no .streaming class, and the board has its old layout', n['hidden'] is True and n['streaming'] is False
           and r['noneDoc'] == {'cls': '|', 'scrollW': 390, 'clientW': 390}, (n['hidden'], r['noneDoc']))
-    check('layout: a stream that does not connect: a black pane, half the window, below the board in portrait (390x844: 390x422)',
+    check(f'{tag}: a stream that does not connect: a black pane, half the window, below the board in portrait (390x844: 390x422)',
           p['streaming'] and p['state'] == 'connecting' and at(p, 0, 422, 390, 422) and p['bg'] == 'rgb(0, 0, 0)' and p['board']['h'] == 422, p)
-    check('layout: the pane says exactly "connecting to <url>...", the timer on a line of its own, and nothing else',
+    check(f'{tag}: the pane says exactly "connecting to <url>...", the timer on a line of its own, and nothing else',
           p['line'] == 'connecting to http://fake.invalid/hang...' and secs(p['timer']) is not None and p['title'] is None and not p['chip'], (p['line'], p['timer'], p['title']))
-    check('layout: the timer counts (a status and a timer role, and a label on the pane)', None not in map(secs, r['hangTimer']) and secs(r['hangTimer'][1]) - secs(r['hangTimer'][0]) >= 1
+    check(f'{tag}: the timer counts (a status and a timer role, and a label on the pane)', None not in map(secs, r['hangTimer']) and secs(r['hangTimer'][1]) - secs(r['hangTimer'][0]) >= 1
           and r['hangRoles'] == ['status', 'timer', 'Live stream'], (r['hangTimer'], r['hangRoles']))
-    check('layout: landscape (844x390): the pane is on the right, half the width, the board beside it (a phone layout in a 422px board)',
+    check(f'{tag}: landscape (844x390): the pane is on the right, half the width, the board beside it (a phone layout in a 422px board)',
           at(land, 422, 0, 422, 390) and land['bg'] == 'rgb(0, 0, 0)' and land['board']['w'] == 422 and land['setupWide'] == 'none'
           and land['docScroll'] == 0 and land['boardScroll'] == 0, land)
-    check('layout: a reloaded board goes on from the server\'s clock: its timer has not started over',
+    check(f'{tag}: a reloaded board goes on from the server\'s clock: its timer has not started over',
           rel['streaming'] and secs(rel['timer']) is not None and secs(rel['timer']) >= secs(land['timer']) and secs(rel['timer']) >= 4, (land['timer'], rel['timer']))
     vl, vp, vw, vt = r['videoLandscape'], r['videoPortrait'], r['videoWide'], r['videoTall']
-    check('layout: the video, 16:9, landscape 844x390: half the width (the picture is letterboxed inside: object-fit contain)',
+    check(f'{tag}: the video, 16:9, landscape 844x390: half the width (the picture is letterboxed inside: object-fit contain)',
           vl['state'] == 'video' and at(vl, 422, 0, 422, 390) and vl['fit'] == 'contain' and vl['line'] == '' and vl['videos'] == 1 and vl['video']['opacity'] == '1', vl)
-    check('layout: the video, 16:9, portrait 390x844: the whole width, the height the ratio gives (219.4), at the bottom',
+    check(f'{tag}: the video, 16:9, portrait 390x844: the whole width, the height the ratio gives (219.4), at the bottom',
           at(vp, 0, 844 - 390 * 9 / 16, 390, 390 * 9 / 16) and abs(vp['board']['h'] + vp['rect']['h'] - 844) < 0.01 and vp['ar'] == '1.7778', vp)
-    check('layout: the video, 16:9, landscape 1280x800: half the width (640)', at(vw, 640, 0, 640, 800), vw)
-    check('layout: the video, 16:9, portrait 800x1280: the ratio gives 450 of the 640 allowed', at(vt, 0, 1280 - 450, 800, 450), vt)
+    check(f'{tag}: the video, 16:9, landscape 1280x800: half the width (640)', at(vw, 640, 0, 640, 800), vw)
+    check(f'{tag}: the video, 16:9, portrait 800x1280: the ratio gives 450 of the 640 allowed', at(vt, 0, 1280 - 450, 800, 450), vt)
     tp, tw = r['sourceTallPortrait'], r['sourceTallWide']
-    check('layout: the video, 9:16, portrait 390x844: capped at half the window (422), the width of the window', tp['state'] == 'video' and at(tp, 0, 422, 390, 422) and tp['ar'] == '0.5625', tp)
-    check('layout: the video, 9:16, landscape 1280x800: as wide as the ratio asks (450 of the 640 allowed)', at(tw, 830, 0, 450, 800), tw)
+    check(f'{tag}: the video, 9:16, portrait 390x844: capped at half the window (422), the width of the window', tp['state'] == 'video' and at(tp, 0, 422, 390, 422) and tp['ar'] == '0.5625', tp)
+    check(f'{tag}: the video, 9:16, landscape 1280x800: as wide as the ratio asks (450 of the 640 allowed)', at(tw, 830, 0, 450, 800), tw)
     mk = r['markup']
-    check('layout: markup in the URL is shown as text: the pane has the URL\'s characters, no <img>, no alert', mk['line'] == f"connecting to {mk['want']}..."
+    check(f'{tag}: markup in the URL is shown as text: the pane has the URL\'s characters, no <img>, no alert', mk['line'] == f"connecting to {mk['want']}..."
           and mk['imgs'] == 0 and mk['alerts'] == [], (mk['line'], mk['imgs'], mk['alerts']))
     sc = r['secret']
-    check('layout: a password in the URL is shown as ***@, in the pane and its tooltip', sc['line'] == 'connecting to http://***@fake.invalid/hang...'
+    check(f'{tag}: a password in the URL is shown as ***@, in the pane and its tooltip', sc['line'] == 'connecting to http://***@fake.invalid/hang...'
           and 'pw' not in sc['text'].replace('\n', ' ').split('http://***@')[-1].replace('fake.invalid/hang', ''), sc['text'])
     c = r['closed']
-    check('layout: closed, the pane is gone and the board has the window again; no media request follows', r['deleteStatus'] == 200 and c['streaming'] is False and c['hidden'] is True
+    check(f'{tag}: closed, the pane is gone and the board has the window again; no media request follows', r['deleteStatus'] == 200 and c['streaming'] is False and c['hidden'] is True
           and c['doc'] == {'cls': '|', 'scrollW': 390, 'clientW': 390} and c['mediaRequests'] == 0, (r['deleteStatus'], c['doc'], c['mediaRequests']))
-    check('layout: no JS errors', r['errors'] == [[], []], r['errors'])
+    check(f'{tag}: no JS errors', r['errors'] == [[], []], r['errors'])
 
 
-def assert_streamaudio(r):
-    S.section('stream: audio only')
-    if not got('streamaudio', r):
+def assert_streamaudio(r, name='streamaudio', tag='audio', note=''):
+    S.section('stream: audio only' + note)
+    if not got(name, r):
         return
     p, l, ph, w = r['portrait'], r['landscape'], r['phone'], r['wide']
-    check('audio: an audio-only stream is "audio connected" (exactly), a black pane, no timer; the player asked for the audio MIME',
+    check(f'{tag}: an audio-only stream is "audio connected" (exactly), a black pane, no timer; the player asked for the audio MIME',
           all(x['state'] == 'audio' and x['line'] == 'audio connected' and x['bg'] == 'rgb(0, 0, 0)' for x in (p, l, ph, w)) and r['timerShown'] == 'none'
           and r['type'] == 'audio/mp4; codecs="mp4a.40.2"' and r['plays'] == [[False, 'ok']], (p['line'], r['timerShown'], r['type'], r['plays']))
-    check('audio: 15% of the window: the height in portrait 390x844 (126.6) at the bottom', at(p, 0, 844 - 126.6, 390, 126.6), p)
-    check('audio: 15% of the window: the width in landscape 844x390 (126.6) on the right', at(l, 844 - 126.6, 0, 126.6, 390), l)
-    check('audio: 15% of the window: 100 wide at 667x375, 192 at 1280x800', at(ph, 667 - 100.05, 0, 100.05, 375) and at(w, 1280 - 192, 0, 192, 800), (ph['rect'], w['rect']))
+    check(f'{tag}: 15% of the window: the height in portrait 390x844 (126.6) at the bottom', at(p, 0, 844 - 126.6, 390, 126.6), p)
+    check(f'{tag}: 15% of the window: the width in landscape 844x390 (126.6) on the right', at(l, 844 - 126.6, 0, 126.6, 390), l)
+    check(f'{tag}: 15% of the window: 100 wide at 667x375, 192 at 1280x800', at(ph, 667 - 100.05, 0, 100.05, 375) and at(w, 1280 - 192, 0, 192, 800), (ph['rect'], w['rect']))
     held = [r['heldPortrait'], r['heldLandscape'], r['heldPhone'], r['heldWide']]
-    check('audio: held by the browser: the chip says "click for sound" in every size', all(x['held'] == 'sound' and x['chip']['label'] == 'click for sound' for x in held), held)
+    check(f'{tag}: held by the browser: the chip says "click for sound" in every size', all(x['held'] == 'sound' and x['chip']['label'] == 'click for sound' for x in held), held)
 
     def inside(x):
         c, k = x['chip']['rect'], x['rect']
         return c['x'] >= k['x'] - 0.5 and c['y'] >= k['y'] - 0.5 and c['x'] + c['w'] <= k['x'] + k['w'] + 0.5 and c['y'] + c['h'] <= k['y'] + k['h'] + 0.5
-    check('audio: the chip fits the pane in every size, as text where there is room (portrait, 1280 wide) and as its icon in the narrow ones',
+    check(f'{tag}: the chip fits the pane in every size, as text where there is room (portrait, 1280 wide) and as its icon in the narrow ones',
           all(inside(x) for x in held) and [x['chip']['textShown'] for x in held] == [True, False, False, True], [(x['chip']['rect'], x['rect'], x['chip']['textShown']) for x in held])
-    check('audio: no JS errors', r['errors'] == [[]], r['errors'])
+    check(f'{tag}: no JS errors', r['errors'] == [[]], r['errors'])
 
 
 def assert_streamheld(r):

@@ -1,12 +1,14 @@
 // An audio-only stream: "audio connected" in a black pane of 15% of the window (the height below the board in
 // portrait, the width beside it in landscape), at four window sizes; and, where the browser lets only muted playback
 // start, the click-for-sound chip, which must fit the narrow pane of a phone in landscape (as its icon alone).
+// With __nodvh=1 on the /__frame page, the boards are read as a browser without dvh units reads them.
 __t.run(async () => {
     const { sleep, until, pane, size, api, drop } = __t;
     const out = { post: {} }, T0 = Date.now();
+    const old = __t.params.get('__nodvh') ? { __nodvh: '1' } : {};
     out.post.open = (await api('POST', '/api/stream', { url: 'http://fake.invalid/audio' })).status;
 
-    const a = await __t.frame('/', 390, 844, { __media: 'stub', __autoplay: 'allowed' });
+    const a = await __t.frame('/', 390, 844, Object.assign({ __media: 'stub', __autoplay: 'allowed' }, old));
     await until(() => pane(a).state === 'audio', 12000);
     await sleep(500);
     out.portrait = pane(a);
@@ -21,7 +23,7 @@ __t.run(async () => {
     out.timerShown = a.contentWindow.getComputedStyle(a.contentDocument.getElementById('stream-timer')).display;
     drop(a);
 
-    const h = await __t.frame('/', 390, 844, { __media: 'stub', __autoplay: 'muted' });
+    const h = await __t.frame('/', 390, 844, Object.assign({ __media: 'stub', __autoplay: 'muted' }, old));
     await until(() => pane(h).state === 'audio' && pane(h).held, 12000);
     await sleep(300);
     out.heldPortrait = pane(h);

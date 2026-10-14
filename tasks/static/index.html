@@ -289,14 +289,27 @@ body.streaming { height: 100vh; height: 100dvh; overflow: hidden; display: grid;
     grid-template: "board" minmax(0, 1fr) "stream" auto / minmax(0, 1fr); }
 body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: contain; container: board / inline-size; }
 #stream { grid-area: stream; position: relative; overflow: hidden; container: stream / inline-size; background: #000; color: #e6edf3;
-    --ar: 1.7778; height: 50vh; height: 50dvh; }
-#stream[data-state=video] { height: min(50dvh, 100vw / var(--ar)); }
-#stream[data-state=audio] { height: 15dvh; }
+    --ar: 1.7778; height: 50vh; }
+#stream[data-state=video] { height: min(50vh, 100vw / var(--ar)); }
+#stream[data-state=audio] { height: 15vh; }
+/* The dynamic viewport (a phone's toolbars come and go) only where the browser knows dvh (Chrome 108+, Safari 15.4+,
+   Firefox 101+), and in blocks of its own: a value with var() in it is checked only once it is used, so an unknown
+   dvh would win over the vh rule above and then count as unset: no height, a pane that collapses (Chrome 106). */
+@supports (height: 1dvh) {
+    #stream { height: 50dvh; }
+    #stream[data-state=video] { height: min(50dvh, 100vw / var(--ar)); }
+    #stream[data-state=audio] { height: 15dvh; }
+}
 @media (orientation: landscape) {
     body.streaming { grid-template: "board stream" minmax(0, 1fr) / minmax(0, 1fr) auto; }
     #stream { height: auto; width: 50vw; }
-    #stream[data-state=video] { height: auto; width: min(50vw, 100dvh * var(--ar)); }
+    #stream[data-state=video] { height: auto; width: min(50vw, 100vh * var(--ar)); }
     #stream[data-state=audio] { height: auto; width: 15vw; }
+}
+@supports (height: 1dvh) {
+    @media (orientation: landscape) {
+        #stream[data-state=video] { width: min(50vw, 100dvh * var(--ar)); }
+    }
 }
 /* Transparent, not visibility: hidden, until there is a picture: Firefox may not decode a video it considers invisible. */
 #stream video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; opacity: 0; }

@@ -3,11 +3,12 @@
 // in landscape; "connecting to <url>..." and a timer that survives a reload); the video at 16:9 and at 9:16 in every
 // orientation (as big as its aspect ratio asks, at most half); a URL with markup, and one with a password; the stream
 // closed (the board has the whole window again, and no media request goes out). The boards are iframes of a /__frame
-// page, so each one's window is the size the case chooses.
+// page, so each one's window is the size the case chooses. With __nodvh=1 on that page, the boards are read as a
+// browser without dvh units reads them, and every size must come out the same.
 __t.run(async () => {
     const { sleep, until, pane, size, api } = __t;
     const out = { post: {} }, T0 = Date.now();
-    const opts = { __media: 'stub', __autoplay: 'allowed' };
+    const opts = Object.assign({ __media: 'stub', __autoplay: 'allowed' }, __t.params.get('__nodvh') ? { __nodvh: '1' } : {});
     const open = async (url) => { const r = await api('POST', '/api/stream', { url }); return r.status; };
     const settled = (f, state) => until(() => pane(f).state === state && pane(f).streaming, 12000);
     await api('GET', '/__log?clear=1');

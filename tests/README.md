@@ -115,7 +115,8 @@ add `__shim=1` (the shim, but no test script and no slow image), `__media=stub` 
 `__autoplay=allowed|muted|blocked`, `__vw`/`__vh`, `__mse=ms|mms|both|none`, `__open=never` and
 `__rate=N`, `__keep=1` (the shim leaves localStorage alone), `__skew=S` (this browser's clock runs S
 seconds ahead of the board's), `__tune=STREAM_X:N` (a page constant given another value, so a timer
-of minutes is tested in seconds) and `__shot=1`, and two hooks, `/__frame?__test=NAME` and
+of minutes is tested in seconds), `__nodvh=1` (the page's `dvh` units renamed to one no browser knows: the page
+as a browser without them reads it, Chrome before 108) and `__shot=1`, and two hooks, `/__frame?__test=NAME` and
 `/__stream?url=...|raw=...|off=1` (which makes `/api/events` carry a stream object of the test's
 own, an odd one included). `ui/harness.py`'s docstring documents them all. Two hooks change the
 board under the page: `/__offline?ms=N` drops every connection without an `X-Test` header for N ms
@@ -137,7 +138,8 @@ sound, the volume and the quality, which restarts the player on the lighter copy
 appends never catch up, the jump to the live edge, trimming, a full buffer, stalls, ManagedMediaSource), `streamfault`, `streamlife` (hidden tabs, the page cache), `streamnav` (scroll position
 and deep links in the split window), `streamoffline`, `streamodd` (a board that answers oddly), and `streamplay`
 (a real source through the real MediaSource, when ffmpeg can encode H.264 and this Firefox can decode it);
-`stream_check_*` repeat the generic page check with a stream open. `test_ui.py stream` runs just this group
+`streamlayoutold` and `streamaudioold` run the layout and audio scripts again with `__nodvh=1`, to the same exact
+sizes; `stream_check_*` repeat the generic page check with a stream open. `test_ui.py stream` runs just this group
 (`base`, `v2` and `theme` are the others), and `UI_STREAM_URL=URL` adds `streamreal`: that real source, through a scratch
 board with the real ffmpeg.
 

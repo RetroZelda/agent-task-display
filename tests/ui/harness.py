@@ -31,6 +31,8 @@ Hooks:
     __skew=S               this browser's clock runs S seconds ahead of the board's (Date.now)
     __tune=NAME:N,...      sets page constants (const STREAM_PARK_MS = 60000; becomes 3000), so a timer
                            measured in minutes can be tested in seconds (the page's STREAM_ numbers only)
+    __nodvh=1              the page's dvh units renamed to one no browser knows: the page as a browser without
+                           dynamic viewport units reads it (Chrome before 108, the WebView of Android 6)
   A page URL with ?__shim=1 gets the shim (and the options above) but no test script and no slow image: a
   board that behaves as it would for a user, its load event not held. It is what the stream cases load in
   the frames of /__frame (below), where the slow image belongs to the frame's parent instead.
@@ -178,6 +180,8 @@ def served(base: bytes, q: dict, test: str | None = None, wait: str = '4000') ->
     """base (the page, or the bare frame page) with the shim and, for a test, its script and the slow image."""
     if q.get('__tune'):
         base = tuned(base, q['__tune'][0])
+    if q.get('__nodvh', [''])[0] == '1':
+        base = re.sub(rb'(\d)dvh\b', rb'\1qvh', base)
     shim = SHIM
     if q.get('__media', [''])[0] == 'stub':
         shim += b'<script>' + (UI / '_media.js').read_bytes() + b'</script>'
