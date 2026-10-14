@@ -62,7 +62,7 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
   POST   /api/tasks/{tid}/attention  {message} -> Task + now; a closed task is a 409 {error, status}
   DELETE /api/tasks/{tid}/attention  -> Task + now (idempotent)
   GET    /api/events               ?since=N&limit=1..1000 (500) -> {now, cursor, events, truncated, waiting,
-                                   stale, settings_version, stream} (see Events and Stream)
+                                   stale, settings_version, stream, clock} (see Events and Stream)
   GET    /api/settings             {now, path, version, exists, error, settings, defaults} (see Settings)
   PUT    /api/settings             {settings: {...}, partial} -> the GET shape
   DELETE /api/settings             removes the file (the defaults again) -> the GET shape
@@ -128,7 +128,9 @@ are the entity's after the change (the request's for request-level events), time
   last one returned) or events after since were pruned; otherwise cursor = the last event id. waiting =
   [{request_id, request_title, task_id | null, task_title | null, message, since}] for every attention
   open in a running request, oldest first; stale = [{request_id, request_title}] of running requests
-  stale now; settings_version = the settings' version; stream = the open stream's object, or null (see Stream).
+  stale now; settings_version = the settings' version; stream = the open stream's object, or null (see Stream);
+  clock = {utc_offset, tz}, the board host's time zone now: seconds east of UTC, and its name (EDT, say), so the
+  board's local date and time are now + utc_offset (the dashboard's header shows them).
 
 Replays: taskctl queues writes while the board is unreachable and replays them later with the header
 X-Tasks-Replay: 1. On create request, request and task complete, progress and attention set/clear such a
@@ -280,6 +282,13 @@ log = logging.getLogger('tasks')
 
 def ts():
     return round(time.time(), 3)
+
+
+def board_clock(now):
+    """The board host's time zone at now: its offset from UTC in seconds (east is positive) and its name as the host gives
+    it (EDT, CEST, +03). The board's local date and time are now + utc_offset; the dashboard shows them in its header."""
+    local = time.localtime(now)
+    return {'utc_offset': local.tm_gmtoff or 0, 'tz': _squash(local.tm_zone or '')[:16]}
 
 
 class ApiError(Exception):
@@ -2809,7 +2818,7 @@ class Handler(BaseHTTPRequestHandler):
         version = self.server.settings.current_version()
         now = ts()
         self._reply(200, {'now': now, **self.server.store.events(since, limit, now, self.server.stale_after),
-                          'settings_version': version, 'stream': self.server.stream.snapshot()})
+                          'settings_version': version, 'stream': self.server.stream.snapshot(), 'clock': board_clock(now)})
 
     def h_get_settings(self):
         self._reply(200, self.server.settings.snapshot(ts()))

@@ -17,6 +17,11 @@ The theme cases load the base board under each system theme (Firefox's own setti
 (or not, or an unknown one): the page must look the chosen theme, the radios and the attribute must say so, every radio
 must work, and another document of the browser changing the choice must be followed.
 
+The clock cases run a board of their own whose host is in one time zone (-05:00 all year) while Firefox is in another
+(+09:00): the header must show the board's date and time, ticking and in the board's zone, and the device's own clock
+only when this device chose it; its place in the bar (centred, or on a row of its own where the bar is narrow), the
+radios, another tab changing the choice, and a board that reports no clock.
+
 The live stream's cases (stream_cases) run on boards of their own too (a board has one stream), each with
 tests/lib/fake_ffmpeg.py first on its PATH as `ffmpeg`, so a stream's URL (http://fake.invalid/live, /hang,
 /audio, /hevc?audio=0, /live?die=30...) says how the "source" behaves. They load the boards in iframes of a
@@ -29,7 +34,7 @@ failure paths, parking, going to a request and Back, and an outage. The streampl
 encode H.264, and this Firefox can decode it) plays a real source with the real MediaSource. The existing
 list and detail checks are repeated with a stream open (stream_check_*).
 
-    python3 tests/test_ui.py [base] [v2] [stream] [theme]   only those groups of cases (all of them without arguments)
+    python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock]   only those groups of cases (all of them without arguments)
     FIREFOX=/path/to/firefox   use that binary
     UI_SHOTS_DIR=DIR           keep every case's screenshot there, for a human look (the stream cases then
                                leave their frames and stream open, so the screenshot shows them)
@@ -49,6 +54,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -203,7 +209,7 @@ def seed(base: str, db_path: Path) -> dict:
 # ---------------------------------------------------------------- firefox
 
 def firefox(name: str, base: str, path: str, width: int, theme: str, script: str, wait: int, extra: str = '',
-            prefs: tuple = (), height: int = 900) -> dict | None:
+            prefs: tuple = (), height: int = 900, tz: str = '') -> dict | None:
     if STOPPING:
         return None
     prof = TMP / f'profile-{name}'
@@ -220,7 +226,8 @@ def firefox(name: str, base: str, path: str, width: int, theme: str, script: str
     page, _, frag = path.partition('#')
     sep = '&' if '?' in page else '?'
     url = f'{base}{page}{sep}__test={script}&__name={name}&__wait={wait}{extra}' + (f'#{frag}' if frag else '')
-    env = clean_env(HOME=HOME, MOZ_CRASHREPORTER_DISABLE=1, XDG_CACHE_HOME=HOME / '.cache', XDG_CONFIG_HOME=HOME / '.config')
+    env = clean_env(HOME=HOME, MOZ_CRASHREPORTER_DISABLE=1, XDG_CACHE_HOME=HOME / '.cache', XDG_CONFIG_HOME=HOME / '.config',
+                    **({'TZ': tz} if tz else {}))
     shot = SHOTS / f'{name}.png'
     proc = subprocess.Popen([FIREFOX, '--headless', '--no-remote', '--profile', str(prof), f'--window-size={width},{height}',
                              '--screenshot', str(shot), url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
@@ -487,6 +494,105 @@ def assert_theme(name, r, system, stored):
     check(f'{name}: the script that applies the stored choice is in the head, before the stylesheet', r['headScriptFirst'] is True)
     check(f'{name}: and it does: a stored Light or Dark is on <html> before the body exists, so there is no flash of the other theme; nothing is set for System',
           (r['firstSet'] == {'value': chosen, 'bodyYet': False}) if chosen else r['firstSet'] is None, r['firstSet'])
+    check(f'{name}: no JS errors', r['errors'] == [], r['errors'])
+
+
+# The header clock (tests/ui/clock.js): the board host is in one zone, the browser in another
+CLOCK_BOARD_TZ, CLOCK_BROWSER_TZ = 'EST5', 'Asia/Tokyo'
+CLOCK_CASES = (('clock_board', 1280, '', 'board'), ('clock_skew', 1280, '&__skew=3600', 'skew'),
+               ('clock_device', 1280, '&__local=' + quote(json.dumps({'clock': 'device'})), 'device'),
+               ('clock_narrow', 390, '', 'narrow'), ('clock_mid', 645, '', 'mid'), ('clock_old', 1280, '&__noclock=1', 'old'))
+
+
+def clock_cases():
+    env = clean_env(UI_RESULTS_DIR=RESULTS, TZ=CLOCK_BOARD_TZ)
+    board = ScratchServer(TMP, '--host', '127.0.0.1', script=UI / 'harness.py', name='ui-clock', env=env).start()
+    try:
+        one_request(board.url, 'Clock test request', 1)
+        res = in_parallel([(name, board.url, '/', width, 'light', 'clock', 7500, extra, (), 700, CLOCK_BROWSER_TZ)
+                           for name, width, extra, kind in CLOCK_CASES])
+        for name, width, extra, kind in CLOCK_CASES:
+            assert_clock(name, res[name], kind, width)
+    finally:
+        board.stop()
+
+
+def assert_clock(name, r, kind, width):
+    S.section(f'clock: {name} (the board is in {CLOCK_BOARD_TZ}, the browser in {CLOCK_BROWSER_TZ})')
+    if not got(name, r):
+        return
+    board_zone, device_zone, b_off, d_off = ('EST',), ('GMT+9', 'JST'), -18000, 32400
+    start, ini = r['start'], r['initial']
+
+    def board_now(st):  # the board's clock when the page took st, from the board's own answer at the start
+        return start['apiNow'] + (st['clientNow'] - start['clientNow'])
+
+    def shows(label, st, source):
+        offset, zones = (b_off, board_zone) if source == 'board' else (d_off, device_zone)
+        ref = board_now(st) if source == 'board' else st['clientNow']
+        check(f'{name}: {label}: the {source}\'s clock (zone {"/".join(zones)}, offset {offset}), the instant it is now, a timer to a screen reader',
+              not st['hidden'] and st['source'] == source and st['offset'] == offset and st['zone'] in zones and abs(st['epoch'] - ref) <= 3
+              and st['role'] == 'timer', st)
+        local = int(st['epoch']) + offset
+        when = datetime.fromtimestamp(local, timezone.utc)
+        m = re.search(r'(\d{1,2}):(\d{2}):(\d{2})\s*([AaPp][Mm])?', st['time'])
+        hour = None
+        if m:
+            hour = int(m.group(1)) % 12 + (12 if m.group(4).lower() == 'pm' else 0) if m.group(4) else int(m.group(1))
+        check(f'{name}: {label}: the text is that instant in that zone ({when:%H:%M:%S}, {when:%a %b} {when.day})',
+              m is not None and (hour, int(m.group(2)), int(m.group(3))) == (when.hour, when.minute, when.second)
+              and when.strftime('%a') in st['day'] and when.strftime('%b') in st['day'] and str(when.day) in st['day'], (st['time'], st['day']))
+        want = (f"The board's date and time (EST, UTC-05:00)" if source == 'board'
+                else None)
+        check(f'{name}: {label}: the tooltip says whose clock and which zone', st['title'] == want if want else
+              (st['title'].startswith("This device's date and time (") and st['title'].endswith(', UTC+09:00)')), st['title'])
+        note_ok = (st['note'] == "the board host's zone: EST (UTC-05:00)" if source == 'board'
+                   else re.fullmatch(r"this device's own zone: .+ \(UTC\+09:00\)", st['note']) is not None)
+        check(f'{name}: {label}: the panel names the zone', note_ok, st['note'])
+
+    def hidden(label, st):
+        check(f'{name}: {label}: no clock shown (this board reports none), no box, the panel says so',
+              st['hidden'] is True and st['boxes']['clock'] is None and st['note'] == 'this board does not report its clock', st)
+
+    if kind == 'old':
+        hidden('an older board', ini)
+        check(f'{name}: the Board radio is checked, as the default', ini['radio'] == 'board', ini['radio'])
+        shows('this device picked', r['toDevice'], 'device')
+        hidden('the board\'s picked again', r['toBoard'])
+        shows('another tab chose this device\'s', r['otherDevice'], 'device')
+        hidden('another tab chose the board\'s', r['otherBoard'])
+        hidden('another tab stored an unknown clock: the board\'s', r['otherJunk'])
+    else:
+        source = 'device' if kind == 'device' else 'board'
+        shows('at load', ini, source)
+        check(f'{name}: the radio and the stored choice say {source} (nothing stored when it was never chosen)', ini['radio'] == source
+              and ini['stored'] == ('device' if kind == 'device' else None), (ini['radio'], ini['stored']))
+        check(f'{name}: it ticks: a second or so later it is a second or more on, in the same zone', r['later']['source'] == source
+              and 1 <= r['later']['epoch'] - ini['epoch'] <= 3 and r['later']['offset'] == ini['offset'], (ini['epoch'], r['later']['epoch']))
+        if kind == 'skew':
+            check(f'{name}: this browser\'s clock was an hour ahead of the board\'s, and the clock still shows the board\'s',
+                  3500 < start['clientNow'] - start['apiNow'] < 3700 and abs(ini['epoch'] - board_now(ini)) <= 3, (start, ini['epoch']))
+        shows('this device\'s picked', r['toDevice'], 'device')
+        shows('the board\'s picked again', r['toBoard'], 'board')
+        check(f'{name}: the choices are stored on the device', [r['toDevice']['stored'], r['toBoard']['stored']] == ['device', 'board'],
+              [r['toDevice']['stored'], r['toBoard']['stored']])
+        shows('another tab chose this device\'s', r['otherDevice'], 'device')
+        shows('another tab chose the board\'s', r['otherBoard'], 'board')
+        shows('another tab stored an unknown clock: the board\'s', r['otherJunk'], 'board')
+        shows('back to the first choice', r['back'], source)
+    # where it sits in the bar
+    c = ini['boxes']['clock']
+    if kind != 'old':
+        b = ini['boxes']
+        if kind in ('narrow',):
+            check(f'{name}: a narrow bar ({width}px): the clock has a row of its own under the rest, centred, nothing overflows',
+                  c['y'] >= max(b['bell']['b'], b['brand']['b'], b['setup']['b']) - 0.5 and abs(c['x'] + c['w'] / 2 - width / 2) <= 1.5
+                  and b['top']['h'] > 60 and ini['scroll'][0] <= ini['scroll'][1], (c, b['top'], ini['scroll']))
+        else:
+            check(f'{name}: one row: the clock is centred in the window ({width}px) and in the bar, clear of the brand and of the buttons',
+                  abs(c['x'] + c['w'] / 2 - width / 2) <= 1.5 and abs(c['y'] + c['h'] / 2 - (b['top']['y'] + b['top']['h'] / 2)) <= 2
+                  and c['x'] >= b['conn']['r'] + 8 and c['r'] <= b['bell']['x'] - 8 and b['top']['h'] < 56 and ini['scroll'][0] <= ini['scroll'][1],
+                  (c, b['top'], b['conn'], b['bell']))
     check(f'{name}: no JS errors', r['errors'] == [], r['errors'])
 
 
@@ -1407,11 +1513,11 @@ def assert_streamplay(r, up, name='streamplay'):
 
 
 if __name__ == '__main__':
-    # python3 tests/test_ui.py [base] [v2] [stream] [theme]: only those groups of cases (every one without arguments)
-    every = {'base', 'v2', 'stream', 'theme'}
+    # python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock]: only those groups of cases (every one without arguments)
+    every = {'base', 'v2', 'stream', 'theme', 'clock'}
     groups = set(sys.argv[1:]) or every
     if groups - every:
-        sys.exit(f'usage: test_ui.py [base] [v2] [stream] [theme]   (no argument: all); not a group: {sorted(groups - every)}')
+        sys.exit(f'usage: test_ui.py [base] [v2] [stream] [theme] [clock]   (no argument: all); not a group: {sorted(groups - every)}')
     env = clean_env(UI_RESULTS_DIR=RESULTS)
     board = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', str(STALE_AFTER), script=UI / 'harness.py',
                           name='ui', env=env).start()
@@ -1427,6 +1533,8 @@ if __name__ == '__main__':
             stateful_cases(board.url, board, ids)
         if 'theme' in groups:
             theme_cases(board.url)
+        if 'clock' in groups:
+            clock_cases()
         if 'v2' in groups:
             v2_cases(env)
         if 'stream' in groups:

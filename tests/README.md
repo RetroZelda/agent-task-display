@@ -94,7 +94,7 @@ The suites never touch a real board or a real configuration:
 | `ufw` | `test_ufw.sh` | the launcher's IPv4 and IPv6 firewall detection against fake ufw files: every rule shape, `IPV6=no`, unreadable rule files, ufw disabled or accepting, and what the banner says for each listen address |
 | `install` | `test_install.sh` | a remote agent following the served usage text verbatim in bash, zsh and fish: crafted Host headers, the one-line install (also through a dead proxy), `install-rule`, the installed `taskctl` with only its baked URL, the `CLAUDE_CONFIG_DIR` variant; the usage text's curl examples run in order against the board |
 | `skill_examples` | `test_skill_examples.sh` | every `taskctl` example in `tasks/skill/SKILL.md`, run against a scratch board (under zsh when installed), plus its front matter (what `allowed-tools` pre-approves, and that `run` and `update` are not), its sections and Commands table |
-| `ui` | `test_ui.py` + `ui/` | the dashboard in headless Firefox at phone (390px) and desktop (1280px) widths, light and dark: no horizontal overflow, meta-line separators, every number against the API, agent text never becoming markup, the ticker, deep links, not-found views, the empty board, keyed reconcile, polling while hidden (every 5s), the offline banner, Mark done, Delete, deletion behind the page (its polls stop, the alerts go on), Clear; and v2: needs input (badge, question, pulse, reduced motion, sorting, the summary), the alert engine (notifications, chimes and their 2s gap, device overrides, replayed events, the title and favicon, stale), an outage, the reminder, audio held by the browser until a click (nothing stacked, one chime on the click), the settings panel, the notification permission flow, an insecure page; and, in the `stream` group, the live stream (below), and in the `theme` group the device's theme (System, Light or Dark under each system theme, every radio, another tab changing it, an unknown stored value, and that a stored theme is on `<html>` before the body exists) |
+| `ui` | `test_ui.py` + `ui/` | the dashboard in headless Firefox at phone (390px) and desktop (1280px) widths, light and dark: no horizontal overflow, meta-line separators, every number against the API, agent text never becoming markup, the ticker, deep links, not-found views, the empty board, keyed reconcile, polling while hidden (every 5s), the offline banner, Mark done, Delete, deletion behind the page (its polls stop, the alerts go on), Clear; and v2: needs input (badge, question, pulse, reduced motion, sorting, the summary), the alert engine (notifications, chimes and their 2s gap, device overrides, replayed events, the title and favicon, stale), an outage, the reminder, audio held by the browser until a click (nothing stacked, one chime on the click), the settings panel, the notification permission flow, an insecure page; and, in the `stream` group, the live stream (below), and in the `theme` group the device's theme (System, Light or Dark under each system theme, every radio, another tab changing it, an unknown stored value, and that a stored theme is on `<html>` before the body exists), and in the `clock` group the header clock (a board in one time zone and a browser in another: the board's date and time, ticking, in the board's zone, even with the browser's clock an hour off; the device's own clock only when chosen; its place in the bar at 1280, 645 and 390px; the radios and another tab changing the choice; a board that reports no clock) |
 
 ## How the UI suite works
 
@@ -116,7 +116,7 @@ add `__shim=1` (the shim, but no test script and no slow image), `__media=stub` 
 `__rate=N`, `__keep=1` (the shim leaves localStorage alone), `__skew=S` (this browser's clock runs S
 seconds ahead of the board's), `__tune=STREAM_X:N` (a page constant given another value, so a timer
 of minutes is tested in seconds), `__nodvh=1` (the page's `dvh` units renamed to one no browser knows: the page
-as a browser without them reads it, Chrome before 108) and `__shot=1`, and two hooks, `/__frame?__test=NAME` and
+as a browser without them reads it, Chrome before 108), `__noclock=1` (this page's `/api/events` answers carry no `clock`, as an older board's) and `__shot=1`, and two hooks, `/__frame?__test=NAME` and
 `/__stream?url=...|raw=...|off=1` (which makes `/api/events` carry a stream object of the test's
 own, an odd one included). `ui/harness.py`'s docstring documents them all. Two hooks change the
 board under the page: `/__offline?ms=N` drops every connection without an `X-Test` header for N ms
@@ -140,7 +140,7 @@ and deep links in the split window), `streamoffline`, `streamodd` (a board that 
 (a real source through the real MediaSource, when ffmpeg can encode H.264 and this Firefox can decode it);
 `streamlayoutold` and `streamaudioold` run the layout and audio scripts again with `__nodvh=1`, to the same exact
 sizes; `stream_check_*` repeat the generic page check with a stream open. `test_ui.py stream` runs just this group
-(`base`, `v2` and `theme` are the others), and `UI_STREAM_URL=URL` adds `streamreal`: that real source, through a scratch
+(`base`, `v2`, `theme` and `clock` are the others), and `UI_STREAM_URL=URL` adds `streamreal`: that real source, through a scratch
 board with the real ffmpeg.
 
 ## Layout

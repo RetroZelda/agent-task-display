@@ -252,7 +252,12 @@ The full wording, including the template for agents that register themselves, is
   device's Settings say Light or Dark, and works at phone width.
 - **Mark done**, **Mark failed** and **Delete** act on a request. **Clear** deletes the finished
   requests listed. **Agent setup** opens `/api/usage`. The gear button opens the **Settings** (the
-  theme, alerts, and the live stream's sound and quality), and the bell turns this device's sound on or off.
+  theme, the clock, alerts, and the live stream's sound and quality), and the bell turns this device's sound on or off.
+- **The clock** in the middle of the header is the board host's date and time, in the host's own time zone,
+  not the browser's, so every screen shows the same moment however it is set (on a narrow window it takes a
+  row of its own under the rest). It runs on the board's clock as the page last heard it, so a device whose
+  clock is wrong still shows the right time. Hover it for the zone. **Settings > This device > Clock** can
+  switch a device to its own clock and zone. A board too old to report its zone shows no board clock.
 - While a [live stream](#live-stream) is open, the dashboard shares the window with it and scrolls on its own.
 
 ## Notifications and settings
@@ -290,7 +295,8 @@ The **Alerts** settings (the gear button in the top bar) have two tabs:
   interval, and the **theme**: *System* follows the browser's own light or dark setting (the
   default), *Light* and *Dark* stay as chosen whatever it says. The choice is kept per browser, so a
   wall display can stay dark while a laptop follows its desktop; other tabs of the same browser follow
-  it at once.
+  it at once. The same goes for the **clock** in the header: *The board's* (the default) or *This
+  device's*.
 
 Writes replayed from an agent's [offline queue](#offline-queue) highlight their rows but never chime
 or notify: they are old news.
@@ -529,7 +535,7 @@ shapes, validation, errors and state rules, is the module docstring of
 | POST | `/api/tasks/<tid>/progress` | `{message, percent?, eta_seconds?}` |
 | POST | `/api/tasks/<tid>/complete` | `{status?: done\|failed, message?}` |
 | POST, DELETE | `/api/tasks/<tid>/attention` | Flag one task as waiting for input: `{message}`; clear it |
-| GET | `/api/events` | The event log since a cursor, plus what is waiting and what is stale (`?since=`, `?limit=`) |
+| GET | `/api/events` | The event log since a cursor, plus what is waiting, what is stale, the open stream and the board host's time zone (`clock`: `utc_offset` in seconds and `tz`; `?since=`, `?limit=`) |
 | GET, PUT, DELETE | `/api/settings` | The board-wide notification settings: read, change (`{settings: {...}}`), reset |
 | GET, POST, DELETE | `/api/stream` | The [live stream](#live-stream): read it, open one (`{url}`, replacing any open one), close it |
 | GET | `/api/stream/media` | The open stream as fragmented MP4, an endless response (`?id=`), which the dashboard plays; `&quality=light` or `stills` for a lighter copy |

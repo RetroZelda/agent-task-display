@@ -29,6 +29,7 @@ Hooks:
     __keep=1               the shim leaves localStorage alone (it clears it at every load otherwise, so a
                            second board in the same browser would wipe the first one's settings)
     __skew=S               this browser's clock runs S seconds ahead of the board's (Date.now)
+    __noclock=1            this page's /api/events answers carry no "clock" key, as an older board's do
     __tune=NAME:N,...      sets page constants (const STREAM_PARK_MS = 60000; becomes 3000), so a timer
                            measured in minutes can be tested in seconds (the page's STREAM_ numbers only)
     __nodvh=1              the page's dvh units renamed to one no browser knows: the page as a browser without
@@ -111,6 +112,7 @@ try {
     var q = new URLSearchParams(location.search);
     try { if (!q.get('__keep')) localStorage.clear(); if (q.get('__local')) localStorage.setItem('taskstatus.settings.local', q.get('__local')); } catch (e) {}
     window.__rec = { notes: [], instances: [], closes: [], tones: [], nodes: 0, perms: 0, contexts: 0, gesture: false };
+    if (q.get('__noclock')) { var xhrOpen = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function (method, url) { if (/^\/api\/events/.test(url)) url += (url.indexOf('?') < 0 ? '?' : '&') + '__noclock=1'; return xhrOpen.apply(this, [method, url].concat([].slice.call(arguments, 2))); }; }
     if (Number(q.get('__skew'))) { var realNow = Date.now, skew = Number(q.get('__skew')) * 1000; Date.now = function () { return realNow() + skew; }; }
     if (q.get('__insecure')) Object.defineProperty(window, 'isSecureContext', { configurable: true, get: function () { return false; } });
     if (!q.get('__stub')) return;
@@ -196,11 +198,15 @@ def served(base: bytes, q: dict, test: str | None = None, wait: str = '4000') ->
 class Handler(server.Handler):
     def _reply(self, code, payload):
         injected = STREAM[0]
-        if injected is not None and code == 200 and urlsplit(self.path).path.rstrip('/') == '/api/events':
-            if injected['obj'] is MISSING:
-                payload.pop('stream', None)
-            else:
-                payload['stream'] = injected['obj']
+        split = urlsplit(self.path)
+        if code == 200 and split.path.rstrip('/') == '/api/events':
+            if injected is not None:
+                if injected['obj'] is MISSING:
+                    payload.pop('stream', None)
+                else:
+                    payload['stream'] = injected['obj']
+            if parse_qs(split.query).get('__noclock'):
+                payload.pop('clock', None)
         super()._reply(code, payload)
 
     def _stream_hook(self, q):

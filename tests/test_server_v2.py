@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import socket
@@ -329,7 +330,7 @@ def phase_api():
         S.section('/api/events: baseline, limit, truncated, pruned')
         s, h, b = call('GET', '/api/events')
         check('baseline: events [], cursor = the last id, keys in order', s == 200 and b['events'] == [] and b['truncated'] is False
-              and b['cursor'] > 0 and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream'], b)
+              and b['cursor'] > 0 and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'clock'], b)
         top = b['cursor']
         s, h, b = call('GET', f'/api/events?since={top - 5}&limit=2')
         check('limit 2: two events, truncated, cursor = the last returned', [x['id'] for x in b['events']] == [top - 4, top - 3]
@@ -676,6 +677,39 @@ def phase_prune():
         check('the next passes keep 10000', count() == 10000, count())
 
 
+def phase_clock():
+    S.section("/api/events: the board host's clock (its time zone), for the dashboard's header")
+
+    def zone_now(zone):
+        # what this machine's C library says for the zone right now (the test process takes it on for a moment)
+        old = os.environ.get('TZ')
+        os.environ['TZ'] = zone
+        time.tzset()
+        try:
+            local = time.localtime()
+            return {'utc_offset': local.tm_gmtoff, 'tz': local.tm_zone}
+        finally:
+            if old is None:
+                os.environ.pop('TZ', None)
+            else:
+                os.environ['TZ'] = old
+            time.tzset()
+
+    # POSIX zone strings need no tz database; the three fixed ones are checked against literals (east is positive)
+    fixed = (('UTC0', {'utc_offset': 0, 'tz': 'UTC'}), ('IST-5:30', {'utc_offset': 19800, 'tz': 'IST'}), ('EST5', {'utc_offset': -18000, 'tz': 'EST'}))
+    rules = ('NST3:30NDT,M3.2.0,M11.1.0', 'CET-1CEST,M3.5.0,M10.5.0/3')  # daylight saving: whichever applies today
+    for zone, want in fixed + tuple((z, zone_now(z)) for z in rules):
+        with ScratchServer(TMP, name='clock', env=clean_env(TZ=zone)) as srv:
+            s, h, b = srv.call('GET', '/api/events')
+            check(f'TZ={zone}: clock is {want}', s == 200 and b['clock'] == want, b.get('clock'))
+            check(f'TZ={zone}: the offset is a whole number of seconds and the zone name a short string', type(b['clock']['utc_offset']) is int
+                  and isinstance(b['clock']['tz'], str) and 0 < len(b['clock']['tz']) <= 16, b['clock'])
+            check(f'TZ={zone}: the board\'s local time is now + utc_offset', abs((b['now'] + b['clock']['utc_offset']) - (time.time() + want['utc_offset'])) < 5, b)
+            s, h, b2 = srv.call('GET', f'/api/events?since={b["cursor"]}&limit=1')
+            check(f'TZ={zone}: every events reply carries it, a cursor one too, as the last key', s == 200 and b2['clock'] == want and list(b2)[-1] == 'clock', list(b2))
+        check(f'TZ={zone}: no tracebacks', 'Traceback' not in srv.log_text(), srv.log_text()[-800:])
+
+
 # ---------------------------------------------------------------- migration of a real v1 database
 
 def schema_of(path: Path):
@@ -796,5 +830,6 @@ if __name__ == '__main__':
     phase_stale_expiry()
     phase_settings()
     phase_prune()
+    phase_clock()
     phase_migration()
     sys.exit(S.finish())

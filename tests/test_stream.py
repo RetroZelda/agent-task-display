@@ -898,10 +898,10 @@ def phase_api():
               and b['ffmpeg'] == str(srv.bin / 'ffmpeg') and abs(b['now'] - time.time()) < 5, b)
         check('...JSON, with both X-Tasks headers', h.get('content-type', '').startswith('application/json') and has_headers(h, docs), h)
         s, h, b = call('GET', '/api/events')
-        check('/api/events ends in stream: null', s == 200 and list(b)[-1] == 'stream' and b['stream'] is None
-              and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream'], list(b))
+        check('/api/events carries stream: null, then the clock', s == 200 and list(b)[-2:] == ['stream', 'clock'] and b['stream'] is None
+              and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'clock'], list(b))
         s, h, b = call('GET', '/api/events?since=0')
-        check('...with a cursor too', s == 200 and list(b)[-1] == 'stream', list(b))
+        check('...with a cursor too', s == 200 and list(b)[-2:] == ['stream', 'clock'], list(b))
 
         t0, t = time.time(), time.monotonic()
         s, h, b = srv.post(f'{FAKE}/hang')
@@ -921,7 +921,7 @@ def phase_api():
         s, h, b = call('GET', '/api/stream')
         check('GET /api/stream shows the same object', s == 200 and b['stream'] == st, b)
         s, h, b = call('GET', '/api/events')
-        check('/api/events carries it, as the last key', s == 200 and list(b)[-1] == 'stream' and b['stream'] == st, b.get('stream'))
+        check('/api/events carries it, just before the clock', s == 200 and list(b)[-2] == 'stream' and b['stream'] == st, b.get('stream'))
         check('...and a hand-written spelling of the same URL is the same stream',
               srv.post('HTTP://fake.invalid/hang')[2]['stream']['id'] == st['id'])
 

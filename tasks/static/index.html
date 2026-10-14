@@ -31,6 +31,10 @@
   device > Appearance: System, Light or Dark, kept in this browser). A choice is the data-theme attribute on
   <html>, which the colour tokens below key on; a script in <head> sets it before the first paint, so a device
   that stays dark never flashes light.
+
+  Clock: the header shows the board host's date and time in the middle of the bar (on a row of its own where the bar
+  is narrow): the polls' clock moved by the zone the board reports in /api/events ("clock": utc_offset and tz), so this
+  device's own clock and zone play no part. Settings > This device > Appearance > Clock can switch it to this device's own.
 -->
 <script>
 try {
@@ -90,6 +94,22 @@ code, pre, .mono { font-family: var(--mono); }
     border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
 .icon-btn:hover { color: var(--text); border-color: var(--muted); }
 .icon-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+/* The header's clock: the date and time centred in the bar (it never grows into the two groups at the sides); on a narrow
+   bar, 640px, a row of its own under them. The second block is for the board beside a stream pane, which is narrow in a
+   window that is not. */
+.top .wrap { position: relative; }
+.clock { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); max-width: calc(100% - 420px); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--muted); }
+.clock-time { margin-left: 8px; color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.clock-zone { margin-left: 6px; }
+@media (max-width: 640px) {
+    .top .wrap { flex-wrap: wrap; padding-top: 8px; padding-bottom: 6px; }
+    .clock { position: static; transform: none; order: 1; flex: 0 0 100%; max-width: none; text-align: center; }
+}
+@container board (max-width: 640px) {
+    .top .wrap { flex-wrap: wrap; padding-top: 8px; padding-bottom: 6px; }
+    .clock { position: static; transform: none; order: 1; flex: 0 0 100%; max-width: none; text-align: center; }
+}
 #bell[aria-pressed=true] { color: var(--text); background: var(--surface-2); }
 #bell[aria-pressed=true] .slash { display: none; }
 #bell[data-held] { border-color: var(--stale); color: var(--stale); }
@@ -397,6 +417,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.4" stroke-width="3.2" stroke-linecap="butt" stroke-dasharray="3.3 3.3"/><circle cx="12" cy="12" r="6.1"/><circle cx="12" cy="12" r="2.1"/></svg>
     </button>
     <a class="setup" href="/api/usage" title="Instructions for agents: the HTTP API, the taskctl CLI, the skill and the CLAUDE.md rule"><span class="wide">Agent </span>setup</a>
+    <div id="clock" class="clock" role="timer" hidden><span id="clock-day" class="clock-day"></span><span id="clock-time" class="clock-time"></span><span id="clock-zone" class="clock-zone"></span></div>
 </div></header>
 <div id="banner" hidden aria-live="polite"><div class="wrap">
     <span id="banner-text"></span>
@@ -483,6 +504,10 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             <label class="check"><input type="radio" name="dev-theme" value="light"> Light</label>
             <label class="check"><input type="radio" name="dev-theme" value="dark"> Dark</label>
             <span id="dev-theme-note" class="inline-note"></span></div>
+        <div class="field" role="radiogroup" aria-labelledby="dev-clock-label"><span class="label" id="dev-clock-label">Clock</span>
+            <label class="check"><input type="radio" name="dev-clock" value="board"> The board's</label>
+            <label class="check"><input type="radio" name="dev-clock" value="device"> This device's</label>
+            <span id="dev-clock-note" class="inline-note"></span></div>
 
         <h3>Sound</h3>
         <div class="field"><label class="check"><input type="checkbox" id="dev-sound"> Play sounds on this device</label><span id="dev-held" class="inline-note" hidden>held by the browser until you click or tap this page</span></div>
@@ -577,6 +602,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     const FINISHED_OPEN_KEY = 'taskstatus.finishedOpen';
     const LOCAL_KEY = 'taskstatus.settings.local';
     const THEMES = ['system', 'light', 'dark'];     // this device's theme: the system's own, or Light or Dark whatever it says
+    const CLOCKS = ['board', 'device'];             // whose clock the header shows: the board host's, or this device's own
     // What this device asks the board for: the stream as the source sends it, or a lighter copy the board makes of it.
     const STREAM_QUALITIES = ['original', 'light', 'stills'];
     const CLAIMS_KEY = 'taskstatus.claims';
@@ -676,6 +702,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     let flashQueue = [];        // highlights waiting for the render that shows their rows
     let remindSince = 0;
     let local = loadLocal();
+    let boardClock = null;      // /api/events "clock" as {offset, tz}: the board host's zone now; null until the board says (or never, an older one)
     let globalSettings = DEFAULTS;
     let boardDefaults = DEFAULTS;
     let settingsMeta = { loaded: false, unsupported: false, path: '', version: '', exists: false, error: null };
@@ -781,6 +808,10 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
                 time: new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
                 day: new Intl.DateTimeFormat([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
                 stamp: new Intl.DateTimeFormat([], { dateStyle: 'medium', timeStyle: 'medium' }),
+                clockDay: new Intl.DateTimeFormat([], { weekday: 'short', month: 'short', day: 'numeric' }),
+                clockTime: new Intl.DateTimeFormat([], { hour: 'numeric', minute: '2-digit', second: '2-digit' }),
+                // not a formatter: this device's zone as the browser names it (GMT+9, EDT), read once per zone
+                zoneName: (new Intl.DateTimeFormat([], { timeZoneName: 'short' }).formatToParts(new Date()).find((p) => p.type === 'timeZoneName') || { value: '' }).value,
             };
         }
         return fmts[name];
@@ -792,6 +823,58 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     }
 
     const fmtStamp = (ts) => ts == null ? '' : dateFmt('stamp').format(new Date(ts * 1000));
+
+    // The header clock: the board host's date and time (the polls' clock moved by the zone the board reported, shown with Intl
+    // in UTC so that this device's own zone plays no part) or, as this device chose, this device's own. The text is written
+    // only when the second, the zone or the choice changes. A board that does not report its zone (an older one) has no clock
+    // of its own to show.
+    const fmtOffset = (s) => 'UTC' + (s < 0 ? '-' : '+') + pad(Math.floor(Math.abs(s) / 3600)) + ':' + pad(Math.floor(Math.abs(s) % 3600 / 60));
+    let boardFmts = null;
+    let clockKey = '';
+
+    function renderClock(now) {
+        const el = $('clock'), board = local.clock !== 'device';
+        if (board && !boardClock) {
+            clockKey = '';
+            setHidden(el, true);
+            return;
+        }
+        const epoch = Math.floor(board ? now : Date.now() / 1000);
+        const at = new Date(epoch * 1000);
+        const offset = board ? boardClock.offset : -at.getTimezoneOffset() * 60;
+        const zone = board ? boardClock.tz : dateFmt('zoneName');
+        const key = (board ? 'b' : 'd') + epoch + '|' + offset + '|' + zone;
+        if (key === clockKey) return;
+        clockKey = key;
+        let day, time;
+        if (board) {
+            if (!boardFmts) {
+                boardFmts = { day: new Intl.DateTimeFormat([], { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' }),
+                              time: new Intl.DateTimeFormat([], { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZone: 'UTC' }) };
+            }
+            const wall = new Date((epoch + offset) * 1000);
+            day = boardFmts.day.format(wall);
+            time = boardFmts.time.format(wall);
+        } else {
+            day = dateFmt('clockDay').format(at);
+            time = dateFmt('clockTime').format(at);
+        }
+        setText($('clock-day'), day);
+        setText($('clock-time'), time);
+        setText($('clock-zone'), zone);
+        setAttr(el, 'data-source', board ? 'board' : 'device');
+        setAttr(el, 'data-offset', String(offset));
+        setAttr(el, 'data-epoch', String(epoch));
+        setAttr(el, 'title', (board ? "The board's" : "This device's") + ' date and time (' + zone + ', ' + fmtOffset(offset) + ')');
+        setHidden(el, false);
+    }
+
+    // The board's /api/events "clock"; none (an older board) means it has no clock of its own to show.
+    function applyBoardClock(raw) {
+        const ok = raw && typeof raw === 'object' && typeof raw.utc_offset === 'number' && Number.isFinite(raw.utc_offset) && Math.abs(raw.utc_offset) <= 18 * 3600;
+        boardClock = ok ? { offset: Math.round(raw.utc_offset), tz: typeof raw.tz === 'string' ? raw.tz.slice(0, 16) : '' } : null;
+        renderClock(serverNow());
+    }
 
     // Remaining time rounds up, so the page never reads "0s left" while time remains.
     function etaInfo(etaAt, now) {
@@ -1068,6 +1151,11 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             if (events) applyStream(events.stream || null);     // an older board has no stream key
         } catch (e) {
             console.error('stream failed', e);
+        }
+        try {
+            if (events) applyBoardClock(events.clock);          // nor a clock key
+        } catch (e) {
+            console.error('clock failed', e);
         }
         if (missing) renderNotFound(missing === 404 ? (loaded ? 'deleted' : 'unknown') : 'invalid', error);
         if (notFound) {
@@ -1411,6 +1499,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         for (const row of rows.values()) row.tick(row, now);
         if (view === 'detail' && headRefs && lastData) tickHeader(now);
         tickStream(now);
+        renderClock(now);
         updateBanner();
     }
 
@@ -1434,7 +1523,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     // This browser's overrides (localStorage); anything malformed falls back to "inherit" or the default.
     function loadLocal() {
         const out = { events: {}, sound_enabled: false, notify_enabled: false, volume: null, remind_every: 120, stream_audio: true, stream_volume: 1,
-                      stream_quality: 'original', theme: 'system' };
+                      stream_quality: 'original', theme: 'system', clock: 'board' };
         let raw = null;
         try {
             raw = JSON.parse(localStorage.getItem(LOCAL_KEY) || 'null');
@@ -1456,6 +1545,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             out.remind_every = Math.round(raw.remind_every);
         }
         if (THEMES.includes(raw.theme)) out.theme = raw.theme;
+        if (CLOCKS.includes(raw.clock)) out.clock = raw.clock;
         if (typeof raw.stream_audio === 'boolean') out.stream_audio = raw.stream_audio;
         if (typeof raw.stream_volume === 'number' && raw.stream_volume >= 0 && raw.stream_volume <= 1) out.stream_volume = raw.stream_volume;
         if (STREAM_QUALITIES.includes(raw.stream_quality)) out.stream_quality = raw.stream_quality;
@@ -1933,6 +2023,9 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         for (const radio of document.querySelectorAll('input[name=dev-theme]')) radio.checked = radio.value === local.theme;
         setText($('dev-theme-note'), local.theme === 'system' ? 'follows the system (' + (systemDark() ? 'dark' : 'light') + ' now)'
                                                               : 'stays ' + local.theme + ' whatever the system says');
+        for (const radio of document.querySelectorAll('input[name=dev-clock]')) radio.checked = radio.value === local.clock;
+        setText($('dev-clock-note'), local.clock === 'device' ? "this device's own zone: " + dateFmt('zoneName') + ' (' + fmtOffset(-new Date().getTimezoneOffset() * 60) + ')'
+                                   : boardClock ? "the board host's zone: " + boardClock.tz + ' (' + fmtOffset(boardClock.offset) + ')' : 'this board does not report its clock');
         $('dev-sound').checked = local.sound_enabled;
         const vol = Math.round(effVolume() * 100);
         const volume = $('dev-volume');
@@ -2196,6 +2289,15 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
                 refreshPanel();
             });
         }
+        for (const radio of document.querySelectorAll('input[name=dev-clock]')) {
+            radio.addEventListener('change', (e) => {
+                if (!e.target.checked) return;
+                local.clock = e.target.value;
+                saveLocal();
+                renderClock(serverNow());
+                refreshPanel();
+            });
+        }
         // The system changed its theme while the panel shows what "System" means right now.
         matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
             if (panelBuilt && $('settings').open) refreshDevice();
@@ -2273,6 +2375,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             const quality = local.stream_quality;
             local = loadLocal();
             applyTheme();
+            renderClock(serverNow());
             refreshPanel();
             updateAttention();
             applyStreamAudio(false);
