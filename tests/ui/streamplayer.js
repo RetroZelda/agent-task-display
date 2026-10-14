@@ -6,7 +6,9 @@
 //    nor one in a hidden tab, until the tab is shown;
 //  - buffered media far behind the playhead is trimmed, up to the playhead minus a margin larger than a GOP; the same
 //    trim with no margin would cut the playing GOP, which the stub (its remove() runs on to the next keyframe, as a
-//    browser's does) shows: the check that the stub can tell.
+//    browser's does) shows: the check that the stub can tell;
+//  - a device that appends slower than the data comes (every append takes 400 ms, a fragment comes every 200 ms) never
+//    sees its queue empty: its first seek comes anyway, after a second, into the data.
 // The trim thresholds are shortened for the case (harness __tune); the margin keeps its proportion to the GOP.
 __t.run(async () => {
     const { sleep, until, pane, api, hide } = __t;
@@ -20,7 +22,14 @@ __t.run(async () => {
     const p = await __t.frame('/', 390, 844, { __media: 'stub', __autoplay: 'blocked' });
     const t = await __t.frame('/', 390, 844, { __media: 'stub', __autoplay: 'allowed', __tune: 'STREAM_TRIM_S:6,STREAM_KEEP_S:3' });
     const bad = await __t.frame('/', 390, 844, { __media: 'stub', __autoplay: 'allowed', __tune: 'STREAM_TRIM_S:6,STREAM_KEEP_S:0' });
-    await until(() => pane(f).state === 'video' && pane(t).state === 'video' && pane(bad).state === 'video' && pane(p).held, 12000);
+    const slow = await __t.frame('/', 390, 844, { __media: 'stub', __autoplay: 'allowed', __append: '400' });
+    await until(() => pane(f).state === 'video' && pane(t).state === 'video' && pane(bad).state === 'video' && pane(p).held
+                && pane(slow).state === 'video', 12000);
+    // (the pane says "video" once the size is known, before the seek: wait for the seek, or five seconds without one)
+    const ms = media(slow);
+    await until(() => ms.seeks.length >= 1, 5000, 50);
+    out.slow = { firstAppend: ms.appends.length ? ms.appends[0].at : null, appends: ms.appends.length, state: pane(slow).state,
+                 seeks: ms.seeks.map((s) => ({ at: s.at, from: s.from, to: s.to, buffered: s.buffered })) };
 
     // steady playback: the one first seek, and where it landed
     await sleep(3000);
@@ -64,7 +73,7 @@ __t.run(async () => {
     const describe = (g) => ({ removes: media(g).removes, snap: media(g).snap(), srcs: media(g).srcs.length, state: pane(g).state });
     out.trim = describe(t);
     out.cut = describe(bad);
-    out.errors = [f, p, t, bad].map((g) => g.contentWindow.__errors.slice());
+    out.errors = [f, p, t, bad, slow].map((g) => g.contentWindow.__errors.slice());
     out.took = Date.now() - out.T0;
     await __t.cleanup();
     await __t.post(out);

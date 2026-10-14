@@ -13,11 +13,12 @@
 // Options (query): __mse=ms|mms|both|none  which of MediaSource and ManagedMediaSource exist (ms)
 //                  __autoplay=allowed|muted|blocked  what play() may do before a gesture: anything, only muted, nothing
 //                  __vw, __vh  the video's size (1920x1080)      __rate=N  media seconds per real second (1)
-//                  __open=never  sourceopen never fires
+//                  __open=never  sourceopen never fires          __append=N  ms an append takes (2): a slow device
 (function () {
     var q = new URLSearchParams(location.search);
     var mseMode = q.get('__mse') || 'ms', autoplay = q.get('__autoplay') || 'allowed';
     var VW = Number(q.get('__vw')) || 1920, VH = Number(q.get('__vh')) || 1080, RATE = Number(q.get('__rate')) || 1;
+    var APPEND_MS = Number(q.get('__append')) || 2;
     var rec = window.__rec.media = {
         elements: 0, created: 0, urls: [], revoked: [], srcs: [], loads: 0, supports: [], opens: 0, inits: 0, plays: [], pauses: [],
         unmutes: [], seeks: [], appends: [], removes: [], aborts: 0, fragments: [], events: [], vw: VW, vh: VH,
@@ -216,7 +217,7 @@
         this.updating = true;
         this.dispatchEvent(new Event('updatestart'));
         var self = this;
-        setTimeout(function () { self.process(u8); }, 2);
+        setTimeout(function () { self.process(u8); }, APPEND_MS);
     };
     FakeSB.prototype.process = function (data) {
         var self = this, all = new Uint8Array(this.rest.length + data.length), bad = false;

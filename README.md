@@ -252,7 +252,7 @@ The full wording, including the template for agents that register themselves, is
   device's Settings say Light or Dark, and works at phone width.
 - **Mark done**, **Mark failed** and **Delete** act on a request. **Clear** deletes the finished
   requests listed. **Agent setup** opens `/api/usage`. The gear button opens the **Settings** (the
-  theme, alerts and the live stream's sound), and the bell turns this device's sound on or off.
+  theme, alerts, and the live stream's sound and quality), and the bell turns this device's sound on or off.
 - While a [live stream](#live-stream) is open, the dashboard shares the window with it and scrolls on its own.
 
 ## Notifications and settings
@@ -394,10 +394,20 @@ so the name must resolve and be reachable from there.
   display that nobody touches can be launched with the browser's autoplay restriction off: Chrome and
   Edge with `--autoplay-policy=no-user-gesture-required`, Firefox with `media.autoplay.default` set to `0`
   in `about:config`.
+- **Quality**: a device that stutters on the stream (a small tablet, an old phone, a photo frame) can ask
+  for a lighter copy in **Settings > This device > Live stream > Quality**: *Light*, at most 854x480 at 15
+  frames a second, or *Stills*, one picture every 2 seconds; both keep the sound. The board host makes
+  each with a second `ffmpeg` that re-encodes the picture as H.264 baseline, which every hardware decoder
+  plays. The first device that asks for a quality starts it, and it stops 10 seconds after the last one
+  leaves, so nothing changes for the devices on *Original* (the default). A running quality costs the
+  board host about half a core for a 1080p source and needs `ffmpeg` with libx264 (Debian's has it);
+  if it cannot run, the pane stays on *connecting* with the reason in its tooltip. The choice is per
+  browser, like the sound. Over the API it is `/api/stream/media?id=<id>&quality=light` (or `stills`).
 - **Browsers**: anything with Media Source Extensions: Chrome, Edge, Firefox, Safari 17.1 and iOS 17.1
   or newer (older iPhones have none). H.264 plays everywhere; HEVC and AV1 are passed through as they
   are, so they play only where the browser can decode them, and otherwise the pane stays on
-  *connecting* with the reason in its tooltip and in `GET /api/stream`.
+  *connecting* with the reason in its tooltip and in `GET /api/stream` (a lighter Quality, which is
+  H.264, plays there).
 - **Trouble**: a run of `ffmpeg` that fails or ends starts again after 1, 2, 4, 8 and then every 10
   seconds, and the pane keeps showing *connecting* with its timer. The reason (`Connection refused`, `Server
   returned 404`, `ffmpeg is not installed on the board host`) is the `error` of `GET /api/stream`. A source that announces audio
@@ -522,7 +532,7 @@ shapes, validation, errors and state rules, is the module docstring of
 | GET | `/api/events` | The event log since a cursor, plus what is waiting and what is stale (`?since=`, `?limit=`) |
 | GET, PUT, DELETE | `/api/settings` | The board-wide notification settings: read, change (`{settings: {...}}`), reset |
 | GET, POST, DELETE | `/api/stream` | The [live stream](#live-stream): read it, open one (`{url}`, replacing any open one), close it |
-| GET | `/api/stream/media` | The open stream as fragmented MP4, an endless response (`?id=`), which the dashboard plays |
+| GET | `/api/stream/media` | The open stream as fragmented MP4, an endless response (`?id=`), which the dashboard plays; `&quality=light` or `stills` for a lighter copy |
 
 Requests and tasks have an `attention` field (`{message, since}` or null); a request also has
 `waiting` and `tasks_waiting`, and the list's counts have `waiting`. A write sent with the header

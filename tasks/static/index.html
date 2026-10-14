@@ -147,15 +147,19 @@ a:focus-visible, button:focus-visible, .row:focus-visible { outline: 2px solid v
 .seq { flex: none; font: 13px var(--mono); color: var(--muted); text-decoration: none; }
 .seq:hover { color: var(--text); text-decoration: underline; }
 .bar { height: 8px; margin: 8px 0 6px; background: var(--track); border-radius: 4px; overflow: hidden; }
-.fill { height: 100%; width: 0; background-color: var(--c); border-radius: inherit; transition: width .6s ease, background-color .3s; }
-[data-status=running] > .bar > .fill, .bar.indeterminate > .fill {
+.fill { position: relative; overflow: hidden; height: 100%; width: 0; background-color: var(--c); border-radius: inherit;
+    transition: width .6s ease, background-color .3s; }
+/* The stripes are a layer one stripe wider than the bar that slides by one stripe: a transform the compositor runs,
+   where an animated background would repaint the page on every frame (a slow device's whole budget). */
+[data-status=running] > .bar > .fill::after, .bar.indeterminate > .fill::after {
+    content: ""; position: absolute; top: 0; bottom: 0; left: -16px; right: 0;
     background-image: linear-gradient(45deg, rgba(255,255,255,.22) 25%, transparent 25%, transparent 50%,
         rgba(255,255,255,.22) 50%, rgba(255,255,255,.22) 75%, transparent 75%, transparent);
     background-size: 16px 16px; animation: stripes 1s linear infinite; }
 .bar.indeterminate > .fill { width: 100% !important; opacity: .35; }
-[data-status=stale] > .bar > .fill, [data-waiting] > .bar > .fill { animation: none; }
-@keyframes stripes { from { background-position: 0 0; } to { background-position: 16px 0; } }
-body.offline .fill { animation: none !important; }
+[data-status=stale] > .bar > .fill::after, [data-waiting] > .bar > .fill::after { animation: none; }
+@keyframes stripes { from { transform: translateX(0); } to { transform: translateX(16px); } }
+body.offline .fill::after { animation: none !important; }
 .hint { margin: 0 0 3px; font-size: 13.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hint .ht { color: var(--text); font-weight: 500; }
 .hint .ht:not(:empty) + .hm:not(:empty)::before { content: " \2014  "; }
@@ -363,7 +367,8 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     .task .pct { margin-left: auto; }
 }
 @media (prefers-reduced-motion: reduce) {
-    .fill { transition: none; animation: none !important; }
+    .fill { transition: none; }
+    .fill::after { animation: none !important; }
     .row.target { animation: none; }
     /* A static strong outline instead of the pulse and the flash */
     .row[data-waiting], .card[data-waiting=request] { animation: none; box-shadow: 0 0 0 2px var(--waiting); }
@@ -380,7 +385,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     <button type="button" class="icon-btn" id="bell" aria-pressed="false" aria-label="Sound on this device" title="Sound on this device: off">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 6 2.5 8 2.5 8h-17S6 15 6 9"/><path d="M10 20.5a2.2 2.2 0 0 0 4 0"/><path class="slash" d="M3.5 3.5l17 17"/></svg>
     </button>
-    <button type="button" class="icon-btn" id="settings-btn" aria-haspopup="dialog" aria-label="Settings" title="Settings: alerts, and the sound of the live stream">
+    <button type="button" class="icon-btn" id="settings-btn" aria-haspopup="dialog" aria-label="Settings" title="Settings: alerts, and the sound and quality of the live stream">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.4" stroke-width="3.2" stroke-linecap="butt" stroke-dasharray="3.3 3.3"/><circle cx="12" cy="12" r="6.1"/><circle cx="12" cy="12" r="2.1"/></svg>
     </button>
     <a class="setup" href="/api/usage" title="Instructions for agents: the HTTP API, the taskctl CLI, the skill and the CLAUDE.md rule"><span class="wide">Agent </span>setup</a>
@@ -484,6 +489,11 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         <h3>Live stream</h3>
         <div class="field"><label class="check"><input type="checkbox" id="dev-stream-audio"> Play the stream's sound on this device</label><span id="dev-stream-held" class="inline-note" hidden>muted by the browser until you click or tap this page</span></div>
         <div class="field"><span class="label">Volume</span><input type="range" id="dev-stream-volume" min="0" max="100" step="5" aria-label="Stream volume on this device"><span id="dev-stream-volume-val" class="mono inline-note"></span></div>
+        <div class="field" role="radiogroup" aria-labelledby="dev-stream-quality-label"><span class="label" id="dev-stream-quality-label">Quality</span>
+            <label class="check"><input type="radio" name="dev-stream-quality" value="original"> Original</label>
+            <label class="check"><input type="radio" name="dev-stream-quality" value="light"> Light</label>
+            <label class="check"><input type="radio" name="dev-stream-quality" value="stills"> Stills</label>
+            <span id="dev-stream-quality-note" class="inline-note"></span></div>
 
         <h3>Browser notifications</h3>
         <p class="note" id="dev-notify-state"></p>
@@ -557,6 +567,8 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     const FINISHED_OPEN_KEY = 'taskstatus.finishedOpen';
     const LOCAL_KEY = 'taskstatus.settings.local';
     const THEMES = ['system', 'light', 'dark'];     // this device's theme: the system's own, or Light or Dark whatever it says
+    // What this device asks the board for: the stream as the source sends it, or a lighter copy the board makes of it.
+    const STREAM_QUALITIES = ['original', 'light', 'stills'];
     const CLAIMS_KEY = 'taskstatus.claims';
     // Live stream
     const STREAM_RETRY_MS = [1000, 2000, 4000, 8000, 10000]; // this page's reconnects, on the worker clock
@@ -565,6 +577,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     const STREAM_STALL_MS = 15000;      // no bytes from the relay for this long: reconnect
     const STREAM_FROZEN_MS = 5000;      // bytes arrive but the buffered end stands still this long: reconnect
     const STREAM_START_MS = 15000;      // data appended but no picture this long after: the pane's tooltip says so
+    const STREAM_FIRST_SEEK_MS = 1000;  // the first seek into the data waits at most this long for the first burst to be in
     const STREAM_LAG_MAX_S = 1.5;       // playing further behind the newest buffered frame than this: jump ...
     const STREAM_LAG_TARGET_S = 0.4;    // ... to this far behind it
     const STREAM_JUMP_GAP_MS = 2000;    // after a jump, wait this long before chasing the live edge again
@@ -747,15 +760,28 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         return Math.floor(s / 86400) + 'd ago';
     }
 
-    function fmtClock(ts) {
-        const d = new Date(ts * 1000), today = new Date(serverNow() * 1000);
-        if (d.toDateString() === today.toDateString()) {
-            return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    // The date formatters, built once (and again when the time zone changes): toLocaleString with options builds a
+    // new one on every call, which on a slow device costs more than the rest of a render.
+    let fmtZone = null, fmts = null;
+    function dateFmt(name) {
+        const zone = new Date().getTimezoneOffset();
+        if (zone !== fmtZone) {
+            fmtZone = zone;
+            fmts = {
+                time: new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+                day: new Intl.DateTimeFormat([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
+                stamp: new Intl.DateTimeFormat([], { dateStyle: 'medium', timeStyle: 'medium' }),
+            };
         }
-        return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        return fmts[name];
     }
 
-    const fmtStamp = (ts) => ts == null ? '' : new Date(ts * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'medium' });
+    function fmtClock(ts) {
+        const d = new Date(ts * 1000), today = new Date(serverNow() * 1000);
+        return dateFmt(d.toDateString() === today.toDateString() ? 'time' : 'day').format(d);
+    }
+
+    const fmtStamp = (ts) => ts == null ? '' : dateFmt('stamp').format(new Date(ts * 1000));
 
     // Remaining time rounds up, so the page never reads "0s left" while time remains.
     function etaInfo(etaAt, now) {
@@ -1385,7 +1411,8 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
 
     // This browser's overrides (localStorage); anything malformed falls back to "inherit" or the default.
     function loadLocal() {
-        const out = { events: {}, sound_enabled: false, notify_enabled: false, volume: null, remind_every: 120, stream_audio: true, stream_volume: 1, theme: 'system' };
+        const out = { events: {}, sound_enabled: false, notify_enabled: false, volume: null, remind_every: 120, stream_audio: true, stream_volume: 1,
+                      stream_quality: 'original', theme: 'system' };
         let raw = null;
         try {
             raw = JSON.parse(localStorage.getItem(LOCAL_KEY) || 'null');
@@ -1409,6 +1436,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         if (THEMES.includes(raw.theme)) out.theme = raw.theme;
         if (typeof raw.stream_audio === 'boolean') out.stream_audio = raw.stream_audio;
         if (typeof raw.stream_volume === 'number' && raw.stream_volume >= 0 && raw.stream_volume <= 1) out.stream_volume = raw.stream_volume;
+        if (STREAM_QUALITIES.includes(raw.stream_quality)) out.stream_quality = raw.stream_quality;
         return out;
     }
 
@@ -1898,6 +1926,12 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         streamVol.disabled = !local.stream_audio;
         setText($('dev-stream-volume-val'), streamPct + '%');
         setHidden($('dev-stream-held'), !(player && player.held === 'sound'));
+        for (const radio of document.querySelectorAll('input[name=dev-stream-quality]')) radio.checked = radio.value === local.stream_quality;
+        setText($('dev-stream-quality-note'), {
+            original: 'the stream as the source sends it',
+            light: 'at most 480p at 15 fps, made by the board: for a device that stutters on the original',
+            stills: 'one picture every 2 seconds, sound and all',
+        }[local.stream_quality]);
 
         const remind = $('dev-remind');
         if (![...remind.options].some((o) => o.value === String(local.remind_every))) {
@@ -2178,6 +2212,15 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             setText($('dev-stream-volume-val'), e.target.value + '%');
             applyStreamAudio(true);
         });
+        for (const radio of document.querySelectorAll('input[name=dev-stream-quality]')) {
+            radio.addEventListener('change', (e) => {
+                if (!e.target.checked) return;
+                local.stream_quality = e.target.value;
+                saveLocal();
+                restartStream();
+                refreshPanel();
+            });
+        }
         $('dev-notify').addEventListener('click', enableNotifications);
         $('dev-notify-test').addEventListener('click', () => {
             notify('taskstatus:test', 'Test notification', 'Board events show up like this.', null, false);
@@ -2205,11 +2248,13 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         // Another tab of this browser changed the device settings.
         addEventListener('storage', (e) => {
             if (e.key !== LOCAL_KEY) return;
+            const quality = local.stream_quality;
             local = loadLocal();
             applyTheme();
             refreshPanel();
             updateAttention();
             applyStreamAudio(false);
+            if (local.stream_quality !== quality) restartStream();
         });
         // Browsers keep audio locked until the page has had a gesture; any one unlocks it once sound is on.
         const unlock = () => {
@@ -2428,6 +2473,25 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         maybeAttach();
     }
 
+    // This device chose another quality: the player starts over with it at once. A codec this browser refused is
+    // forgotten too: the board's lighter copies are H.264 baseline, which nearly every browser plays.
+    function restartStream() {
+        if (!stream) return;
+        stopPlayer();
+        clock.clear(streamRetry);
+        streamRetry = 0;
+        streamRetries = 0;
+        streamNote = '';
+        if (streamBlocked && streamBlocked.key !== '*') streamBlocked = null;
+        if (!streamWait) streamWait = serverNow();
+        renderStream();
+        maybeAttach();
+    }
+
+    // The relay's URL for this device's quality.
+    const streamMedia = (s) => local.stream_quality === 'original' ? s.media
+                               : s.media + (s.media.includes('?') ? '&' : '?') + 'quality=' + local.stream_quality;
+
     // Full teardown: the fetch, the timers, the element and the MediaSource's object URL.
     function stopPlayer() {
         const p = player;
@@ -2467,7 +2531,9 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             return;
         }
         const now = Date.now();
-        const p = { id: s.id, media: s.media, MS, key: codecKey(s), codecs: [s.video, s.audio].filter(Boolean).join(', '), hasAudio: !!s.audio,
+        // A lighter quality has codecs of its own: what can't play is then named by the Content-Type it came with.
+        const codecs = local.stream_quality === 'original' ? [s.video, s.audio].filter(Boolean).join(', ') : '';
+        const p = { id: s.id, media: streamMedia(s), MS, key: codecKey(s), codecs, hasAudio: !!s.audio,
                     ctrl: new AbortController(), queue: [], queued: 0, video: null, ms: null, sb: null, url: '', type: '',
                     audioOnly: false, connected: false, held: '', unmutedAt: 0, seeked: false, jumpedAt: 0, trimmedAt: 0,
                     suspended: false, bytes: 0, lastData: now, lastEnd: 0, endMovedAt: now, firstAppendAt: 0, watch: 0, openTimer: 0 };
@@ -2660,7 +2726,9 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
                 p.endMovedAt = now;
             }
             if (!p.seeked) {
-                if (!p.queue.length) {      // the first data is all in: start inside it
+                // Start inside the first data once it is all in, or once STREAM_FIRST_SEEK_MS have gone by: a device that
+                // appends slower than the data comes never sees its queue empty, and would wait at 0, before the data.
+                if (!p.queue.length || now - p.firstAppendAt > STREAM_FIRST_SEEK_MS) {
                     p.seeked = true;
                     p.jumpedAt = now;
                     v.currentTime = Math.max(r.start, r.end - STREAM_LAG_TARGET_S);

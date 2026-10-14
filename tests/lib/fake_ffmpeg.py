@@ -57,8 +57,25 @@ whitelist"); `-rw_timeout` with an rtsp URL fails ("Option rw_timeout not found.
 makes it listen for a connection (it hangs); for rtsp, `-stimeout` is only known before ffmpeg 5 and `-timeout`
 means listen before it. `-version` prints $FAKE_FFMPEG_VERSION (default 7.1.1-fake).
 
+Transcoding (`-i pipe:0`, the board's lighter qualities: rendition_argv in server.py) has no URL to read, so it
+reads fragmented MP4 on stdin, as the board writes it, and plays what $FAKE_FFMPEG_CONTROL says (a JSON file read
+at the start of each run; absent or unreadable: {}). {"transcode": MODE, ...}:
+    ok            (the default) once the input's moov is in: an init segment of its own (avc1 42c01e, 160x90, the
+                  audio track if the input has one); then one fragment for each fragment read: one video sample, a
+                  keyframe when the input fragment started with one (every one with `-g 1`), and the audio. Its mdat
+                  starts with `FAKE`, K or `.`, the marker (`S` when the -vf has fps=0.5, else `L`), the process id
+                  and the sequence number of the input fragment, so a reader can tell where each came from.
+                  `delay` (ms) before the init segment
+    fail          "Unknown encoder 'libx264'" and exit 8, before reading anything
+    hang          reads its input, writes nothing
+    noread        reads nothing, writes nothing
+    die           as ok, then after `after` (3) fragments "Invalid data found" and exit 1
+    garbage       as ok, then bytes that are no box after `after` (0) fragments, then silence
+The stdin end is ffmpeg's: the output ends, status 0.
+
 Every run appends {pid, ppid, argv, env, t, url, mode} as a JSON line to $FAKE_FFMPEG_LOG (env: the proxy
-variables it was given). SIGTERM ends it as it ends ffmpeg (exit 255); a closed stdout ends it quietly.
+variables it was given; url pipe:0 and mode transcode for a transcoding run). SIGTERM ends it as it ends ffmpeg
+(exit 255); a closed stdout ends it quietly.
 
 As a library (the tests import it): box, box64, fbox, build_init, build_fragment, build_mfra, sample_stream, and the
 pieces mvhd, mvex, trak, tfhd, tfdt, trun, traf, moof, mdat for layouts the fake itself never writes.
@@ -603,6 +620,110 @@ def run_mode(run: Run, args: list, before: int) -> int:
     return run.play()
 
 
+def control() -> dict:
+    """$FAKE_FFMPEG_CONTROL's object: how a run with no URL to read plays (transcoding)."""
+    path = os.environ.get('FAKE_FFMPEG_CONTROL')
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (TypeError, OSError, ValueError):
+        return {}
+
+
+def option(args: list, name: str, default: str = '') -> str:
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
+
+
+def traf_times(moof: bytes) -> dict:
+    """{track id: (base decode time, duration)} of the track fragments of a moof as this fake writes them (a default
+    sample duration in the tfhd, a sample count in the trun)."""
+    def kids(start, end):
+        while start + 8 <= end:
+            size, kind = struct.unpack_from('>I4s', moof, start)
+            if size < 8:
+                return
+            yield kind, start, min(start + size, end)
+            start += size
+    out = {}
+    for kind, start, end in kids(8, len(moof)):
+        if kind != b'traf':
+            continue
+        track = base = duration = count = 0
+        for sub, at, _ in kids(start + 8, end):
+            if sub == b'tfhd':
+                flags, track = struct.unpack_from('>II', moof, at + 8)
+                field = at + 16 + (8 if flags & 0x1 else 0) + (4 if flags & 0x2 else 0)
+                duration = struct.unpack_from('>I', moof, field)[0] if flags & 0x8 else 0
+            elif sub == b'tfdt':
+                base = struct.unpack_from('>Q' if moof[at + 8] else '>I', moof, at + 12)[0]
+            elif sub == b'trun':
+                count = struct.unpack_from('>I', moof, at + 12)[0]
+        out[track] = (base, duration * count)
+    return out
+
+
+def transcode(run: Run, args: list, ctl: dict) -> int:
+    """-i pipe:0: fragmented MP4 in, fragmented MP4 out (see the module docstring)."""
+    mode, after = str(ctl.get('transcode', 'ok')), int(ctl.get('after', 3 if ctl.get('transcode') == 'die' else 0))
+    if mode == 'fail':
+        for line in (f"[vost#0:0 @ {run.addr()}] Unknown encoder 'libx264'", f'[vost#0:0 @ {run.addr()}] Error selecting an encoder',
+                     'Error opening output file pipe:1.', 'Error opening output files: Encoder not found'):
+            run.say(line)
+        return 8
+    if mode == 'noread':
+        run.hang()
+    marker = b'S' if 'fps=0.5' in option(args, '-vf') else b'L'
+    every_key = option(args, '-g') == '1'
+    buf, moof, audio, out, first = bytearray(), None, False, 0, {}
+    while True:
+        data = os.read(0, 65536)
+        if not data:
+            return 0
+        buf += data
+        pos = 0
+        while len(buf) - pos >= 8:
+            size, kind = struct.unpack_from('>I4s', buf, pos)
+            if size < 8 or len(buf) - pos < size:
+                break
+            item, pos = bytes(buf[pos:pos + size]), pos + size
+            if mode == 'hang':
+                continue
+            if kind == b'moov':
+                audio = b'soun' in item
+                time.sleep(max(int(ctl.get('delay', 0)), 0) / 1000)
+                run.put(build_init((160, 90), audio, codec='42c01e'))
+                run.started = True
+            elif kind == b'moof':
+                moof = item
+            elif kind == b'mdat' and moof is not None and run.started:
+                key, seq = item[8:13] == b'FAKEK', struct.unpack_from('>I', moof, 20)[0]  # the mfhd's sequence number
+                moof_read, moof = moof, None
+                if mode == 'garbage' and out >= after:
+                    run.put(b'This is not an MP4 file at all. ' * 8)
+                    run.hang()
+                if mode == 'die' and out >= after:
+                    run.say(f'[in#0/mov,mp4,m4a,3gp,3g2,mj2 @ {run.addr()}] Error during demuxing: Invalid data found when processing input')
+                    return 1
+                out += 1
+                sync = key or every_key
+                # The times of what it read, from 0 on (as ffmpeg's output starts): video one sample, audio as many as came.
+                times = traf_times(moof_read)
+                parts = []
+                for track, video in ((1, True), (2, False)):
+                    if track not in times or (not video and not audio):
+                        continue
+                    base, duration = times[track]
+                    first.setdefault(track, base)
+                    if video:
+                        parts.append({'id': 1, 'base': base - first[1], 'dur': duration or 6000, 'sizes': [800], 'sync': sync, 'video': True})
+                    else:
+                        parts.append({'id': 2, 'base': base - first[2], 'dur': 1024, 'sizes': [340] * max(duration // 1024, 1), 'sync': True,
+                                      'video': False})
+                run.put(build_fragment(out, parts, b'FAKE' + (b'K' if sync else b'.') + marker + struct.pack('>II', os.getpid(), seq)))
+        del buf[:pos]
+
+
 def main(argv: list) -> int:
     args = argv[1:]
     version = os.environ.get('FAKE_FFMPEG_VERSION', VERSION)
@@ -613,7 +734,7 @@ def main(argv: list) -> int:
         sys.stderr.write('At least one input file must be specified\n')
         return 1
     url = args[args.index('-i') + 1]
-    mode, p = parse_url(url)
+    mode, p = ('transcode', Params('')) if url == 'pipe:0' else parse_url(url)
     before = log_spawn(args, url, mode)
     run = Run(args, url, mode, p)
     signal.signal(signal.SIGTERM, on_term)
@@ -624,7 +745,9 @@ def main(argv: list) -> int:
     try:
         run.noise(p.int('noise', 0))
         status = refusal(run, args, major_of(version))
-        return run_mode(run, args, before) if status is None else status
+        if status is not None:
+            return status
+        return transcode(run, args, control()) if mode == 'transcode' else run_mode(run, args, before)
     except Terminated:
         run.say('Exiting normally, received signal 15.')
         if run.started and not run.writing:

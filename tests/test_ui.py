@@ -957,7 +957,7 @@ def _stream_cases(boards, play):
     cases = [frame_case('fault', 75000), frame_case('retry', 40000), frame_case('player', 40000), frame_case('offline', 40000),
              frame_case('layout', 36000), frame_case('nav', 30000), frame_case('life', 24000), frame_case('held', 30000),
              frame_case('swap', 22000), frame_case('hevc', 20000), frame_case('odd', 32000), frame_case('audio', 14000),
-             frame_case('multi', 14000), frame_case('panel', 14000),
+             frame_case('multi', 14000), frame_case('panel', 30000),
              ('stream_check_390', check_board, '/', 390, 'light', 'check', 7000, '', (), 900),
              ('stream_check_1280_dark', check_board, '/', 1280, 'dark', 'check', 7000, '', (), 900),
              ('stream_check_844x390', check_board, '/', 844, 'light', 'check', 7000, '', (), 390),
@@ -1186,6 +1186,21 @@ def assert_streampanel(r):
     vol = r['volume']
     check('panel: the volume slider: saved as stream_volume 0.4, shown as 40%, the volume of this board\'s video and of the other one\'s (by the storage event)',
           vol['stored']['stream_volume'] == 0.4 and vol['text'] == '40%' and vol['a']['video']['volume'] == 0.4 and vol['b']['video']['volume'] == 0.4, vol)
+    q = r['quality']
+    check('panel: the Live stream block has a Quality choice: Original (checked), Light, Stills, and says what Original is',
+          q['label'] == 'Quality' and q['radios'] == [['original', True], ['light', False], ['stills', False]]
+          and q['note'] == 'the stream as the source sends it', q)
+    li = r['light']
+    check('panel: Light: saved as stream_quality light, checked, explained; this board starts over at once ("connecting") on the media route with '
+          'quality=light, and the other board follows it (storage event)', li['stored'].get('stream_quality') == 'light'
+          and li['radios'][1] == ['light', True] and li['note'].startswith('at most 480p at 15 fps') and li['switched']['a'] == 'connecting'
+          and all(f and all(p.endswith('&quality=light') and s == 200 for p, s in f) for f in li['fetches']), li)
+    check('panel: ...and both play the board\'s light copy (the fake transcoder\'s fragments, marker L)', li['markers'] == ['LLL', 'LLL']
+          and li['a']['state'] == li['b']['state'] == 'video', (li['markers'], li['a']['state'], li['b']['state']))
+    og = r['original']
+    check('panel: Original again: saved; both boards back on the stream itself (no quality in the media URL, marker A)',
+          og['stored'].get('stream_quality') == 'original' and all(f and all('quality=' not in p and s == 200 for p, s in f) for f in og['fetches'])
+          and og['markers'] == ['AAA', 'AAA'], og)
     junk = r['junk']
     check('panel: a hand-edited, invalid saved value is ignored (the defaults: sound on, volume 1)', junk['b']['video']['volume'] == 1 and junk['b']['held'] == 'sound', junk)
     check('panel: no JS errors', r['errors'] == [[], []], r['errors'])
@@ -1245,7 +1260,12 @@ def assert_streamplayer(r):
     cut_rm = removals(cut)[0] if removals(cut) else None
     check('player: the stub can tell: with no margin the same trim cuts the playing GOP (its removal runs on to a keyframe after the playhead)',
           cut_rm and not (cut_rm['after'] and cut_rm['after'][0][0] <= cut_rm['ct'] <= cut_rm['after'][0][1]), removals(cut)[:1])
-    check('player: no JS errors', r['errors'] == [[], [], [], []], r['errors'])
+    sl = r['slow']
+    s0 = sl['seeks'][0] if sl['seeks'] else None
+    check('player: a device that appends slower than the data comes (its queue never empties) still makes its first seek, a second after its '
+          'first append, into the data, and shows the picture', s0 is not None and sl['firstAppend'] and 950 <= s0['at'] - sl['firstAppend'] <= 2500
+          and s0['buffered'] and s0['buffered'][0][0] <= s0['to'] <= s0['buffered'][-1][1] and s0['to'] > 0 and sl['state'] == 'video', sl)
+    check('player: no JS errors', r['errors'] == [[], [], [], [], []], r['errors'])
 
 
 def assert_streamfault(r):

@@ -12,12 +12,13 @@ ffmpeg that remuxes it to fragmented MP4 (GET /api/stream/media). Four phases:
            replace/close leaving no process, the backoff and its reset, stalls, stubborn processes, garbage,
            the probe ladder, audio that is silent or stops, no ffmpeg installed yet, persistence across a
            restart (mode 0600, a corrupt file), SIGTERM with viewers attached, SIGKILL of the board, polls
-           with 16 viewers
+           with 16 viewers; the lighter qualities (?quality=light|stills) against the fake transcoder: what it
+           is fed and when, sharing, the idle stop, the run ending, failures and slowness
   real     the same against the real ffmpeg (skipped without ffmpeg and libx264), over loopback only: a
            paced MPEG-TS source (video, audio+video, audio, a long GOP joined mid-way, announced audio that
            never comes), refusals and a black hole, a redirect to file:, five viewers on one upstream
            connection, rtmp/tcp/srt/rtsp through ffmpeg's own listeners, the HTTPS listener, orphans after a
-           SIGKILL
+           SIGKILL, both lighter qualities of a 720p source
 
 Slow scenarios (a watchdog that needs 15 s of silence, say) run side by side in threads, each on a board of its own.
 """
@@ -74,14 +75,25 @@ class Board(ScratchServer):
     def __init__(self, name: str, *extra, ffmpeg: str = 'fake', version: str | None = None, env: dict | None = None, **kw):
         self.ffmpeg = ffmpeg
         self.fake_log = TMP / f'{name}.ffmpeg.log'
+        self.control_file = TMP / f'{name}.control.json'
+        self.control_file.unlink(missing_ok=True)
         if ffmpeg == 'real':
             self.bin = real_ffmpeg_dir(TMP)
             path = f'{self.bin}{os.pathsep}{PATH}'
         else:
             self.bin = fake_ffmpeg_dir(TMP, f'{name}-bin', install=ffmpeg == 'fake')
             path = f'{self.bin}{os.pathsep}{PATH}' if ffmpeg == 'fake' else str(self.bin)
-        super().__init__(TMP, *extra, name=name, env=clean_env(PATH=path, FAKE_FFMPEG_LOG=self.fake_log, FAKE_FFMPEG_VERSION=version, **(env or {})),
+        super().__init__(TMP, *extra, name=name, env=clean_env(PATH=path, FAKE_FFMPEG_LOG=self.fake_log, FAKE_FFMPEG_VERSION=version,
+                                                               FAKE_FFMPEG_CONTROL=self.control_file, **(env or {})),
                          **kw)
+
+    def control(self, **settings):
+        """What the fake's next transcoding runs do (FAKE_FFMPEG_CONTROL in fake_ffmpeg.py)."""
+        self.control_file.write_text(json.dumps(settings))
+
+    def transcodes(self) -> list:
+        """The fake's transcoding runs so far (the lighter qualities)."""
+        return [x for x in self.spawns() if x['url'] == 'pipe:0']
 
     def stream(self):
         """The open stream's object from GET /api/stream, or None."""
@@ -119,9 +131,9 @@ class Board(ScratchServer):
     def kids(self) -> list:
         return children_of(self.proc.pid) if self.proc else []
 
-    def reader(self, **kw):
-        """A background reader of the open stream's media (see harness.StreamReader)."""
-        return stream_get(self.port, self.stream()['media'], **kw)
+    def reader(self, quality: str | None = None, **kw):
+        """A background reader of the open stream's media (see harness.StreamReader), in a quality if one is given."""
+        return stream_get(self.port, self.stream()['media'] + (f'&quality={quality}' if quality else ''), **kw)
 
 
 def analyze_of(spawn: dict) -> int:
@@ -400,6 +412,24 @@ def phase_units_argv():
     check('audio=True: no -an', '-an' not in a, a)
     same = server.ffmpeg_argv(exe, 'http://h/', 0, True, 7)
     check('the command line is deterministic', same == server.ffmpeg_argv(exe, 'http://h/', 0, True, 7))
+
+    S.section('rendition_argv: the lighter qualities, made from the relay\'s own output')
+    check('the qualities are light and stills', list(server.STREAM_RENDITIONS) == ['light', 'stills'], list(server.STREAM_RENDITIONS))
+    for quality, fps, rate in (('light', '15', ['-g', '30', '-b:v', '700k', '-maxrate', '900k', '-bufsize', '900k']),
+                               ('stills', '0.5', ['-g', '1', '-crf', '28', '-maxrate', '400k', '-bufsize', '800k'])):
+        a = server.rendition_argv(exe, quality)
+        maps = [a[i + 1] for i, x in enumerate(a) if x == '-map']
+        check(f'{quality}: fragmented MP4 from stdin, only the pipe protocol allowed, no keyboard; the video and any audio mapped',
+              a[0] == exe and '-nostdin' in a and option_value(a, '-protocol_whitelist') == 'pipe' and option_value(a, '-f') == 'mp4'
+              and option_value(a, '-i') == 'pipe:0' and a.index('-protocol_whitelist') < a.index('-i') and maps == ['0:v:0', '0:a:0?'], a)
+        check(f'{quality}: scaled to fit 854x480 (even sizes, never up), {fps} fps; H.264 baseline yuv420p, zero latency',
+              option_value(a, '-vf') == "scale=w='min(854,iw)':h='min(480,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=" + fps
+              and option_value(a, '-c:v') == 'libx264' and option_value(a, '-profile:v') == 'baseline' and option_value(a, '-pix_fmt') == 'yuv420p'
+              and option_value(a, '-tune') == 'zerolatency' and option_value(a, '-preset') == 'veryfast', a)
+        check(f'{quality}: ' + ' '.join(rate) + '; the audio copied; fragmented MP4 on stdout as the relay writes it',
+              all(option_value(a, rate[i]) == rate[i + 1] for i in range(0, len(rate), 2)) and option_value(a, '-c:a') == 'copy'
+              and option_value(a, '-movflags') == '+frag_keyframe+empty_moov+default_base_moof' and option_value(a, '-frag_duration') == '200000'
+              and a[-1] == 'pipe:1', a)
 
 
 def phase_units_errors():
@@ -1719,6 +1749,227 @@ def sc_schemes():
         no_traceback(srv, f'ffmpeg {version}')
 
 
+# ---------------------------------------------------------------- fake: the lighter qualities (side by side)
+
+LIGHT_MIME = 'video/mp4; codecs="avc1.42C01E,mp4a.40.2"'   # what the fake transcoder writes, for either quality
+
+
+def quality_of(spawn: dict) -> str:
+    return 'stills' if 'fps=0.5' in spawn['argv'][spawn['argv'].index('-vf') + 1] else 'light'
+
+
+def sc_rend_basic():
+    ck = tagged('qualities')
+    srv = Board('rend').start()
+    readers = []
+    try:
+        st = srv.go_live(f'{FAKE}/live?pace=100&gop=10&marker=A', 10)
+        if not ck('(the stream is live)', st is not None, srv.stream()):
+            return
+        orig = srv.reader()
+        readers.append(orig)
+        frags_of(orig, 13)          # past the first GOP: a quality now starts mid-stream
+        light = srv.reader('light')
+        readers.append(light)
+        ck('quality=light: 200, the copy\'s own Content-Type, no-store, no length', light.wait_headers(10) and light.status == 200
+           and light.headers.get('content-type') == LIGHT_MIME and light.headers.get('cache-control') == 'no-store'
+           and 'content-length' not in light.headers, (light.status, light.headers, light.error))
+        fr = frags_of(light, 12)
+        tx = srv.transcodes()
+        ck('its first viewer started one transcoder: its init segment, then its fragments (marker L, its pid)', len(tx) == 1
+           and parse_media(light.body)['init'] == fk.build_init((160, 90), True, codec='42c01e') and len(fr) >= 12
+           and all(f['fake'][1] == 'L' and f['fake'][2] == tx[0]['pid'] for f in fr), (len(tx), fr[:1]))
+        came = [f['fake'][3] for f in fr]   # the source fragment each one was made from
+        ck('the transcoder read the source from its latest keyframe on, then every fragment once and in order; the viewer starts at a keyframe',
+           fr and fr[0]['fake'][0] and came[0] > 1 and (came[0] - 1) % 10 == 0 and all(b == a + 1 for a, b in zip(came, came[1:])), came[:12])
+        ck('the transcoder\'s command line is rendition_argv\'s', tx and tx[0]['argv'] == server.rendition_argv('ffmpeg', 'light')[1:], tx and tx[0]['argv'])
+        ck('/api/stream counts the original\'s viewer and the copy\'s', wait_until(lambda: viewers(srv) == 2, 3), viewers(srv))
+        late = srv.reader('light')
+        readers.append(late)
+        lf = frags_of(late, 4)
+        ck('a second light viewer shares that transcoder and starts at its latest keyframe, without a gap',
+           len(srv.transcodes()) == 1 and lf and lf[0]['fake'][0] and lf[0]['fake'][2] == tx[0]['pid'] and seqs_ok(lf), [f['fake'] for f in lf][:4])
+        stills = srv.reader('stills')
+        readers.append(stills)
+        sf = frags_of(stills, 4)
+        both = {quality_of(x): x for x in srv.transcodes()}
+        ck('quality=stills: a transcoder of its own, every picture a keyframe (marker S)', set(both) == {'light', 'stills'} and len(srv.transcodes()) == 2
+           and sf and all(f['fake'][1] == 'S' and f['fake'][0] and f['fake'][2] == both['stills']['pid'] for f in sf), [f['fake'] for f in sf][:4])
+        ck('/api/stream counts four viewers', wait_until(lambda: viewers(srv) == 4, 3), viewers(srv))
+
+        hd = stream_get(srv.port, st['media'] + '&quality=light', method='HEAD')
+        ck('HEAD of a running quality: its Content-Type, no body, no viewer', hd.wait_headers(5) and hd.status == 200
+           and hd.headers.get('content-type') == LIGHT_MIME and hd.wait_closed(5) and hd.body == b'' and viewers(srv) == 4, (hd.status, hd.headers))
+        for method in ('GET', 'HEAD'):
+            s, _, b = srv.call(method, st['media'] + '&quality=ultra')
+            ck(f'{method} with an unknown quality: 400 with field quality', s == 400 and (method == 'HEAD' or (b.get('field') == 'quality'
+               and b.get('error') == 'quality must be original, light or stills')), (s, b))
+        for spelled in ('original', 'ORIGINAL'):
+            o2 = srv.reader(spelled)
+            ck(f'quality={spelled} is the stream as it is', o2.wait_headers(5) and o2.headers.get('content-type') == 'video/mp4; codecs="avc1.42C01F,mp4a.40.2"'
+               and frags_of(o2, 2) and frags_of(o2, 2)[0]['fake'][1] == 'A' and len(srv.transcodes()) == 2, o2.headers)
+            o2.close()
+
+        light.close()
+        late.close()
+        time.sleep(3)
+        back = srv.reader('light')
+        bf = frags_of(back, 2)
+        ck('a light viewer back within 10 s of the last one leaving gets the same transcoder', bf and bf[0]['fake'][2] == both['light']['pid']
+           and len(srv.transcodes()) == 2, ([f['fake'] for f in bf][:2], len(srv.transcodes())))
+        back.close()
+        t0 = time.monotonic()
+        gone = wait_until(lambda: not alive(both['light']['pid']), 16, 0.2)
+        took = time.monotonic() - t0
+        ck(f'10 s after its last viewer left, the light transcoder stops ({took:.1f}s) and the log says why', gone and 9 <= took <= 13.5
+           and 'the light quality stopped: no viewers for 10s' in srv.log_text(), (gone, took))
+        n = len(parse_media(stills.body)['frags'])
+        ck('...the stills one, still watched, goes on', alive(both['stills']['pid']) and stills.wait_bytes(len(stills.body) + 2000, 3), n)
+
+        crowd = [srv.reader() for _ in range(13)]
+        readers.extend(crowd)
+        one = srv.reader('light')
+        readers.append(one)
+        ck('(13 more original viewers and a new light one: 16 in all)', all(x.wait_headers(5) and x.status == 200 for x in crowd + [one])
+           and wait_until(lambda: viewers(srv) == 16, 4), viewers(srv))
+        extra = srv.reader('stills')
+        ck('the 17th, of whatever quality: 503 naming the limit (a copy\'s viewers count toward the 16)', extra.wait_closed(5) and extra.status == 503
+           and '16' in (extra.json() or {}).get('error', ''), (extra.status, extra.body[:200]))
+        srv.call('DELETE', '/api/stream')
+        ck('closing the stream ends every viewer, of every quality, and every ffmpeg', all(x.wait_closed(3) for x in readers)
+           and wait_until(lambda: srv.kids() == [], 4), ([x.closed for x in readers], srv.kids()))
+
+        srv.go_live(f'{FAKE}/audio', 10)
+        n = len(srv.transcodes())
+        a = srv.reader('light')
+        readers.append(a)
+        ck('a stream without video: quality=light is the stream as it is (audio/mp4), no transcoder', a.wait_headers(5)
+           and a.headers.get('content-type') == 'audio/mp4; codecs="mp4a.40.2"' and frags_of(a, 2) and len(srv.transcodes()) == n, a.headers)
+        srv.call('DELETE', '/api/stream')
+    finally:
+        for x in readers:
+            x.close()
+        srv.stop()
+    no_traceback(srv, 'qualities')
+
+
+def sc_rend_run():
+    ck = tagged('qualities and the run')
+    srv = Board('rend-run').start()
+    try:
+        srv.go_live(f'{FAKE}/die=40?pace=100&gop=10', 10)     # every run ends after 4 s
+        light = srv.reader('light')
+        ck('(a light viewer of a run that will end)', light.wait_headers(5) and light.status == 200, (light.status, light.error))
+        pid = srv.transcodes()[0]['pid'] if srv.transcodes() else 0
+        ck('the run ends: the light viewer is ended with it (its page asks again), and its transcoder stops', light.wait_closed(8)
+           and wait_until(lambda: not alive(pid), 4), (light.closed, pid))
+        live = srv.wait_stream(lambda s: s['state'] == 'live', 10)
+        again = srv.reader('light')
+        ck('the next run: a light viewer is let in at once by a new transcoder (a run ending is no failure of the quality)', live is not None
+           and again.wait_headers(5) and again.status == 200 and len(srv.transcodes()) == 2 and 'quality failed' not in srv.log_text(),
+           (again.status, again.body[:200], len(srv.transcodes())))
+        again.close()
+
+        srv.go_live(f'{FAKE}/live?pace=100&gop=10&marker=B', 10)
+        v = srv.reader('stills')
+        ck('(a stills viewer of a stream that gets replaced)', v.wait_headers(5) and v.status == 200 and frags_of(v, 2), v.status)
+        srv.post(f'{FAKE}/live?pace=100&gop=10&marker=C')
+        ck('replacing the stream ends it within 2 s; the one ffmpeg left is the new source', v.wait_closed(2)
+           and wait_until(lambda: len(srv.kids()) == 1 and srv.spawns()[-1]['url'].endswith('marker=C'), 4), srv.kids())
+        v.close()
+        srv.wait_stream(lambda s: s['state'] == 'live', 10)
+        w = srv.reader('light')
+        ck('(a light viewer of the new stream)', w.wait_headers(5) and w.status == 200 and frags_of(w, 2), w.status)
+        pids = [x['pid'] for x in srv.spawns()]
+        t = time.monotonic()
+        srv.proc.send_signal(signal.SIGTERM)
+        try:
+            code = srv.proc.wait(8)
+        except subprocess.TimeoutExpired:
+            code = None
+        ck(f'SIGTERM with a light viewer attached: exit 0 ({time.monotonic() - t:.2f}s), the viewer ended, no ffmpeg left (the source\'s nor the transcoder\'s)',
+           code == 0 and w.wait_closed(2) and not any(alive(p) for p in pids), (code, [p for p in pids if alive(p)]))
+        w.close()
+    finally:
+        srv.stop()
+    no_traceback(srv, 'qualities and the run')
+
+
+def sc_rend_fail():
+    ck = tagged('a quality that fails')
+    srv = Board('rend-fail').start()
+    try:
+        srv.control(transcode='fail')
+        st = srv.go_live(f'{FAKE}/live?pace=100&gop=10', 10)
+        if not ck('(the stream is live)', st is not None, srv.stream()):
+            return
+        t0 = time.monotonic()
+        s, h, b = srv.call('GET', st['media'] + '&quality=light')
+        ck('a transcoder that cannot start (no libx264): 503 at once, the cause in the error, Retry-After 10', s == 503
+           and b == {'error': "the light quality is not available: Unknown encoder 'libx264'"} and h.get('retry-after') == '10'
+           and time.monotonic() - t0 < 3, (s, b, h))
+        s2, _, b2 = srv.call('GET', st['media'] + '&quality=light')
+        ck('...asked again within 10 s: the same answer, and no other try', s2 == 503 and b2 == b and len(srv.transcodes()) == 1, (s2, b2, len(srv.transcodes())))
+        o = srv.reader()
+        ck('the stream itself is untouched: live, no error, the original served', o.wait_headers(5) and o.status == 200
+           and srv.stream()['state'] == 'live' and srv.stream()['error'] is None, srv.stream())
+        o.close()
+        srv.control(transcode='ok')
+        time.sleep(max(0.0, 10.5 - (time.monotonic() - t0)))
+        ok = srv.reader('light')
+        ck('10 s later it is tried again, and plays', ok.wait_headers(5) and ok.status == 200 and len(srv.transcodes()) == 2 and frags_of(ok, 2),
+           (ok.status, len(srv.transcodes())))
+        ok.close()
+        # It dies past the source's cached GOP (at most 10 fragments, fed at once), so the viewer is in before it does.
+        srv.control(transcode='die', after=15)
+        d = srv.reader('stills')
+        df = parse_media(d.body)['frags'] if d.wait_headers(5) and d.wait_closed(8) else []
+        dies = [x['pid'] for x in srv.transcodes() if quality_of(x) == 'stills']
+        ck('a transcoder that dies: its viewer got its pictures, then the end of the body', d.status == 200 and 1 <= len(df) <= 15 and dies
+           and all(f['fake'][1] == 'S' and f['fake'][2] == dies[0] for f in df), (d.status, d.closed, [f['fake'] for f in df][:3]))
+        s, h, b = srv.call('GET', st['media'] + '&quality=stills')
+        ck('...and the next request is a 503 naming the cause from its stderr', s == 503
+           and b.get('error') == 'the stills quality is not available: Error during demuxing: Invalid data found when processing input', (s, b))
+        ck('...the board log says so', 'the stills quality failed: Error during demuxing' in srv.log_text(), srv.log_text()[-600:])
+        srv.call('DELETE', '/api/stream')
+    finally:
+        srv.stop()
+    no_traceback(srv, 'a quality that fails')
+
+
+def sc_rend_slow():
+    ck = tagged('a quality that is slow')
+    srv = Board('rend-slow').start()
+    try:
+        srv.control(transcode='noread')
+        st = srv.go_live(f'{FAKE}/live?pace=50&gop=10&size=8000&ksize=20000&audio=0', 10)
+        if not ck('(the stream is live)', st is not None, srv.stream()):
+            return
+        t0 = time.monotonic()
+        s, h, b = srv.call('GET', st['media'] + '&quality=light')
+        took = time.monotonic() - t0
+        ck(f'a transcoder that reads nothing is given up on once 64 fragments wait for it: 503 naming that ({took:.1f}s)', s == 503
+           and b.get('error') == 'the light quality is not available: ffmpeg fell 64 fragments behind the stream' and took < 9.5, (s, b, took))
+        pid = srv.transcodes()[0]['pid'] if srv.transcodes() else 0
+        ck('...and stopped', wait_until(lambda: not alive(pid), 4), pid)
+        srv.control(transcode='ok', delay=12000)
+        srv.go_live(f'{FAKE}/live?pace=200&gop=10&size=1000&ksize=2000&audio=0', 10)   # small: 12 s of it fit in the pipe and the queue
+        st = srv.stream()
+        t1 = time.monotonic()
+        s, h, b = srv.call('GET', st['media'] + '&quality=stills')
+        took = time.monotonic() - t1
+        ck(f'a transcoder slow to write its header: 503 "not ready yet" after the 10 s wait, Retry-After 2 ({took:.1f}s)', s == 503
+           and b == {'error': 'the stills quality is not ready yet'} and h.get('retry-after') == '2' and 9.5 <= took <= 12.5, (s, b, h, took))
+        r = srv.reader('stills')
+        ck('...asked again, the request waits on the same transcoder and gets its pictures', r.wait_headers(8) and r.status == 200
+           and frags_of(r, 2) and len(srv.transcodes()) == 2, (r.status, len(srv.transcodes())))
+        r.close()
+        srv.call('DELETE', '/api/stream')
+    finally:
+        srv.stop()
+    no_traceback(srv, 'a quality that is slow')
+
+
 # ---------------------------------------------------------------- fake: restarts, shutdown, load, HTTPS
 
 def phase_persistence():
@@ -2377,8 +2628,49 @@ def phase_real():
     for kind in ('video', 'av', 'audio'):
         make_ts(kind, 6)
     make_ts('av', 8)
-    run_group('real ffmpeg over loopback: sources, joining mid-GOP, silent audio, failures, five viewers, rtmp/tcp/srt/rtsp, a board that dies',
-              rc_sources, rc_midgop, rc_silent, rc_failures, rc_fanout, rc_protocols, rc_rtsp, rc_orphans, limit=300)
+    run_group('real ffmpeg over loopback: sources, joining mid-GOP, silent audio, failures, five viewers, rtmp/tcp/srt/rtsp, a board that dies, '
+              'the lighter qualities', rc_sources, rc_midgop, rc_silent, rc_failures, rc_fanout, rc_protocols, rc_rtsp, rc_orphans, rc_renditions,
+              limit=300)
+
+
+def rc_renditions():
+    ck = tagged('real lighter qualities')
+    ts = make_ts('av', 12, size='1280x720')
+    if ts is None:
+        S.skip('real lighter qualities', 'could not make the test stream')
+        return
+    srv = Board('r-rend', ffmpeg='real').start()
+    up = FakeUpstream(ts, marker=TMP)
+    try:
+        srv.post(up.url)
+        if not ck('(a 1280x720 source with sound is live)', srv.wait_stream(lambda s: s['state'] == 'live', 30) is not None, srv.stream()):
+            return
+        for quality, fps, count in (('light', '15/1', 15), ('stills', '1/2', 25)):
+            r = srv.reader(quality)
+            ok = r.wait_headers(20) and r.status == 200
+            frags = frags_of(r, count, 25) if ok else []
+            mime = r.headers.get('content-type', '')
+            info = probe(whole_boxes(r.body))
+            streams = {x['codec_type']: x for x in (info or {}).get('streams', [])}
+            v, a = streams.get('video', {}), streams.get('audio', {})
+            ck(f'{quality}: H.264 Constrained Baseline, 480 high, {fps} fps, the AAC audio copied ({mime})', ok and v.get('codec_name') == 'h264'
+               and v.get('profile') == 'Constrained Baseline' and v.get('height') == 480 and abs((v.get('width') or 0) - 854) <= 2
+               and v.get('r_frame_rate') == fps and a.get('codec_name') == 'aac' and a.get('channels') == 2,
+               (r.status, {k: v.get(k) for k in ('codec_name', 'profile', 'width', 'height', 'r_frame_rate')}, a.get('codec_name')))
+            seen = f'video/mp4; codecs="{v.get("mime_codec_string", "?")},{a.get("mime_codec_string", "?")}"'
+            ck(f'{quality}: its Content-Type names the codecs ffprobe sees', mime.lower() == seen.lower(), (mime, seen))
+            # The copied audio can be ready before the encoder's first picture: fragments of audio alone may come first.
+            first = next((f for f in frags if 1 in f['tracks']), None)
+            ck(f'{quality}: its first fragment with video starts with a keyframe; no gap', first is not None and keyframe(first) and seqs_ok(frags),
+               [(f['seq'], f['sync']) for f in frags][:4])
+            r.close()
+        ck('one upstream connection serves the original and both copies', up.connections == 1, up.connections)
+        srv.call('DELETE', '/api/stream')
+        ck('closing the stream ends every ffmpeg, the copies\' too', wait_until(lambda: srv.kids() == [], 6), srv.kids())
+    finally:
+        up.close()
+        srv.stop()
+    no_traceback(srv, 'real lighter qualities')
 
 
 # ---------------------------------------------------------------- units: the classes behind the route
@@ -2434,9 +2726,9 @@ def phase_units_channel():
     check('once a header is in, the snapshot has its codecs and size',
           (snap['video'], snap['audio'], snap['width'], snap['height']) == ('avc1.42C01F', 'mp4a.40.2', 320, 180), snap)
     chan.gop = [b'k', b'p1']
-    viewer, init, gop, mime = chan.attach(0.1)
-    check('attach: the viewer, the init segment, a copy of the GOP cache, the MIME type', init == b'INIT' and gop == [b'k', b'p1']
-          and gop is not chan.gop and mime == 'video/mp4; codecs="x"'
+    viewer, init, gop, mime, rendition = chan.attach(0.1)
+    check('attach: the viewer, the init segment, a copy of the GOP cache, the MIME type; no rendition (the original)', init == b'INIT'
+          and gop == [b'k', b'p1'] and gop is not chan.gop and mime == 'video/mp4; codecs="x"' and rendition is None
           and viewer in chan.viewers and chan.snapshot()['viewers'] == 1)
     chan.detach(viewer)
     chan.detach(viewer)
@@ -2493,6 +2785,28 @@ def phase_units_channel():
     chan2.stop()
     check('stop() twice is fine', chan2.stopped and not chan2.viewers and chan2.stopping.is_set())
 
+    S.section('StreamChannel: a lighter quality, where none is made (no ffmpeg involved)')
+    chan3 = server.StreamChannel('aaaaaaaaaaaa', 'http://h/a', 1.0)
+    _, moov = init_parts(video=None)
+    chan3.init, chan3.mime, chan3.tracks = b'INIT', 'audio/mp4; codecs="mp4a.40.2"', server.mp4_init_info(moov)['tracks']
+    viewer, init, _, mime, rendition = chan3.attach(0.1, 'light')
+    check('a stream without video: quality light is the original (its viewer, its MIME type, no rendition started)', init == b'INIT'
+          and mime == 'audio/mp4; codecs="mp4a.40.2"' and rendition is None and viewer in chan3.viewers and chan3.renditions == {}
+          and chan3.media_mime('light') == mime)
+    chan3.stop()
+    chan4 = server.StreamChannel('bbbbbbbbbbbb', 'http://h/v', 1.0)
+    _, moov = init_parts()
+    chan4.init, chan4.mime, chan4.tracks = b'INIT', 'video/mp4; codecs="x"', server.mp4_init_info(moov)['tracks']
+    chan4.failures['stills'] = (time.monotonic(), "Unknown encoder 'libx264'")
+    t = time.monotonic()
+    _, exc = attempt(chan4.attach, 5, 'stills')
+    check('a quality that failed less than 10 s ago: 503 at once, the cause in the error, Retry-After 10, nothing started',
+          exc is not None and exc.code == 503 and exc.payload == {'error': "the stills quality is not available: Unknown encoder 'libx264'"}
+          and exc.headers == {'Retry-After': '10'} and time.monotonic() - t < 0.5 and chan4.renditions == {}, exc and (exc.payload, exc.headers))
+    check('HEAD of a quality that is not running has no type to tell (None), and starts nothing', chan4.media_mime('light') is None
+          and chan4.media_mime() == 'video/mp4; codecs="x"' and chan4.renditions == {})
+    chan4.stop()
+
 
 if __name__ == '__main__':
     phase_units_urls()
@@ -2508,6 +2822,8 @@ if __name__ == '__main__':
     run_group('the supervisor: backoff and its reset, stalls, stubborn processes, garbage, the probe ladder, audio, no ffmpeg', sc_backoff, sc_die,
               sc_healthy, sc_stall,
               sc_stubborn, sc_garbage, sc_probe, sc_silent, sc_dropaudio, sc_firstkey, sc_nofmpeg, sc_media503, sc_schemes)
+    run_group('the lighter qualities: one transcoder per quality, idle stop, the run ending, failures, slowness', sc_rend_basic, sc_rend_run,
+              sc_rend_fail, sc_rend_slow, limit=150)
     phase_persistence()
     phase_shutdown()
     phase_https()

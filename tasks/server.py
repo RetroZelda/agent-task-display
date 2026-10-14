@@ -69,7 +69,8 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
   GET    /api/stream               {now, stream, ffmpeg} (see Stream)
   POST   /api/stream               {url} -> 201 the GET shape + existing: false; the url already open: 200, existing: true
   DELETE /api/stream               -> the GET shape + closed: bool (idempotent)
-  GET    /api/stream/media?id=<id> the open stream as fragmented MP4, an endless body (see Stream)
+  GET    /api/stream/media?id=<id> the open stream as fragmented MP4, an endless body; &quality=light|stills: a
+                                   lighter copy of it (see Stream)
 Rendering literally replaces {{BASE_URL}}, {{PUBLIC_URL}}, {{VERSION}} and {{DOCS_VERSION}}. Files are
 re-read per request; a missing one is a 500 {"error": "template missing: <path>"}. On the HTTPS listener
 BASE_URL is http://<the Host's hostname>:<http port> (agents stay on plain http, which a self-signed
@@ -162,7 +163,15 @@ Stream: one network stream can be open at a time, shown beside the board on ever
   codecs, no Content-Length, fragmented MP4: the header, the fragments since the last keyframe, then live
   ones. It ends whenever a run ends and when the stream is replaced or closed; a page then asks again. 404 no
   stream, 410 another id, 503 (+Retry-After) not connected yet, 16 viewers or shutting down. A viewer more
-  than 64 fragments behind is dropped. HEAD sends the headers only. The open stream is kept in
+  than 64 fragments behind is dropped. HEAD sends the headers only.
+  quality=light or stills (original, the default, is the stream as above; anything else is a 400 with field
+  quality) is a lighter copy, for devices that cannot decode the original or keep up with it: a second ffmpeg
+  reads the relay's own output from the latest keyframe on and re-encodes the video as H.264 baseline (light:
+  at most 854x480 at 15 fps; stills: one picture every 2 s), the audio copied. Its first viewer starts it, its
+  Content-Type is its own, and it ends with the run and 10 s after its last viewer left. One that failed
+  (ffmpeg without libx264, say) is a 503 naming the cause for the next 10 s; one whose header has not come
+  within the wait is a 503 too. Its viewers count toward the 16 and in viewers. A stream without video is
+  served as it is. HEAD starts nothing: a quality that is not running is a 503. The open stream is kept in
   <db>.stream.json (mode 600; --db tasks/data/tasks.db gives tasks/data/tasks.stream.json) and reopened
   after a restart; only DELETE removes it.
 
@@ -251,6 +260,16 @@ STREAM_GOP_MAX = 8 << 20        # bytes of fragments kept for late joiners
 STREAM_BOX_MAX = 64 << 20       # a box claiming more than this is corrupt output
 STREAM_INIT_WAIT = 10           # s the media route waits for a restarting ffmpeg's header
 STREAM_ERROR_LINES = 8          # lines of ffmpeg's stderr kept from the start and from the end of a run
+# The lighter qualities a page may ask the media route for (?quality=), for devices that cannot decode the original or
+# keep up with it: (video filter, encoder options) of a second ffmpeg that re-encodes the relay's own output as H.264
+# baseline, the profile every hardware decoder plays. light: at most 854x480, 15 fps; stills: one picture every 2 s.
+STREAM_SCALE = "scale=w='min(854,iw)':h='min(480,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
+STREAM_RENDITIONS = {
+    'light': (STREAM_SCALE + ',fps=15', ('-g', '30', '-b:v', '700k', '-maxrate', '900k', '-bufsize', '900k')),
+    'stills': (STREAM_SCALE + ',fps=0.5', ('-g', '1', '-crf', '28', '-maxrate', '400k', '-bufsize', '800k')),
+}
+STREAM_RENDITION_IDLE = 10      # s a lighter quality goes on without viewers (a page that reloads finds it running)
+STREAM_RENDITION_RETRY = 10     # s after a lighter quality failed before it is tried again
 STATUS_ALIASES = {
     'done': 'done', 'ok': 'done', 'success': 'done', 'complete': 'done', 'completed': 'done',
     'failed': 'failed', 'fail': 'failed', 'error': 'failed',
@@ -696,6 +715,18 @@ def ffmpeg_argv(exe, url, level=0, audio=True, major=None):
     return argv
 
 
+def rendition_argv(exe, quality):
+    """The ffmpeg command line for a lighter quality of a stream (STREAM_RENDITIONS): the relay's fragmented MP4 on
+    stdin, the video scaled down and re-encoded, the audio copied (it is AAC already), fragmented MP4 on stdout."""
+    scale, video = STREAM_RENDITIONS[quality]
+    return [exe, '-hide_banner', '-nostdin', '-nostats', '-loglevel', 'error', '-protocol_whitelist', 'pipe',
+            '-analyzeduration', '1000000', '-probesize', '1000000', '-f', 'mp4', '-i', 'pipe:0',
+            '-map', '0:v:0', '-map', '0:a:0?', '-vf', scale,
+            '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-profile:v', 'baseline', '-pix_fmt', 'yuv420p',
+            *video, '-threads', '2', '-c:a', 'copy', '-max_interleave_delta', '1000000', '-f', 'mp4',
+            '-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-frag_duration', '200000', 'pipe:1']
+
+
 def _stderr_text(raw):
     """One stderr line without its [module @ 0x...] prefix; None when it is empty or decoder noise."""
     line = raw.strip()
@@ -989,6 +1020,50 @@ def _close_pipes(proc):
             pass
 
 
+def _read_output(proc, chunks):
+    """ffmpeg's stdout into the queue chunks, then None. A thread of its own that never waits for anyone."""
+    try:
+        while True:
+            data = os.read(proc.stdout.fileno(), 65536)
+            if not data:
+                break
+            chunks.put(data)
+    except OSError:
+        pass
+    finally:
+        chunks.put(None)
+
+
+def _read_errors(proc, head, tail):
+    """ffmpeg's stderr, a line at a time: the first STREAM_ERROR_LINES lines worth keeping into the list head, the
+    later ones into tail (a deque that keeps the last of them)."""
+    rest = b''
+
+    def keep(raw):
+        line = _stderr_text(raw.decode('utf-8', 'replace'))
+        if line:
+            (head if len(head) < STREAM_ERROR_LINES else tail).append(line)
+
+    try:
+        while True:
+            data = os.read(proc.stderr.fileno(), 4096)
+            if not data:
+                break
+            *lines, rest = (rest + data).split(b'\n')
+            rest = rest[-2000:]
+            for raw in lines:
+                keep(raw)
+    except OSError:
+        pass
+    keep(rest)
+
+
+def _write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
 class StreamViewer:
     """One media connection's queue of fragments. The supervisor offers to it and never waits for it."""
 
@@ -1045,6 +1120,9 @@ class StreamChannel:
         self.audio = True  # False once the source proved to have no usable audio
         self.level = 0  # how long ffmpeg looks at the source first (STREAM_PROBES)
         self.restart = False  # the same URL was posted again to try the audio again
+        self.renditions = {}  # quality: the StreamRendition of the current run
+        self.failures = {}  # quality: (time.monotonic(), why) of the last failure of that quality
+        self.rendition_threads = []  # every one started, for shutdown to wait for
         self.stopping = threading.Event()
         self.wake = threading.Event()  # cuts a backoff wait short
         self.thread = self.after = None
@@ -1062,16 +1140,20 @@ class StreamChannel:
         self.wake.set()
         with self.cond:
             self.stopped = True
-            proc, viewers = self.proc, list(self.viewers)
+            procs, viewers = [self.proc], list(self.viewers)
             self.viewers.clear()
+            for rendition in list(self.renditions.values()):
+                procs.append(rendition.proc)
+                rendition.end()
             self.cond.notify_all()
         for viewer in viewers:
             viewer.end()
-        if proc is not None:
-            try:
-                proc.terminate()
-            except OSError:
-                pass
+        for proc in procs:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
 
     def kick(self):
         """The same URL was posted again: try now if it is not live; if it is live without the audio it lost, try
@@ -1093,15 +1175,22 @@ class StreamChannel:
             return {'id': self.id, 'url': self.shown, 'opened_at': self.opened_at, 'state': self.state,
                     'since': self.since, 'error': self.error, 'video': video and video['codec'],
                     'audio': audio and audio['codec'], 'width': video and video['width'],
-                    'height': video and video['height'], 'viewers': len(self.viewers),
+                    'height': video and video['height'],
+                    'viewers': len(self.viewers) + sum(len(r.viewers) for r in self.renditions.values()),
                     'media': f'/api/stream/media?id={self.id}'}
 
-    def attach(self, timeout):
-        """Register a viewer once there is an init segment (waiting up to timeout seconds for a restarting ffmpeg's).
-        -> (viewer, init segment, the cached fragments, mime). Taking the cache and registering happen under one
-        lock, so the viewer sees every fragment once and in order."""
+    def _has_video(self):
+        return any(track['kind'] == 'vide' for track in self.tracks.values())
+
+    def attach(self, timeout, quality=None):
+        """Register a viewer once there is an init segment (waiting up to timeout seconds for a restarting ffmpeg's,
+        or for a lighter quality's first output). -> (viewer, init segment, the cached fragments, mime, the
+        StreamRendition it watches or None). Taking the cache and registering happen under one lock, so the viewer
+        sees every fragment once and in order. A lighter quality of a stream without video is the original."""
+        deadline = time.monotonic() + timeout
         with self.cond:
-            if len(self.viewers) + self.waiting >= STREAM_VIEWERS_MAX:
+            load = len(self.viewers) + self.waiting + sum(len(r.viewers) + r.waiting for r in self.renditions.values())
+            if load >= STREAM_VIEWERS_MAX:
                 raise ApiError(503, f'the stream has {STREAM_VIEWERS_MAX} viewers already', {'Retry-After': '10'})
             self.waiting += 1
             try:
@@ -1113,13 +1202,61 @@ class StreamChannel:
             if self.init is None:
                 extra = {'hint': self.error} if self.error else {}
                 raise ApiError(503, 'the stream is not connected yet', {'Retry-After': '2'}, **extra)
+            if quality is not None and self._has_video():
+                return self._attach_rendition(quality, deadline)
             viewer = StreamViewer()
             self.viewers.add(viewer)
-            return viewer, self.init, list(self.gop or ()), self.mime
+            return viewer, self.init, list(self.gop or ()), self.mime, None
 
-    def detach(self, viewer):
+    def _attach_rendition(self, quality, deadline):
+        """attach() for a lighter quality, under self.cond: its rendition of this run, started by the first viewer."""
+        failed = self.failures.get(quality)
+        if failed is not None and time.monotonic() - failed[0] < STREAM_RENDITION_RETRY:
+            raise ApiError(503, f'the {quality} quality is not available: {failed[1]}',
+                           {'Retry-After': str(STREAM_RENDITION_RETRY)})
+        rendition = self.renditions.get(quality)
+        if rendition is None:
+            # From the latest keyframe (the cached fragments start with one), else from the next one.
+            rendition = StreamRendition(self, quality, [self.init, *(self.gop or ())], self.gop is not None)
+            self.renditions[quality] = rendition
+            self.rendition_threads = [t for t in self.rendition_threads if t.is_alive()]
+            self.rendition_threads.append(rendition.start())
+        rendition.waiting += 1
+        try:
+            self.cond.wait_for(lambda: self.stopped or rendition.ended or rendition.init is not None,
+                               max(0.0, deadline - time.monotonic()))
+        finally:
+            rendition.waiting -= 1
+            if not rendition.waiting and not rendition.viewers:
+                rendition.idle_since = time.monotonic()
+        if self.stopped:
+            raise ApiError(410, 'the stream was replaced or closed')
+        if rendition.ended or rendition.init is None:
+            failed = self.failures.get(quality)
+            if rendition.ended and failed is not None:
+                raise ApiError(503, f'the {quality} quality is not available: {failed[1]}',
+                               {'Retry-After': str(STREAM_RENDITION_RETRY)})
+            raise ApiError(503, f'the {quality} quality is not ready yet', {'Retry-After': '2'})
+        viewer = StreamViewer()
+        rendition.viewers.add(viewer)
+        return viewer, rendition.init, list(rendition.gop or ()), rendition.mime, rendition
+
+    def detach(self, viewer, rendition=None):
         with self.cond:
-            self.viewers.discard(viewer)
+            if rendition is None:
+                self.viewers.discard(viewer)
+            elif viewer in rendition.viewers:
+                rendition.viewers.discard(viewer)
+                if not rendition.viewers and not rendition.waiting:
+                    rendition.idle_since = time.monotonic()
+
+    def media_mime(self, quality=None):
+        """The Content-Type a media request would get now; None while it would have to wait (HEAD starts nothing)."""
+        with self.cond:
+            if quality is None or not self._has_video():
+                return self.mime
+            rendition = self.renditions.get(quality)
+            return rendition.mime if rendition is not None else None
 
     def _supervise(self):
         after, self.after = self.after, None
@@ -1170,40 +1307,8 @@ class StreamChannel:
 
         chunks = queue.Queue()  # unbounded on purpose: the pump must never wait, or it would never see the end
         head, tail = [], collections.deque(maxlen=STREAM_ERROR_LINES)  # the first and the last lines of stderr
-
-        def pump():
-            try:
-                while True:
-                    data = os.read(proc.stdout.fileno(), 65536)
-                    if not data:
-                        break
-                    chunks.put(data)
-            except OSError:
-                pass
-            finally:
-                chunks.put(None)
-
-        def drain():
-            rest = b''
-            try:
-                while True:
-                    data = os.read(proc.stderr.fileno(), 4096)
-                    if not data:
-                        break
-                    *lines, rest = (rest + data).split(b'\n')
-                    rest = rest[-2000:]
-                    for raw in lines:
-                        keep(raw)
-            except OSError:
-                pass
-            keep(rest)
-
-        def keep(raw):
-            line = _stderr_text(raw.decode('utf-8', 'replace'))
-            if line:
-                (head if len(head) < STREAM_ERROR_LINES else tail).append(line)
-
-        threads = [threading.Thread(target=pump, daemon=True), threading.Thread(target=drain, daemon=True)]
+        threads = [threading.Thread(target=_read_output, args=(proc, chunks), daemon=True),
+                   threading.Thread(target=_read_errors, args=(proc, head, tail), daemon=True)]
         for thread in threads:
             thread.start()
 
@@ -1301,9 +1406,12 @@ class StreamChannel:
                     self.viewers.discard(viewer)
                     if viewer.dropped:
                         log.info('stream %s: dropped a viewer that fell %d fragments behind', self.id, STREAM_QUEUE_MAX)
+            for rendition in list(self.renditions.values()):
+                rendition.take(frag, sync)
 
     def _end_run(self, error):
-        """A run is over: its viewers end (their pages reconnect to the next one) and the channel is connecting again."""
+        """A run is over: its viewers end (their pages reconnect to the next one), its lighter qualities with them,
+        and the channel is connecting again."""
         was_live = changed = False
         with self.cond:
             self.proc = self.init = self.mime = self.gop = None
@@ -1311,6 +1419,8 @@ class StreamChannel:
             self.tracks = {}
             viewers = list(self.viewers)
             self.viewers.clear()
+            for rendition in list(self.renditions.values()):
+                rendition.end()
             if not self.stopped:
                 was_live = self.state == 'live'
                 if was_live:
@@ -1322,6 +1432,196 @@ class StreamChannel:
             viewer.end()
         if not self.stopped and error:
             (log.info if was_live or changed else log.debug)('stream %s: %s', self.id, error)
+
+
+class StreamRendition:
+    """A lighter quality of one run of a channel: a second ffmpeg (rendition_argv) that reads the run's fragmented MP4
+    from a keyframe on and writes it again with the video re-encoded smaller, for viewers of its own. The first viewer
+    of the quality starts it; it ends with the run or the channel, when it fails, and STREAM_RENDITION_IDLE seconds
+    after its last viewer left. Its fields are guarded by the channel's cond, under which the run's fragments reach it
+    too, so ffmpeg reads each of them once and in order."""
+
+    def __init__(self, chan, quality, head, keyed):
+        self.chan, self.quality = chan, quality
+        self.head = head  # what ffmpeg reads first: the run's init segment and its fragments since the last keyframe
+        self.keyed = keyed  # the input has reached a keyframe; the fragments before one are left out
+        self.feed = StreamViewer()  # the run's fragments on their way to ffmpeg's stdin, never waited for
+        self.init = self.mime = self.gop = None
+        self.gop_bytes = 0
+        self.viewers = set()
+        self.waiting = 0  # media requests waiting in attach() for its init segment
+        self.idle_since = time.monotonic()
+        self.proc = None
+        self.ended = False
+
+    def start(self):
+        thread = threading.Thread(target=self._main, name=f'stream-{self.chan.id}-{self.quality}', daemon=True)
+        thread.start()
+        return thread
+
+    def take(self, frag, sync):
+        """One of the run's fragments, under the channel's cond: passed on from the first keyframe on."""
+        if self.ended:
+            return
+        if not self.keyed:
+            if not sync:
+                return
+            self.keyed = True
+        if not self.feed.offer(frag):
+            self.fail(f'ffmpeg fell {STREAM_QUEUE_MAX} fragments behind the stream')
+
+    def fail(self, error):
+        """Under the channel's cond: this one ends and the quality is refused for STREAM_RENDITION_RETRY seconds."""
+        self.chan.failures[self.quality] = (time.monotonic(), error)
+        log.info('stream %s: the %s quality failed: %s', self.chan.id, self.quality, error)
+        self.end()
+
+    def end(self):
+        """Under the channel's cond: no more input, its viewers end, and the next viewer of the quality starts another
+        one. Its thread stops ffmpeg."""
+        if self.ended:
+            return
+        self.ended = True
+        if self.chan.renditions.get(self.quality) is self:
+            del self.chan.renditions[self.quality]
+        self.feed.end()
+        for viewer in self.viewers:
+            viewer.end()
+        self.viewers.clear()
+        self.init = self.mime = self.gop = None
+        self.chan.cond.notify_all()
+
+    def _main(self):
+        try:
+            error = self._run()
+        except Exception:  # whatever it was, the quality failed; the channel goes on
+            log.exception('stream %s: the %s quality failed', self.chan.id, self.quality)
+            error = 'internal error (see the board log)'
+        with self.chan.cond:
+            self.proc = None
+            if not self.ended:
+                self.fail(error)
+
+    def _run(self):
+        """ffmpeg from its start to its end. -> why it failed; None once the rendition was ended."""
+        chan = self.chan
+        exe = find_ffmpeg()
+        if exe is None:
+            return 'ffmpeg is not installed on the board host'
+        try:
+            proc = subprocess.Popen(rendition_argv(exe, self.quality), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, bufsize=0, env=_ffmpeg_env(), start_new_session=True)
+        except OSError as exc:
+            return f'cannot run {exe}: {exc.strerror or exc}'
+        with chan.cond:
+            ended = self.ended
+            if not ended:
+                self.proc = proc
+        if not ended:
+            log.info('stream %s: the %s quality started', chan.id, self.quality)
+        head, self.head = self.head, None
+
+        def write():  # the only user of stdin, so the one that closes it: no other thread can write to a reused descriptor
+            try:
+                while head and not ended:
+                    _write_all(proc.stdin.fileno(), head.pop(0))
+                while not ended:
+                    part = self.feed.next(5)
+                    if part is None:
+                        break
+                    if part:
+                        _write_all(proc.stdin.fileno(), part)
+            except OSError:
+                pass  # ffmpeg is gone
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+        chunks = queue.Queue()
+        lines, tail = [], collections.deque(maxlen=STREAM_ERROR_LINES)
+        threads = [threading.Thread(target=write, daemon=True),
+                   threading.Thread(target=_read_output, args=(proc, chunks), daemon=True),
+                   threading.Thread(target=_read_errors, args=(proc, lines, tail), daemon=True)]
+        for thread in threads:
+            thread.start()
+        reader = FragmentReader()
+        started = last_data = time.monotonic()
+        init_at = error = None
+        try:
+            while not ended:
+                try:
+                    chunk = chunks.get(timeout=1)
+                except queue.Empty:
+                    chunk = b''
+                now = time.monotonic()
+                if chunk is None:
+                    break
+                if chunk:
+                    last_data = now
+                    for event in reader.feed(chunk):
+                        if event[0] == 'init':
+                            init_at = now
+                            self._set_init(event[1], event[2])
+                        else:
+                            self._publish(event[1], event[2])
+                with chan.cond:
+                    if self.ended:
+                        break
+                    if not self.viewers and not self.waiting and now - self.idle_since > STREAM_RENDITION_IDLE:
+                        log.info('stream %s: the %s quality stopped: no viewers for %ds', chan.id, self.quality,
+                                 STREAM_RENDITION_IDLE)
+                        self.end()
+                        break
+                # The run's own watchdogs end it, and this with it, when the source is the one that stalls.
+                if init_at is None and self.keyed and now - started > STREAM_FIRST_DATA:
+                    error = f'no output after {STREAM_FIRST_DATA}s'
+                elif init_at is not None and now - last_data > 2 * STREAM_STALL:
+                    error = f'no output for {2 * STREAM_STALL}s'
+                if error:
+                    break
+        except ValueError as exc:
+            error = 'ffmpeg produced unreadable output'
+            log.info('stream %s: the %s quality: %s (%s)', chan.id, self.quality, error, exc)
+        finally:
+            self.feed.end()  # the writer leaves
+            rc = _stop_process(proc)
+            for thread in threads:
+                thread.join(1)
+            _close_pipes(proc)
+        with chan.cond:
+            if self.ended:
+                return None
+        return error or ffmpeg_error(lines + list(tail), 'pipe:0', rc) or (
+            f'ffmpeg exited with status {rc}' if rc else 'ffmpeg ended')
+
+    def _set_init(self, init, mime):
+        with self.chan.cond:
+            if not self.ended:
+                self.init, self.mime = init, mime
+                self.gop, self.gop_bytes = None, 0
+                self.chan.cond.notify_all()
+
+    def _publish(self, frag, sync):
+        with self.chan.cond:
+            if self.ended:
+                return
+            if sync:
+                self.gop, self.gop_bytes = [frag], len(frag)
+            elif self.gop is not None:
+                self.gop.append(frag)
+                self.gop_bytes += len(frag)
+                if self.gop_bytes > STREAM_GOP_MAX:
+                    self.gop = None
+            for viewer in list(self.viewers):
+                if not viewer.offer(frag):
+                    self.viewers.discard(viewer)
+                    if not self.viewers and not self.waiting:
+                        self.idle_since = time.monotonic()
+                    if viewer.dropped:
+                        log.info('stream %s: dropped a %s viewer that fell %d fragments behind', self.chan.id,
+                                 self.quality, STREAM_QUEUE_MAX)
 
 
 class StreamHub:
@@ -1442,10 +1742,11 @@ class StreamHub:
                 chan.stop()
             deadline = time.monotonic() + timeout
             for chan in chans:
-                try:
-                    chan.thread.join(max(0.0, deadline - time.monotonic()))
-                except (AttributeError, RuntimeError):  # never started
-                    pass
+                for thread in (chan.thread, *chan.rendition_threads):
+                    try:
+                        thread.join(max(0.0, deadline - time.monotonic()))
+                    except (AttributeError, RuntimeError):  # never started
+                        pass
         except Exception:
             log.exception('stopping the stream failed')
 
@@ -2560,12 +2861,19 @@ class Handler(BaseHTTPRequestHandler):
     def h_stream_media(self):
         """The open stream as fragmented MP4: no Content-Length, the body ends when the channel's run does."""
         chan = self.server.stream.channel(self._query('id'))
-        if self.command == 'HEAD':  # routed as GET; it only says what a GET would send
-            if chan.mime is None:
-                raise ApiError(503, 'the stream is not connected yet', {'Retry-After': '2'})
-            self._stream_headers(chan.mime)
+        quality = self._query('quality')
+        if quality == 'original':
+            quality = None
+        elif quality is not None and quality not in STREAM_RENDITIONS:
+            raise ApiError(400, 'quality must be original, ' + ' or '.join(STREAM_RENDITIONS), field='quality')
+        if self.command == 'HEAD':  # routed as GET; it only says what a GET would send, and starts nothing
+            mime = chan.media_mime(quality)
+            if mime is None:
+                raise ApiError(503, 'the stream is not connected yet' if quality is None
+                               else f'the {quality} quality is not running', {'Retry-After': '2'})
+            self._stream_headers(mime)
             return
-        viewer, init, gop, mime = chan.attach(STREAM_INIT_WAIT)
+        viewer, init, gop, mime, rendition = chan.attach(STREAM_INIT_WAIT, quality)
         sent, started = 0, time.monotonic()
         try:
             self._stream_headers(mime)
@@ -2584,10 +2892,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # _dispatch would write a JSON 500 into the middle of the media
             log.exception('stream %s: a media request failed', chan.id)
         finally:
-            chan.detach(viewer)
+            chan.detach(viewer, rendition)
             self.close_connection = True
-            log.info('%s GET /api/stream/media %s: %d bytes in %s%s', self.address_string(), chan.id, sent,
-                     humanise(time.monotonic() - started), ' (dropped: too slow)' if viewer.dropped else '')
+            log.info('%s GET /api/stream/media %s%s: %d bytes in %s%s', self.address_string(), chan.id,
+                     f' ({rendition.quality})' if rendition else '', sent, humanise(time.monotonic() - started),
+                     ' (dropped: too slow)' if viewer.dropped else '')
 
 
 def _printable(text):
