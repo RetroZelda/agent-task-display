@@ -147,19 +147,15 @@ a:focus-visible, button:focus-visible, .row:focus-visible { outline: 2px solid v
 .seq { flex: none; font: 13px var(--mono); color: var(--muted); text-decoration: none; }
 .seq:hover { color: var(--text); text-decoration: underline; }
 .bar { height: 8px; margin: 8px 0 6px; background: var(--track); border-radius: 4px; overflow: hidden; }
-.fill { position: relative; overflow: hidden; height: 100%; width: 0; background-color: var(--c); border-radius: inherit;
-    transition: width .6s ease, background-color .3s; }
-/* The stripes are a layer one stripe wider than the bar that slides by one stripe: a transform the compositor runs,
-   where an animated background would repaint the page on every frame (a slow device's whole budget). */
-[data-status=running] > .bar > .fill::after, .bar.indeterminate > .fill::after {
-    content: ""; position: absolute; top: 0; bottom: 0; left: -16px; right: 0;
+.fill { height: 100%; width: 0; background-color: var(--c); border-radius: inherit; transition: width .6s ease, background-color .3s; }
+/* The stripes move by a timer (stepStripes), not a CSS animation: see there. */
+[data-status=running] > .bar > .fill, .bar.indeterminate > .fill {
     background-image: linear-gradient(45deg, rgba(255,255,255,.22) 25%, transparent 25%, transparent 50%,
         rgba(255,255,255,.22) 50%, rgba(255,255,255,.22) 75%, transparent 75%, transparent);
-    background-size: 16px 16px; animation: stripes 1s linear infinite; }
+    background-size: 16px 16px; background-position: var(--stripe, 0px) 0; }
 .bar.indeterminate > .fill { width: 100% !important; opacity: .35; }
-[data-status=stale] > .bar > .fill::after, [data-waiting] > .bar > .fill::after { animation: none; }
-@keyframes stripes { from { transform: translateX(0); } to { transform: translateX(16px); } }
-body.offline .fill::after { animation: none !important; }
+[data-status=stale] > .bar > .fill, [data-waiting] > .bar > .fill { background-position: 0 0; }
+body.offline .fill { background-position: 0 0 !important; }
 .hint { margin: 0 0 3px; font-size: 13.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hint .ht { color: var(--text); font-weight: 500; }
 .hint .ht:not(:empty) + .hm:not(:empty)::before { content: " \2014  "; }
@@ -367,8 +363,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     .task .pct { margin-left: auto; }
 }
 @media (prefers-reduced-motion: reduce) {
-    .fill { transition: none; }
-    .fill::after { animation: none !important; }
+    .fill { transition: none; background-position: 0 0 !important; }
     .row.target { animation: none; }
     /* A static strong outline instead of the pulse and the flash */
     .row[data-waiting], .card[data-waiting=request] { animation: none; box-shadow: 0 0 0 2px var(--waiting); }
@@ -556,6 +551,8 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     const WRITE_TIMEOUT_MS = 10000;
     const BANNER_AFTER_FAILS = 2;
     const TICK_MS = 500;
+    const STRIPE_STEP_MS = 125;         // the running bars' stripes move this often (stepStripes)
+    const STRIPED = '[data-status=running] > .bar > .fill, .bar.indeterminate > .fill';   // the bars with stripes (the CSS's)
     const ALERT_TICK_MS = 1500;         // the tab title alternates and the reminder is checked at this pace
     const CHIME_GAP_MS = 2000;          // sounds never start closer together than this
     const HELD_CHIME_MS = 60000;        // a chime asked for while the browser held the audio plays on the unlock this soon after
@@ -841,6 +838,18 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         if (fill.style.width !== width) fill.style.width = width;
         bar.classList.toggle('indeterminate', indeterminate);
         setAttr(bar, 'aria-valuenow', indeterminate ? null : String(Math.floor(percent)));
+    }
+
+    // The stripes of the running bars move 2px at a time, 8 times a second, from this one timer (the CSS puts them
+    // at --stripe, and keeps them still where they should not move). A CSS animation, of the background or of a
+    // transform, has the browser draw the page at the screen's full rate for as long as a bar runs: on a slow device
+    // (a photo frame) that took three times what everything else did, a live video included. A step now and then
+    // costs a fraction of it and still reads as moving.
+    let stripeX = 0;
+    function stepStripes() {
+        if (document.hidden) return;
+        stripeX = (stripeX + 2) % 16;
+        for (const fill of document.querySelectorAll(STRIPED)) fill.style.setProperty('--stripe', stripeX + 'px');
     }
 
     function collectRefs(root) {
@@ -3033,6 +3042,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             if (e.target instanceof Element && e.target.closest('a[href]')) saveBoardScroll();
         }, true);
         setInterval(tick, TICK_MS);
+        setInterval(stepStripes, STRIPE_STEP_MS);
         clock.set(alertTick, ALERT_TICK_MS);
         loadSettings();
         poll();
