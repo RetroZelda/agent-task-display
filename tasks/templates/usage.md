@@ -201,9 +201,11 @@ file on the board host (`config_path` in /api/health). `GET /api/settings` retur
 version, exists, error, settings, defaults}`: `settings` is what is in effect (the defaults merged
 with the file; the defaults alone, with `error` set, when the file is not valid). The shape is
 `{"events": {KEY: {"highlight": bool, "title": bool, "sound": bool, "notify": bool}}, "sound":
-{"volume": 0.0-1.0}}` with KEY one of waiting, task_failed, request_failed, request_done, task_done,
-task_started, task_progress, request_created and stale. `PUT /api/settings` with `{"settings":
-{...}}` (any part of that shape) validates it (an unknown key or a non-boolean is a 400 naming the
+{"volume": 0.0-1.0}, "tasks": {"order": "number" | "progress"}}` with KEY one of waiting, task_failed,
+request_failed, request_done, task_done, task_started, task_progress, request_created and stale.
+`tasks.order` is how a request's page lists its tasks: by number (the default), or by progress (running,
+then queued, then done and failed); the API always lists them by number. `PUT /api/settings` with `{"settings":
+{...}}` (any part of that shape) validates it (an unknown key, a non-boolean or an unknown order is a 400 naming the
 field), merges it into the current settings, saves the whole result and answers like GET; `DELETE`
 removes the file. `version` (also `settings_version` in /api/events) changes whenever the settings
 do. Leave the settings to your user unless they ask you to change them.

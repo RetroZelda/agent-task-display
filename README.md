@@ -244,6 +244,11 @@ The full wording, including the template for agents that register themselves, is
 - The list shows the active requests first, then the finished ones, with running, stale, done and
   failed counts at the top. Each request's page lists its tasks, and `/r/<rid>#<tid>` links straight
   to one task.
+- **Task order**: a request's page lists its tasks by **Number** (the order they were added) or by
+  **Progress**: running tasks first (those waiting for input at the top), then queued ones, then done
+  and failed ones, then cancelled ones, by number within each group. The toggle on the *Tasks* heading
+  switches it for this device. The default for every viewer is in the [settings file](#the-settings-file),
+  and *Settings > This device > Task order > The board's* follows it again. The request list keeps its own order.
 - **Waiting** requests come first. They and their waiting tasks pulse (a steady outline if your
   system asks for reduced motion), carry a *needs input* badge and show the agent's question. The
   summary line starts with how many are waiting for you.
@@ -286,8 +291,8 @@ The defaults:
 The **Alerts** settings (the gear button in the top bar) have two tabs:
 
 - **All viewers (saved on the board)**: the defaults for everyone, saved in the board's
-  [settings file](#the-settings-file). **Reset to defaults** deletes the file, which brings the
-  defaults above back.
+  [settings file](#the-settings-file): the events above, the volume and the task order. **Reset to
+  defaults** deletes the file, which brings the defaults back.
 - **This device**: overrides for this browser only, kept in its local storage. Each cell inherits the
   board-wide value until you set it on or off. Sound and notifications are also off on every device
   until you switch them on there, because a browser only plays sound or asks for notification
@@ -296,7 +301,7 @@ The **Alerts** settings (the gear button in the top bar) have two tabs:
   default), *Light* and *Dark* stay as chosen whatever it says. The choice is kept per browser, so a
   wall display can stay dark while a laptop follows its desktop; other tabs of the same browser follow
   it at once. The same goes for the **clock** in the header: *The board's* (the default) or *This
-  device's*.
+  device's*, and for the **task order**: *The board's* (the default), *By number* or *By progress*.
 
 Writes replayed from an agent's [offline queue](#offline-queue) highlight their rows but never chime
 or notify: they are old news.
@@ -314,15 +319,17 @@ settings, and the defaults apply until then. The format:
     "waiting": {"highlight": true, "title": true, "sound": true, "notify": true},
     "task_done": {"highlight": true, "title": false, "sound": false, "notify": false}
   },
-  "sound": {"volume": 0.6}
+  "sound": {"volume": 0.6},
+  "tasks": {"order": "number"}
 }
 ```
 
 The event keys are `waiting`, `task_failed`, `request_failed`, `request_done`, `task_done`,
-`task_started`, `task_progress`, `request_created` and `stale`. You can edit the file by hand: leave
+`task_started`, `task_progress`, `request_created` and `stale`. `tasks.order` is `"number"` (the
+default) or `"progress"` (see [task order](#the-dashboard)). You can edit the file by hand: leave
 out anything you do not want to change (it keeps its default), and open dashboards pick up the
-change within seconds. If the file is not valid JSON, or has an unknown key or a value that is not `true` or
-`false`, the board uses the defaults and reports the problem (in `/api/settings`, and on the
+change within seconds. If the file is not valid JSON, or has an unknown key, a value that is not `true` or
+`false` or an unknown order, the board uses the defaults and reports the problem (in `/api/settings`, and on the
 `settings` line of `./tasks.sh --status`). Saving from the panel rewrites the file in full, with
 every key.
 
@@ -536,7 +543,7 @@ shapes, validation, errors and state rules, is the module docstring of
 | POST | `/api/tasks/<tid>/complete` | `{status?: done\|failed, message?}` |
 | POST, DELETE | `/api/tasks/<tid>/attention` | Flag one task as waiting for input: `{message}`; clear it |
 | GET | `/api/events` | The event log since a cursor, plus what is waiting, what is stale, the open stream and the board host's time zone (`clock`: `utc_offset` in seconds and `tz`; `?since=`, `?limit=`) |
-| GET, PUT, DELETE | `/api/settings` | The board-wide notification settings: read, change (`{settings: {...}}`), reset |
+| GET, PUT, DELETE | `/api/settings` | The board-wide notification settings and task order: read, change (`{settings: {...}}`), reset |
 | GET, POST, DELETE | `/api/stream` | The [live stream](#live-stream): read it, open one (`{url}`, replacing any open one), close it |
 | GET | `/api/stream/media` | The open stream as fragmented MP4, an endless response (`?id=`), which the dashboard plays; `&quality=light` or `stills` for a lighter copy |
 

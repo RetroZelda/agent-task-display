@@ -495,6 +495,8 @@ def phase_settings():
             'waiting', 'task_failed', 'request_failed', 'request_done', 'task_done', 'task_started', 'task_progress',
             'request_created', 'stale'] and all(list(v) == ['highlight', 'title', 'sound', 'notify'] for v in D['events'].values())
               and D['sound'] == {'volume': 0.6}, D)
+        check('the defaults: events, sound and tasks, in that order; tasks are listed by number', list(D) == ['events', 'sound', 'tasks']
+              and D['tasks'] == {'order': 'number'}, D)
         table = {k: ''.join('T' if v[c] else 'F' for c in ('highlight', 'title', 'sound', 'notify')) for k, v in D['events'].items()}
         check('the defaults table', table == {'waiting': 'TTTT', 'task_failed': 'TTTT', 'request_failed': 'TTTT', 'request_done': 'TTTT',
                                               'task_done': 'TFFF', 'task_started': 'TFFF', 'task_progress': 'TFFF',
@@ -517,6 +519,20 @@ def phase_settings():
         s, h, b = call('PUT', '/api/settings', {'settings': {'events': {'waiting': {'notify': False}}}})
         check('a second PUT merges onto the saved settings', b['settings']['events']['task_done']['sound'] is True
               and b['settings']['events']['waiting']['notify'] is False and b['settings']['sound']['volume'] == 1.0, b)
+        before = b['version']
+        s, h, b = call('PUT', '/api/settings', {'settings': {'tasks': {'order': 'progress'}}})
+        check('PUT tasks.order progress: saved, the rest kept, a new version', s == 200 and b['settings']['tasks'] == {'order': 'progress'}
+              and b['settings']['events']['waiting']['notify'] is False and b['settings']['sound']['volume'] == 1.0
+              and b['version'] not in (before, v0) and json.loads(cfg.read_text())['tasks'] == {'order': 'progress'}, b)
+        check('/api/events settings_version follows the task order', srv.events(None)['settings_version'] == b['version'])
+        rid = call('POST', '/api/requests', {'title': 'order', 'tasks': ['a', 'b', 'c']})[2]['id']
+        call('POST', f'/api/tasks/{rid}-3/progress', {'message': 'going', 'percent': 50})
+        call('POST', f'/api/tasks/{rid}-1/complete', {})
+        check('the API still lists a request\'s tasks by number (the order is the dashboard\'s)',
+              [t['seq'] for t in call('GET', f'/api/requests/{rid}')[2]['tasks']] == [1, 2, 3])
+        call('DELETE', f'/api/requests/{rid}')
+        s, h, b = call('PUT', '/api/settings', {'settings': {'tasks': {'order': 'number'}}})
+        check('PUT tasks.order number: back again', s == 200 and b['settings']['tasks'] == {'order': 'number'}, b)
         for body, field in (({'settings': {'events': {'bogus': {'sound': True}}}}, 'settings.events.bogus'),
                             ({'settings': {'events': {'task_done': {'flash': True}}}}, 'settings.events.task_done.flash'),
                             ({'settings': {'events': {'task_done': {'sound': 1}}}}, 'settings.events.task_done.sound'),
@@ -528,12 +544,23 @@ def phase_settings():
                             ({'settings': {'sound': {'volume': True}}}, 'settings.sound.volume'),
                             ({'settings': {'sound': {'volume': '0.5'}}}, 'settings.sound.volume'),
                             ({'settings': {'sound': {'loud': 1}}}, 'settings.sound.loud'),
+                            ({'settings': {'tasks': {'order': 'seq'}}}, 'settings.tasks.order'),
+                            ({'settings': {'tasks': {'order': 'Progress'}}}, 'settings.tasks.order'),
+                            ({'settings': {'tasks': {'order': None}}}, 'settings.tasks.order'),
+                            ({'settings': {'tasks': {'order': ['number']}}}, 'settings.tasks.order'),
+                            ({'settings': {'tasks': {'order': 1}}}, 'settings.tasks.order'),
+                            ({'settings': {'tasks': {'sort': 'number'}}}, 'settings.tasks.sort'),
+                            ({'settings': {'tasks': 'progress'}}, 'settings.tasks'),
                             ({'settings': {'colour': {}}}, 'settings.colour'), ({'settings': {'events': []}}, 'settings.events'),
                             ({'settings': 'x'}, 'settings'), ({}, 'settings')):
             s, h, b = call('PUT', '/api/settings', body)
             check(f'PUT {json.dumps(body)[:70]}: 400 field {field}', s == 400 and b.get('field') == field, b)
         s, h, b = call('PUT', '/api/settings', {'settings': {'events': {'waitng': {}}}})
         check('an unknown KEY: a did-you-mean hint', s == 400 and b.get('hint') == "did you mean 'waiting'?", b)
+        s, h, b = call('PUT', '/api/settings', {'settings': {'tasks': {'order': 'seq'}}})
+        check('an unknown task order: the error names both orders', s == 400 and b['error'] == 'settings.tasks.order must be one of: number, progress', b)
+        s, h, b = call('PUT', '/api/settings', {'settings': {'task': {'order': 'progress'}}})
+        check('a misspelt tasks: a did-you-mean hint', s == 400 and b.get('field') == 'settings.task' and b.get('hint') == "did you mean 'tasks'?", b)
         s, h, b = call('PUT', '/api/settings', raw=b'{"settings": {"sound": {"volume": NaN}}}')
         check('volume NaN: 400', s == 400 and b.get('field') == 'settings.sound.volume', b)
         check('no invalid PUT changed the file', json.loads(cfg.read_text())['events']['waiting']['notify'] is False
@@ -557,6 +584,15 @@ def phase_settings():
               and b['settings']['events']['task_started']['sound'] is True and b['settings']['events']['waiting']['notify'] is True
               and b['settings']['events']['task_done']['sound'] is False and b['settings']['sound']['volume'] == 0.6, b)
         check('/api/events settings_version follows a hand edit', srv.events(None)['settings_version'] == b['version'])
+        check('a file without tasks (as an older board wrote it): the default task order', b['settings']['tasks'] == {'order': 'number'}, b)
+        cfg.write_text('{"tasks": {"order": "progress"}}\n')
+        s, h, b = call('GET', '/api/settings')
+        check('a hand-edited task order is picked up, the alerts keep their defaults', b['error'] is None and b['settings']['tasks'] == {'order': 'progress'}
+              and b['settings']['events'] == D['events'] and srv.events(None)['settings_version'] == b['version'], b)
+        cfg.write_text('{"tasks": {"order": "random"}, "sound": {"volume": 0.1}}\n')
+        s, h, b = call('GET', '/api/settings')
+        check('an unknown order in the file: the whole file ignored (the defaults), the error names the field', b['settings'] == D
+              and 'tasks.order must be one of: number, progress' in b['error'], b)
         cfg.write_text('{"events": ')
         s, h, b = call('GET', '/api/settings')
         check('invalid JSON: the defaults, error says invalid JSON, exists true', b['settings'] == D and b['exists'] is True
@@ -591,7 +627,7 @@ def phase_settings():
     finally:
         srv.stop()
     log = srv.log_text()
-    check('each broken version of the file is logged once', log.count('using the defaults') == 3,
+    check('each broken version of the file is logged once', log.count('using the defaults') == 4,
           [line for line in log.splitlines() if 'settings' in line])
     check('saves, hand edits and resets are logged', 'settings saved to' in log and 'changed; reloaded' in log and 'settings reset' in log)
     check('the listening line names the settings file', f'settings {cfg})' in log, log[:600])

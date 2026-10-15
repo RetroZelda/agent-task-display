@@ -2,6 +2,7 @@
 - Live stream: `taskctl api POST /api/stream '{"url": "http://camera.lan:8554/"}'` shows a network video or audio stream (http, https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp) beside the board on every open dashboard; a newer url replaces it, `taskctl api DELETE /api/stream` closes it and `taskctl api GET /api/stream` shows it. Do this only when your user asks. The board host needs ffmpeg for it.
 - HTTP API: GET, POST and DELETE /api/stream and GET /api/stream/media; /api/events gains `stream`; new errors: 410 for a stream that was replaced or closed, and 503 (+Retry-After) while the stream is not connected yet or has 16 viewers.
 - Dashboard: the alert settings dialog is now just "Settings" and has a Live stream section for this device: the stream's sound on or off, and its volume.
+- Dashboard: a request's page can list its tasks by number or by progress (running, then queued, then finished). The settings gain `"tasks": {"order": "number" | "progress"}`, the default for every viewer; each device can pick its own. Nothing changes for agents: the API still lists tasks by number.
 
 ## v2 — 2026-09-28
 - Waiting for the user: `taskctl ask ID 'QUESTION'` flags a request or one task as waiting for input (the board pulses it, shows the question, and can chime or send a notification); `taskctl resume ID` clears it. While a request is open, run ask before you stop to ask the user anything or wait for them, and resume once they answer.

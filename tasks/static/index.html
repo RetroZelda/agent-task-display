@@ -35,6 +35,11 @@
   Clock: the header shows the board host's date and time in the middle of the bar (on a row of its own where the bar
   is narrow): the polls' clock moved by the zone the board reports in /api/events ("clock": utc_offset and tz), so this
   device's own clock and zone play no part. Settings > This device > Appearance > Clock can switch it to this device's own.
+
+  Task order: a request's page lists its tasks by number (as the board sends them) or by progress: running (waiting
+  first), then queued, then done and failed, then cancelled, by number within each. The board's settings ("tasks":
+  {"order"}) set it for every viewer; the toggle on the Tasks heading, or Settings > This device > Appearance > Task
+  order, picks this device's own. The request list keeps its own order.
 -->
 <script>
 try {
@@ -134,6 +139,12 @@ summary.section::-webkit-details-marker { display: none; }
 summary.section::before { content: "\25B8"; display: inline-block; width: 1em; margin-right: -4px; }
 details[open] > summary.section::before { content: "\25BE"; }
 summary.section .btn { margin-left: auto; text-transform: none; letter-spacing: 0; }
+/* The task order toggle on a request's Tasks heading: two buttons joined into one */
+.order { display: inline-flex; margin-left: auto; text-transform: none; letter-spacing: 0; }
+.order .btn { border-radius: 0; color: var(--muted); }
+.order .btn:first-child { border-radius: 6px 0 0 6px; }
+.order .btn:last-child { margin-left: -1px; border-radius: 0 6px 6px 0; }
+.order .btn[aria-pressed=true] { position: relative; color: var(--text); background: var(--surface); border-color: var(--muted); }
 .none { color: var(--muted); font-size: 14px; margin: 4px 0; }
 .empty { text-align: center; color: var(--muted); padding: 32px 0; }
 .empty .big { font-size: 18px; color: var(--text); font-weight: 600; margin: 0 0 6px; }
@@ -464,7 +475,8 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
                 </span>
             </div>
         </div>
-        <h2 class="section">Tasks <span class="count" id="count-tasks"></span></h2>
+        <h2 class="section">Tasks <span class="count" id="count-tasks"></span>
+            <span class="order" id="task-order" role="group" aria-label="Order of the tasks"><button type="button" class="btn small" data-order="number" aria-pressed="true" title="List the tasks by number">Number</button><button type="button" class="btn small" data-order="progress" aria-pressed="false" title="List the tasks running first, then queued, then finished">Progress</button></span></h2>
         <p id="task-empty" class="none" hidden>No tasks yet. Agents add them with <code id="task-empty-cmd"></code></p>
         <ol id="task-list" class="rows"></ol>
     </section>
@@ -508,6 +520,11 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             <label class="check"><input type="radio" name="dev-clock" value="board"> The board's</label>
             <label class="check"><input type="radio" name="dev-clock" value="device"> This device's</label>
             <span id="dev-clock-note" class="inline-note"></span></div>
+        <div class="field" role="radiogroup" aria-labelledby="dev-order-label"><span class="label" id="dev-order-label">Task order</span>
+            <label class="check"><input type="radio" name="dev-order" value="board"> The board's</label>
+            <label class="check"><input type="radio" name="dev-order" value="number"> By number</label>
+            <label class="check"><input type="radio" name="dev-order" value="progress"> By progress</label>
+            <span id="dev-order-note" class="inline-note"></span></div>
 
         <h3>Sound</h3>
         <div class="field"><label class="check"><input type="checkbox" id="dev-sound"> Play sounds on this device</label><span id="dev-held" class="inline-note" hidden>held by the browser until you click or tap this page</span></div>
@@ -553,6 +570,10 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         <div class="notice" id="glob-notice" hidden><p id="glob-notice-text"></p><button type="button" class="btn small" id="glob-notice-btn" hidden></button></div>
         <table class="matrix" id="glob-matrix"></table>
         <div class="field"><span class="label">Volume</span><input type="range" id="glob-volume" min="0" max="100" step="5" aria-label="Volume for all viewers"><span id="glob-volume-val" class="mono inline-note"></span></div>
+        <div class="field" role="radiogroup" aria-labelledby="glob-order-label"><span class="label" id="glob-order-label">Task order</span>
+            <label class="check"><input type="radio" name="glob-order" value="number"> By number</label>
+            <label class="check"><input type="radio" name="glob-order" value="progress"> By progress</label>
+            <span id="glob-order-note" class="inline-note"></span></div>
         <p class="note">Settings file on the board: <code id="glob-path"></code> <span id="glob-exists"></span></p>
         <div class="field"><span class="btns"><button type="button" class="btn good" id="glob-save">Save</button><button type="button" class="btn" id="glob-discard" hidden>Discard changes</button>
             <button type="button" class="btn danger" id="glob-reset">Reset to defaults</button></span><span id="glob-status" class="inline-note" role="status"></span></div>
@@ -602,6 +623,10 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     const LOCAL_KEY = 'taskstatus.settings.local';
     const THEMES = ['system', 'light', 'dark'];     // this device's theme: the system's own, or Light or Dark whatever it says
     const CLOCKS = ['board', 'device'];             // whose clock the header shows: the board host's, or this device's own
+    // How a request's page lists its tasks: by number, or by progress (running, then queued, then finished; see orderTasks).
+    const TASK_ORDERS = ['number', 'progress'];
+    const ORDER_TEXT = { number: 'by number', progress: 'running first, then queued, then finished' };
+    const PROGRESS_RANK = { running: 1, pending: 2, done: 3, failed: 3, cancelled: 4 };   // a waiting task is 0
     // What this device asks the board for: the stream as the source sends it, or a lighter copy the board makes of it.
     const STREAM_QUALITIES = ['original', 'light', 'stills'];
     const CLAIMS_KEY = 'taskstatus.claims';
@@ -652,7 +677,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             events[key] = {};
             CHANNELS.forEach((ch, i) => { events[key][ch] = table[key][i] === 'T'; });
         }
-        return { events, sound: { volume: 0.6 } };
+        return { events, sound: { volume: 0.6 }, tasks: { order: 'number' } };
     })();
     const REMIND_CHOICES = [[0, 'off'], [30, 'every 30 s'], [60, 'every minute'], [120, 'every 2 minutes'], [300, 'every 5 minutes'],
                             [600, 'every 10 minutes'], [900, 'every 15 minutes']];
@@ -704,7 +729,8 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     let boardClock = null;      // /api/events "clock" as {offset, tz}: the board host's zone now; null until the board says (or never, an older one)
     let globalSettings = DEFAULTS;
     let boardDefaults = DEFAULTS;
-    let settingsMeta = { loaded: false, unsupported: false, path: '', version: '', exists: false, error: null };
+    // parts: the top-level keys of the board's settings, which a save sends no more than (an older board refuses "tasks")
+    let settingsMeta = { loaded: false, unsupported: false, path: '', version: '', exists: false, error: null, parts: [] };
     let settingsError = '';
     let settingsBusy = false;
     let settingsRetryAt = 0;
@@ -1344,9 +1370,11 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     function renderDetail(d) {
         if (!headRefs) headRefs = collectRefs($('req-head'));
         updateHeader(d);
-        const seen = new Set();
-        reconcile($('task-list'), d.tasks, createTaskRow, updateTaskRow, seen);
+        const seen = new Set(), order = taskOrder();
+        reconcile($('task-list'), orderTasks(d.tasks, order), createTaskRow, updateTaskRow, seen);
         prune(seen);
+        setHidden($('task-order'), d.tasks.length === 0);
+        for (const btn of $('task-order').children) setAttr(btn, 'aria-pressed', btn.dataset.order === order ? 'true' : 'false');
         setHidden($('task-empty'), d.tasks.length > 0);
         setText($('task-empty-cmd'), "taskctl add " + d.id + " 'title'");
         setText($('count-tasks'), d.tasks.length ? String(d.tasks.length) : '');
@@ -1358,6 +1386,28 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         baseIcon = [st, d.status === 'running' && d.tasks_total === 0 ? null : d.percent];
         updateAttention();
         applyHash();
+    }
+
+    // A request's tasks as this page lists them: by number is the board's own order; by progress puts the running
+    // ones first (those waiting for input ahead of the rest), then the queued, then the done and failed, then the
+    // cancelled, by number within each.
+    function orderTasks(tasks, order) {
+        if (order !== 'progress') return tasks;
+        const rank = (t) => t.status === 'running' && t.attention ? 0 : PROGRESS_RANK[t.status] ?? 5;
+        return tasks.slice().sort((a, b) => rank(a) - rank(b) || a.seq - b.seq);
+    }
+
+    // The task order changed (here, in another tab, or on the board): the open request's page lists them again.
+    function applyTaskOrder() {
+        if (view === 'detail' && lastData && !notFound) renderDetail(lastData);
+    }
+
+    // order: 'number' or 'progress' for this device's own, null for the board's.
+    function setTaskOrder(order) {
+        local.task_order = order;
+        saveLocal();
+        applyTaskOrder();
+        refreshPanel();
     }
 
     function updateHeader(r) {
@@ -1519,13 +1569,15 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         }
         const vol = s && s.sound ? s.sound.volume : undefined;
         if (typeof vol === 'number' && vol >= 0 && vol <= 1) out.sound.volume = vol;
+        const order = s && s.tasks ? s.tasks.order : undefined;
+        out.tasks = { order: TASK_ORDERS.includes(order) ? order : DEFAULTS.tasks.order };
         return out;
     }
 
     // This browser's overrides (localStorage); anything malformed falls back to "inherit" or the default.
     function loadLocal() {
         const out = { events: {}, sound_enabled: false, notify_enabled: false, volume: null, remind_every: 120, stream_audio: true, stream_volume: 1,
-                      stream_quality: 'original', theme: 'system', clock: 'board' };
+                      stream_quality: 'original', theme: 'system', clock: 'board', task_order: null };
         let raw = null;
         try {
             raw = JSON.parse(localStorage.getItem(LOCAL_KEY) || 'null');
@@ -1548,6 +1600,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         }
         if (THEMES.includes(raw.theme)) out.theme = raw.theme;
         if (CLOCKS.includes(raw.clock)) out.clock = raw.clock;
+        if (TASK_ORDERS.includes(raw.task_order)) out.task_order = raw.task_order;   // null: the board's
         if (typeof raw.stream_audio === 'boolean') out.stream_audio = raw.stream_audio;
         if (typeof raw.stream_volume === 'number' && raw.stream_volume >= 0 && raw.stream_volume <= 1) out.stream_volume = raw.stream_volume;
         if (STREAM_QUALITIES.includes(raw.stream_quality)) out.stream_quality = raw.stream_quality;
@@ -1577,6 +1630,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     }
 
     const effVolume = () => local.volume === null ? globalSettings.sound.volume : local.volume;
+    const taskOrder = () => local.task_order || globalSettings.tasks.order;
 
     async function loadSettings() {
         if (settingsBusy || settingsMeta.unsupported) return;
@@ -1595,11 +1649,12 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
 
     // d: a GET /api/settings shape. ours: the answer to this page's own save or reset.
     function applySettings(d, ours) {
-        const before = settingsMeta.version;
+        const before = settingsMeta.version, order = taskOrder();
         globalSettings = fullSettings(d.settings);
         boardDefaults = fullSettings(d.defaults);
         settingsMeta = { loaded: true, unsupported: false, path: String(d.path || ''), version: String(d.version || ''),
-                         exists: !!d.exists, error: d.error || null };
+                         exists: !!d.exists, error: d.error || null, parts: Object.keys(d.settings) };
+        if (taskOrder() !== order) applyTaskOrder();
         settingsError = '';
         const changed = !ours && before && before !== settingsMeta.version;
         if (changed) globStatus = ['', ''];
@@ -2028,6 +2083,9 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         for (const radio of document.querySelectorAll('input[name=dev-clock]')) radio.checked = radio.value === local.clock;
         setText($('dev-clock-note'), local.clock === 'device' ? "this device's own zone: " + dateFmt('zoneName') + ' (' + fmtOffset(-new Date().getTimezoneOffset() * 60) + ')'
                                    : boardClock ? "the board host's zone: " + boardClock.tz + ' (' + fmtOffset(boardClock.offset) + ')' : 'this board does not report its clock');
+        for (const radio of document.querySelectorAll('input[name=dev-order]')) radio.checked = radio.value === (local.task_order || 'board');
+        setText($('dev-order-note'), local.task_order ? ORDER_TEXT[local.task_order] + ' on this device'
+                                                      : "the board's: " + ORDER_TEXT[globalSettings.tasks.order]);
         $('dev-sound').checked = local.sound_enabled;
         const vol = Math.round(effVolume() * 100);
         const volume = $('dev-volume');
@@ -2137,6 +2195,13 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         if (document.activeElement !== volume) volume.value = String(Math.round(globForm.sound.volume * 100));
         volume.disabled = !ready || globSaving;
         setText($('glob-volume-val'), Math.round(globForm.sound.volume * 100) + '%');
+        const oldBoard = ready && !meta.parts.includes('tasks');   // a page newer than the server that runs the board
+        for (const radio of document.querySelectorAll('input[name=glob-order]')) {
+            radio.checked = radio.value === globForm.tasks.order;
+            radio.disabled = !ready || globSaving || oldBoard;
+        }
+        setText($('glob-order-note'), oldBoard ? 'the board runs an older version: restart it to save this'
+                                               : "each request's page, unless a device picks its own");
         setText($('glob-path'), meta.path || '(unknown)');
         setText($('glob-exists'), !ready ? '' : meta.exists ? '' : '(not created yet: the defaults apply until you save)');
         const dirty = globDirty();
@@ -2237,7 +2302,10 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         globSaving = true;
         globStatus = ['saving…', ''];
         refreshPanel();
-        const res = await apiSend('PUT', '/api/settings', { settings: globForm });
+        // Only the parts the board has: a page served by a newer checkout than the running server still saves the rest.
+        const settings = {};
+        for (const part of Object.keys(globForm)) if (settingsMeta.parts.includes(part)) settings[part] = globForm[part];
+        const res = await apiSend('PUT', '/api/settings', { settings });
         globSaving = false;
         if (res.ok && res.data && res.data.settings) {
             applySettings(res.data, true);
@@ -2249,7 +2317,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     }
 
     async function resetGlobal() {
-        if (!confirm("Reset the alert settings for every viewer to the defaults?\n\nThis deletes the board's settings file (" +
+        if (!confirm("Reset the settings for every viewer to the defaults?\n\nThis deletes the board's settings file (" +
                      (settingsMeta.path || 'settings.json') + ').')) return;
         globSaving = true;
         globStatus = ['resetting…', ''];
@@ -2300,6 +2368,12 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
                 refreshPanel();
             });
         }
+        for (const radio of document.querySelectorAll('input[name=dev-order]')) {
+            radio.addEventListener('change', (e) => {
+                if (e.target.checked) setTaskOrder(e.target.value === 'board' ? null : e.target.value);
+            });
+        }
+        for (const btn of $('task-order').children) btn.addEventListener('click', () => setTaskOrder(btn.dataset.order));
         // The system changed its theme while the panel shows what "System" means right now.
         matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
             if (panelBuilt && $('settings').open) refreshDevice();
@@ -2363,6 +2437,14 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             globStatus = ['', ''];
             refreshPanel();
         });
+        for (const radio of document.querySelectorAll('input[name=glob-order]')) {
+            radio.addEventListener('change', (e) => {
+                if (!e.target.checked) return;
+                globForm.tasks.order = e.target.value;
+                globStatus = ['', ''];
+                refreshPanel();
+            });
+        }
         $('glob-save').addEventListener('click', saveGlobal);
         $('glob-reset').addEventListener('click', resetGlobal);
         $('glob-discard').addEventListener('click', discardGlobal);
@@ -2374,9 +2456,10 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         // Another tab of this browser changed the device settings.
         addEventListener('storage', (e) => {
             if (e.key !== LOCAL_KEY) return;
-            const quality = local.stream_quality;
+            const quality = local.stream_quality, order = taskOrder();
             local = loadLocal();
             applyTheme();
+            if (taskOrder() !== order) applyTaskOrder();
             renderClock(serverNow());
             refreshPanel();
             updateAttention();

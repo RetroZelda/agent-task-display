@@ -138,13 +138,16 @@ request may carry a numeric body field "at": the write's own time, clamped to [n
 never before the entity's updated_at. The write's times (an ETA's base included) use it, and its events
 get ts = it and replayed = true. Without the header "at" is an unknown field.
 
-Settings: the notification defaults for every viewer, a JSON file (--config), re-read whenever its
+Settings: the notification and display defaults for every viewer, a JSON file (--config), re-read whenever its
 mtime or size changes:
-  {"events": {KEY: {"highlight": bool, "title": bool, "sound": bool, "notify": bool}}, "sound": {"volume": 0..1}}
+  {"events": {KEY: {"highlight": bool, "title": bool, "sound": bool, "notify": bool}}, "sound": {"volume": 0..1},
+   "tasks": {"order": "number" | "progress"}}
   KEY: waiting task_failed request_failed request_done task_done task_started task_progress request_created
-  stale. settings = the defaults deep-merged with the file; a file that is not valid JSON or breaks the
+  stale. tasks.order is how a request's page lists its tasks (number, the default: by seq; progress: running,
+  waiting first, then pending, then done and failed, then cancelled, by seq within each); the API itself always
+  lists them by seq. settings = the defaults deep-merged with the file; a file that is not valid JSON or breaks the
   schema counts as absent (the defaults) and says why in error. PUT validates its partial settings
-  (unknown key, channel or field, non-bool, volume outside 0..1 -> 400 with field), merges them onto the
+  (unknown key, channel or field, non-bool, volume outside 0..1, an unknown order -> 400 with field), merges them onto the
   current settings and writes the full result atomically. version = sha256 of the settings as compact
   JSON with sorted keys, hex[:12].
 
@@ -449,10 +452,13 @@ _DEFAULT_EVENTS = {
     'stale': 'TTFF',
 }
 EVENT_KEYS = tuple(_DEFAULT_EVENTS)
+# How a request's page lists its tasks: by number, or running, then queued, then finished (the dashboard sorts).
+TASK_ORDERS = ('number', 'progress')
 DEFAULT_SETTINGS = {
     'events': {key: {channel: flag == 'T' for channel, flag in zip(CHANNELS, flags)}
                for key, flags in _DEFAULT_EVENTS.items()},
     'sound': {'volume': 0.6},
+    'tasks': {'order': 'number'},
 }
 
 
@@ -504,8 +510,17 @@ def check_settings(value, where):
                 if not math.isfinite(volume) or not 0 <= volume <= 1:
                     raise bad
                 out['sound']['volume'] = volume
+        elif key == 'tasks':
+            out['tasks'] = {}
+            for name, order in section(part, path).items():
+                if name != 'order':
+                    raise _unknown('field', name, ('order',), path)
+                if order not in TASK_ORDERS:
+                    field = join(path, name)
+                    raise ApiError(400, f'{field} must be one of: {", ".join(TASK_ORDERS)}', field=field)
+                out['tasks']['order'] = order
         else:
-            raise _unknown('field', key, ('events', 'sound'), where)
+            raise _unknown('field', key, ('events', 'sound', 'tasks'), where)
     return out
 
 
@@ -514,6 +529,7 @@ def merge_settings(base, patch):
     for name, channels in patch.get('events', {}).items():
         merged['events'][name].update(channels)
     merged['sound'].update(patch.get('sound', {}))
+    merged['tasks'].update(patch.get('tasks', {}))
     return merged
 
 
