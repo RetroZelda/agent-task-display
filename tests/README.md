@@ -136,7 +136,9 @@ the page's real player code runs against it (`__append=N` makes its appends take
 sound, the volume and the quality, which restarts the player on the lighter copy), `streamswap`, `streamretry`,
 `streammulti`, `streamhevc` (a codec the browser cannot play), `streamplayer` (the first seek, also on a device whose
 appends never catch up, the jump to the live edge, trimming, a full buffer, stalls, ManagedMediaSource), `streamfault`, `streamlife` (hidden tabs, the page cache), `streamnav` (scroll position
-and deep links in the split window), `streamoffline`, `streamodd` (a board that answers oddly), and `streamplay`
+and deep links in the split window), `streamoffline`, `streamodd` (a board that answers oddly), `streamfull` (full screen: the button, the whole window in
+portrait and landscape and back, Escape, this page's own reconnect keeping it, the board's run ending or restarting and a
+closed stream dropping it, another page and a reload in the split, none over audio only), and `streamplay`
 (a real source through the real MediaSource, when ffmpeg can encode H.264 and this Firefox can decode it);
 `streamlayoutold` and `streamaudioold` run the layout and audio scripts again with `__nodvh=1`, to the same exact
 sizes; `stream_check_*` repeat the generic page check with a stream open. `test_ui.py stream` runs just this group

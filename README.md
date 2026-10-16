@@ -401,6 +401,13 @@ so the name must resolve and be reachable from there.
   the video is narrower or flatter than that. Until the video is playing, the pane is a black half of the
   window that reads `connecting to <url>...` with a running timer under it. A stream with sound but no
   picture shows `audio connected` in a black box of 15% of the window.
+- **Full screen**: the button in the top right corner of the picture makes the stream cover the whole
+  window, in portrait or landscape, with the dashboard hidden behind it. The same button, or Escape, brings
+  the split back. It is for that one page only: it is not saved, other pages and devices keep their
+  split, and reloading the page starts in the split again. It also ends with the stream: when the stream
+  is closed or replaced, or its source drops and the board starts it again, the page goes back to the
+  split, so a stream that comes back appears at half the window. A hiccup on that one device, where the
+  page reconnects while the board's stream runs on, keeps it full screen.
 - **Sound**: browsers keep sound off until you have clicked or tapped the page once, so a page that opened
   by itself starts the stream muted and shows a *click for sound* button. **Settings > This device >
   Live stream** switches the sound on or off for that device (the bell is separate) and sets its volume. A

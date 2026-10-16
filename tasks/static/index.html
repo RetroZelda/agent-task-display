@@ -25,7 +25,10 @@
   nothing in the markup or in flight holds that event. Sound is per device (Settings > This device): tried
   unmuted first, else muted with a "click for sound" chip until a gesture the browser accepts. A tab that has
   been hidden and muted for a minute lets its media connection go, and takes it up again when shown. The
-  unknown-path view never polls, so it shows no stream.
+  unknown-path view never polls, so it shows no stream. A button in the pane's corner (while it shows video) makes the
+  pane cover the whole window, in either orientation, and back (or Escape). It is this page's alone, never stored, so a
+  reload starts in the split, and it lasts only while the board's stream goes on: one closed, replaced, whose run
+  ended, or live again as a new run (another since) comes back in the split. This page's own reconnects keep it.
 
   Theme: the colours follow the system's light or dark setting unless this device chose one (Settings > This
   device > Appearance: System, Light or Dark, kept in this browser). A choice is the data-theme attribute on
@@ -357,6 +360,16 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     font: 500 12.5px/1.3 var(--sans); cursor: pointer; }
 .stream-chip:hover { border-color: #8b949e; }
 .stream-chip svg { flex: none; width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+/* Full screen (this page only, until it reloads): the pane covers the whole window, over the board, in either
+   orientation, the picture letterboxed in it, until the board's stream ends. The button that toggles it sits in the
+   pane's top right corner: dimmed over the picture, clear on hover or focus. */
+html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; width: auto; height: auto; }
+.stream-full-btn { position: absolute; top: 8px; right: 8px; z-index: 1; display: inline-flex; align-items: center; justify-content: center;
+    width: 34px; height: 34px; padding: 0; border: 1px solid #484f58; border-radius: 8px; background: rgba(13, 17, 23, .7); color: #e6edf3;
+    cursor: pointer; opacity: .6; transition: opacity .15s; }
+.stream-full-btn:hover, .stream-full-btn:focus-visible { opacity: 1; border-color: #8b949e; }
+.stream-full-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.stream-full-btn[aria-pressed=true] .expand, .stream-full-btn[aria-pressed=false] .collapse { display: none; }
 /* The audio-only pane is only 100-127px wide beside a phone's board: the chip is then its icon alone. */
 @container stream (max-width: 170px) {
     .stream-chip { padding: 6px; }
@@ -494,6 +507,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         <p id="stream-line" role="status"></p>
         <p id="stream-timer" role="timer"></p>
     </div>
+    <button type="button" class="stream-full-btn" id="stream-full" hidden aria-pressed="false" aria-label="Full screen" title="Full screen"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="expand" d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/><path class="collapse" d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5"/></svg></button>
     <button type="button" class="stream-chip" id="stream-sound" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 6v12l-4.5-3.5H4z"/><path d="M16 9.5a4 4 0 0 1 0 5"/><path d="M3.5 3.5l17 17"/></svg><span id="stream-chip-text"></span></button>
 </section>
 
@@ -741,6 +755,7 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     // Live stream state
     let stream = null;          // the /api/events "stream" (checked), or null: nothing is open
     let splitLayout = false;    // html and body carry .streaming: the board is an inner scroller beside the pane
+    let streamFull = null;      // full screen: the live run it began on (liveRun); null: the split. This page's alone, never stored
     let player = null;          // the attached media, see startPlayer; null: none
     let pageLoaded = document.readyState === 'complete';  // the player attaches only after the load event
     let streamWait = 0;         // server-clock seconds at which the wait for the picture began; 0: not waiting
@@ -2580,6 +2595,22 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
     }
 
     const codecKey = (s) => (s.video || '') + '|' + (s.audio || '');
+    // One live run of the board's stream: its id and when it went live (the board's since, new every time it does).
+    const liveRun = (s) => s && s.state === 'live' ? s.id + '|' + s.since : null;
+
+    // Full screen on (only while the board's stream is live: it keeps that run) or off, back to the split.
+    function setStreamFull(on) {
+        const run = on ? liveRun(stream) : null;
+        if (run === streamFull) return;
+        streamFull = run;
+        document.documentElement.classList.toggle('stream-full', run !== null);
+        $('board').inert = run !== null;    // behind the pane: out of the tab order too
+        const btn = $('stream-full'), label = run ? 'Exit full screen' : 'Full screen';
+        setAttr(btn, 'aria-pressed', run ? 'true' : 'false');
+        setAttr(btn, 'aria-label', label);
+        setAttr(btn, 'title', run ? label + ' (Esc)' : label);
+        renderStream();
+    }
 
     // Every events answer: the stream is opened, replaced, closed, or just reported again.
     function applyStream(raw) {
@@ -2587,6 +2618,9 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         if ((s ? s.id : '') !== (stream ? stream.id : '')) resetStream();
         const was = stream !== null;
         stream = s;
+        // Full screen ends with its run: the stream closed, replaced, its run ended (connecting), or live again as a
+        // new run (a restart between two polls), so a stream that comes back opens in the split.
+        if (streamFull && liveRun(s) !== streamFull) setStreamFull(false);
         if (was !== (s !== null)) switchLayout(s !== null);
         if (!s) {
             streamParked = false;
@@ -2623,6 +2657,8 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
         setText($('stream-line'), state === 'audio' ? 'audio connected' : state === 'video' ? '' : 'connecting to ' + stream.url + '...');
         setAttr(pane, 'title', state !== 'connecting' ? null : streamBlocked ? streamBlocked.text
                                : stream.state === 'connecting' && stream.error ? stream.error : streamNote);
+        // Offered over a picture; kept while full screen whatever the pane shows, so there is always a way back.
+        setHidden($('stream-full'), state !== 'video' && !streamFull);
         const held = p ? p.held : '';
         const chip = $('stream-sound');
         setAttr(pane, 'data-held', held);
@@ -3239,6 +3275,10 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
             }, { once: true });
         }
         for (const type of ['click', 'pointerup', 'keydown']) addEventListener(type, onStreamGesture, true);
+        $('stream-full').addEventListener('click', () => setStreamFull(!streamFull));
+        addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && streamFull && !$('settings').open) setStreamFull(false);
+        });
         $('board').addEventListener('click', (e) => {
             if (e.target instanceof Element && e.target.closest('a[href]')) saveBoardScroll();
         }, true);

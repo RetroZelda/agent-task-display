@@ -1090,7 +1090,7 @@ def assert_panel(r, srv):
 
 STREAM_JSON = {'Content-Type': 'application/json'}
 STREAM_NAMES = ('layout', 'audio', 'held', 'swap', 'retry', 'multi', 'panel', 'hevc', 'player', 'fault', 'life', 'nav', 'offline', 'odd', 'check',
-                'layoutold', 'audioold')
+                'layoutold', 'audioold', 'full')
 RESULTS_STREAM: dict = {}
 
 
@@ -1166,7 +1166,7 @@ def _stream_cases(boards, play):
     cases = [frame_case('fault', 75000), frame_case('retry', 40000), frame_case('player', 40000), frame_case('offline', 40000),
              frame_case('layout', 36000), frame_case('nav', 30000), frame_case('life', 24000), frame_case('held', 30000),
              frame_case('swap', 22000), frame_case('hevc', 20000), frame_case('odd', 32000), frame_case('audio', 14000),
-             frame_case('multi', 14000), frame_case('panel', 30000),
+             frame_case('multi', 14000), frame_case('panel', 30000), frame_case('full', 70000),
              # the same two scripts on boards read as a browser without dvh units reads them (Chrome before 108)
              ('streamlayoutold', boards['layoutold'].url, '/__frame', 1280, 'light', 'streamlayout', 36000, keep + '&__nodvh=1', (), 900),
              ('streamaudioold', boards['audioold'].url, '/__frame', 1280, 'light', 'streamaudio', 14000, keep + '&__nodvh=1', (), 900),
@@ -1198,6 +1198,7 @@ def _stream_cases(boards, play):
     assert_streamnav(res['streamnav'])
     assert_streamoffline(res['streamoffline'])
     assert_streamodd(res['streamodd'])
+    assert_streamfull(res['streamfull'])
     S.section('stream: the list and detail checks, repeated with a stream open')
     for name, theme, width, height, rows in (('stream_check_390', 'light', 390, 900, n_requests), ('stream_check_1280_dark', 'dark', 1280, 900, n_requests),
                                              ('stream_check_844x390', 'light', 844, 390, n_requests), ('stream_check_detail_390', 'light', 390, 900, wait_rows)):
@@ -1348,6 +1349,63 @@ def assert_streamswap(r):
     check('swap: the media requests are for A (one per board) and C (one per board): none for B, none for A after it was replaced',
           log.count(ids['a']) == 2 and log.count(ids['c']) == 2 and ids['b'] not in log and len(log) == 4, (log, ids))
     check('swap: no JS errors', r['errors'] == [[], []], r['errors'])
+
+
+def assert_streamfull(r):
+    S.section('stream: full screen, this page only, until the board\'s stream ends')
+    if not got('streamfull', r):
+        return
+
+    def full(label, p, w, h):
+        check(f'full: {label}: the pane covers the whole {w}x{h} window, over the board (inert, a tap reaches the pane); the button says Exit full screen',
+              p['full'] and at(p, 0, 0, w, h) and p['inert'] and p['topLeft'] == 'pane' and p['btn'] is not None and p['btn']['pressed'] == 'true'
+              and p['btn']['label'] == 'Exit full screen' and p['btn']['title'] == 'Exit full screen (Esc)', p)
+
+    def split(label, p, how, w, h):
+        ok = not p['full'] and not p['inert'] and p['streaming'] and p['topLeft'] == 'board'
+        if how == 'bottom':     # portrait: the whole width at the bottom, at most half the height
+            ok = ok and abs(p['rect']['x']) < 1 and abs(p['rect']['w'] - w) < 1 and abs(p['rect']['y'] + p['rect']['h'] - h) < 1 and p['rect']['h'] <= h / 2 + 1
+        else:                   # landscape: the whole height on the right, at most half the width
+            ok = ok and abs(p['rect']['y']) < 1 and abs(p['rect']['h'] - h) < 1 and abs(p['rect']['x'] + p['rect']['w'] - w) < 1 and p['rect']['w'] <= w / 2 + 1
+        check(f'full: {label}: the split ({how}), the board in front and not inert', ok, p)
+
+    s = r['splitPortrait']
+    split('a picture in portrait', s, 'bottom', 390, 844)
+    b = s['btn']
+    check('full: over the picture, the Full screen button: not pressed, 34px in the pane\'s top right corner, dimmed',
+          b is not None and b['pressed'] == 'false' and b['label'] == 'Full screen' and b['title'] == 'Full screen'
+          and abs(b['rect']['w'] - 34) < 1 and abs(b['rect']['x'] + 34 + 8 - 390) < 1 and abs(b['rect']['y'] - (s['rect']['y'] + 8)) < 1
+          and b['opacity'] == '0.6', b)
+    full('clicked in portrait', r['fullPortrait'], 390, 844)
+    check('full: the picture fills the pane, letterboxed (object-fit: contain)', r['fullPortrait']['videoRect'] == {'x': 0, 'y': 0, 'w': 390, 'h': 844},
+          r['fullPortrait']['videoRect'])
+    full('turned to landscape while full', r['fullRotated'], 844, 390)
+    split('clicked again, in landscape', r['splitLandscape'], 'right', 844, 390)
+    check('full: back in the split, the button is Full screen again, the pane the size it had (16:9, half the width)',
+          r['splitLandscape']['btn']['pressed'] == 'false' and at(r['splitLandscape'], 422, 0, 422, 390), r['splitLandscape'])
+    full('clicked in landscape', r['fullLandscape'], 844, 390)
+    split('Escape', r['escaped'], 'right', 844, 390)
+    o = r['ownRetry']
+    check('full: this page\'s own reconnect (the browser failed to decode; the board\'s run goes on): still full, "connecting", the button still there to leave',
+          o['full'] and o['state'] == 'connecting' and at(o, 0, 0, 390, 844) and o['btn'] is not None and o['btn']['pressed'] == 'true', o)
+    full('and the picture back after it', r['ownRetried'], 390, 844)
+    split('another board page beside it (another tab): its own split, while the first is full', r['other'], 'bottom', 390, 844)
+    check('full: nothing about it is stored on the device', 'full' not in r['storedFull'], r['storedFull'])
+    split('reloaded while full: the split again', r['reloaded'], 'bottom', 390, 844)
+    full('the board\'s run that will end', r['dieFull'], 390, 844)
+    split('the board\'s run ended: out of full screen as soon as the page heard', r['dieEnded'], 'bottom', 390, 844)
+    d = r['dieRestarted']
+    split('the board started the run again: the picture in the split, not full', d, 'bottom', 390, 844)
+    check('full: the restarted run\'s picture, the button offered again, not pressed', d['state'] == 'video' and d['btn'] is not None and d['btn']['pressed'] == 'false', d)
+    full('a stream live from one since', r['runFull'], 390, 844)
+    split('the same stream live again from a later since (a restart between two polls)', r['runNew'], 'bottom', 390, 844)
+    full('before the stream closes', r['closeFull'], 390, 844)
+    c = r['closed']
+    check('full: the stream closed while full: no pane, no full screen, the board has the whole window and is not inert',
+          not c['streaming'] and c['hidden'] and not c['full'] and not c['inert'] and c['topLeft'] == 'board', c)
+    check('full: an audio-only stream: no Full screen button', r['audio']['state'] == 'audio' and r['audio']['btn'] is None, r['audio'])
+    check('full: the stream requests went through (201 each)', r['post'] == {'live': 201, 'die': 201, 'audio': 201}, r['post'])
+    check('full: no JS errors', r['errors'] == [[]], r['errors'])
 
 
 def assert_streamretry(r):
