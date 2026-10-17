@@ -41,7 +41,7 @@ TASK_KEYS = {'id', 'request_id', 'seq', 'title', 'status', 'percent', 'message',
 REQUEST_KEYS = {'id', 'title', 'origin', 'status', 'message', 'created_at', 'updated_at', 'completed_at',
                 'elapsed', 'percent', 'tasks_total', 'tasks_done', 'tasks_failed', 'tasks_running',
                 'tasks_pending', 'tasks_cancelled', 'current', 'eta_at', 'stale', 'url', 'attention', 'waiting',
-                'tasks_waiting'}
+                'tasks_waiting', 'report'}
 NUDGE = ('taskctl: task was never started; its running time is approximate - run `taskctl start TID` '
          'when you begin a task')
 
@@ -540,6 +540,63 @@ def main_flow():
     check('flush with nothing queued: rc 0, says so', rc == 0 and out == '' and err == f'taskctl: nothing queued for {URL}\n', (rc, err))
     rc, out, err = tc('ping')
     check('ping with nothing queued: no queue note', rc == 0 and 'queued' not in err, err)
+
+    S.section('report: send, replace, show, delete')
+    rc, out, _ = tc('new', 'Report via the CLI')
+    rrid = out.split()[0]
+    html_file, md_file = WORK / 'weekly.html', WORK / 'notes.MD'
+    html_doc = '<!doctype html><html><head><title>Weekly — ✓</title></head><body><p>all good</p></body></html>\n'
+    html_file.write_text(html_doc, encoding='utf-8')
+    md_file.write_text('# Notes\n\n- one\n', encoding='utf-8')
+    rc, out, err = tc('report', rrid, str(html_file), '--artifact', 'https://claude.ai/artifact/abc')
+    rep = api(URL, 'GET', f'/api/requests/{rrid}/report')[1]
+    size = len(html_doc.encode())
+    check('report FILE.html: the page on stdout, a note of what was saved, the board has it as sent',
+          rc == 0 and out == f'{URL}/r/{rrid}/report\n' and err == f'taskctl: report of {rrid} saved (html, {size} bytes, version 1)\n'
+          and rep['content'] == html_doc and rep['format'] == 'html' and rep['title'] == 'Weekly — ✓'
+          and rep['artifact_url'] == 'https://claude.ai/artifact/abc', (rc, out, err, rep))
+    rc, out, err = tc('report', rrid, str(md_file), '--title', 'My notes')
+    rep = api(URL, 'GET', f'/api/requests/{rrid}/report')[1]
+    check('report FILE.MD --title: Markdown (the extension in any case), replaced, version 2', rc == 0 and rep['format'] == 'markdown'
+          and rep['title'] == 'My notes' and rep['version'] == 2 and rep['artifact_url'] is None and 'version 2' in err, (rc, err, rep))
+    p = subprocess.run([str(WRAPPER), '--strict', '--url', URL, 'report', rrid, '-', '--format', 'md'], input='# From stdin\n',
+                       capture_output=True, text=True, cwd=WORK, env=ENV, timeout=60)
+    rep = api(URL, 'GET', f'/api/requests/{rrid}/report')[1]
+    check('report RID - --format md: from stdin', p.returncode == 0 and rep['content'] == '# From stdin\n' and rep['title'] == 'From stdin', (p, rep))
+    rc, out, err = tc('show', rrid)
+    check('show: a report line with its page, format, size and version', rc == 0
+          and f'report: {URL}/r/{rrid}/report (markdown, 13 bytes, version 3)' in lines(out), out)
+    (WORK / 'plain.txt').write_text('x')
+    (WORK / 'latin1.html').write_bytes(b'<p>caf\xe9</p>')
+    (WORK / 'empty.md').write_text('  \n')
+    for label, argv, msg in (
+            ('an unknown extension', ('report', rrid, str(WORK / 'plain.txt')), "add --format html or --format markdown"),
+            ('stdin without --format', ('report', rrid, '-'), "can't tell whether stdin is HTML or Markdown"),
+            ('a task id', ('report', f'{rrid}-1', str(html_file)), f'this command needs its request id {rrid}'),
+            ('a missing file', ('report', rrid, str(WORK / 'nope.html')), 'cannot read'),
+            ('a file that is not UTF-8', ('report', rrid, str(WORK / 'latin1.html')), 'is not UTF-8 text'),
+            ('an empty file', ('report', rrid, str(WORK / 'empty.md')), 'is empty'),
+            ('no FILE', ('report', rrid), 'report needs the FILE to send'),
+            ('--delete with a FILE', ('report', rrid, str(html_file), '--delete'), 'report RID --delete takes nothing else')):
+        rc, out, err = tc(*argv)
+        check(f'report: {label}: a usage error (exit 2), nothing sent', rc == 2 and msg in err and out == '', (rc, err))
+    big = WORK / 'big.html'
+    big.write_text('x' * (8 * 1024 * 1024 + 1))
+    rc, out, err = tc('report', rrid, str(big))
+    check('report: a file over the board\'s 8 MiB: a usage error before sending', rc == 2 and 'too large' in err, (rc, err))
+    big.unlink()
+    check('the usage errors left the report as it was', api(URL, 'GET', f'/api/requests/{rrid}/report')[1]['version'] == 3)
+    rc, out, err = tc('report', 'zzzzzz', str(html_file))
+    check('report: an unknown request: rejected (exit 1 strict), the board\'s error', rc == 1 and "unknown request 'zzzzzz'" in err, (rc, err))
+    rc, out, err = tc('report', 'offline', str(html_file))
+    check("report: the 'offline' id: nothing sent, exit 0", rc == 0 and out == '' and 'nothing to report' in err, (rc, err))
+    rc, out, err = tc('report', rrid, '--delete')
+    check('report --delete: deleted', rc == 0 and err == f'taskctl: the report of {rrid} deleted\n'
+          and get_req(rrid)['report'] is None, (rc, err))
+    rc, out, err = tc('report', rrid, '--delete')
+    check('report --delete again: says there was none', rc == 0 and err == f'taskctl: {rrid} had no report\n', (rc, err))
+    rc, out, err = tc('report', rrid, str(html_file), url='http://127.0.0.1:9', strict=False)
+    check('report to an unreachable board: queued for replay (exit 0)', rc == 0 and 'queued for replay' in err and out == '', (rc, err))
 
 
 def run_signals():

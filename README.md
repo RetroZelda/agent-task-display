@@ -19,6 +19,8 @@ one `curl` line.
 - **Notifications**: per kind of event, a row highlight, an unread counter and blinking tab title,
   a chime and a desktop notification. Board-wide defaults live in a settings file; each browser can
   override them. Browsers on other machines need the optional [HTTPS listener](#https-for-notifications).
+- **Reports**: a request can carry a report, the same HTML page an agent publishes as a Claude
+  artifact (or Markdown), shown on a page of its own on every device. See [Reports](#reports).
 - **Live stream**: one API call shows a network video or audio stream (a camera, an encoder) beside the
   dashboard on every open page, below it on a portrait screen and to its right on a landscape one. See
   [Live stream](#live-stream).
@@ -37,6 +39,7 @@ one `curl` line.
 - [Using it from Claude Code](#using-it-from-claude-code)
 - [The dashboard](#the-dashboard)
 - [Notifications and settings](#notifications-and-settings)
+- [Reports](#reports)
 - [Live stream](#live-stream)
 - [taskctl reference](#taskctl-reference)
 - [HTTP API](#http-api)
@@ -377,6 +380,44 @@ browser you change: open `chrome://flags/#unsafely-treat-insecure-origin-as-secu
 `edge://flags/#unsafely-treat-insecure-origin-as-secure`), enter the board's address exactly as you
 open it, such as `http://192.168.1.10:8765`, set the flag to *Enabled* and relaunch the browser.
 
+## Reports
+
+A request can have one report: a document the agent wrote about the work, shown on a page of its own on
+the dashboard (`/r/<rid>/report`). The request's page gets a **Report** button, and the list marks the
+request with *report*.
+
+It is meant to mirror a Claude artifact. When an agent publishes a report as an artifact for a request
+it tracks on the board, the skill has it send the very same file to the request, and again after every
+update, so the artifact on claude.ai and the board's report page always show the same thing:
+
+```sh
+taskctl report k3m9qa report.html --artifact https://claude.ai/code/artifact/0123abcd
+taskctl report k3m9qa findings.md --title 'Migration findings'
+some-generator | taskctl report k3m9qa - --format markdown
+taskctl report k3m9qa --delete
+```
+
+- **HTML** is shown exactly as sent, like the artifact: its own styles, scripts and charts, in a frame
+  that fills the window under a slim header. A page without a doctype gets the same skeleton an artifact
+  gets (charset and viewport). Its scripts run in a sandbox with an origin of its own, so they cannot
+  read or change anything on the board. Links that leave the report open in a new tab.
+- **Markdown** (a GitHub-flavoured subset: headings, lists and task lists, tables, code, quotes, links
+  and images) is rendered by the board, in a reading column that follows the theme. Raw HTML in it is
+  shown as text.
+- **The header** shows the title (the page's `<title>` or the first Markdown heading, unless `--title`
+  says otherwise), the format, when it was updated, its version and size, a link to the Claude artifact
+  (`--artifact`) and *Open on its own*, the report as a page by itself.
+- **Live**: a new version reloads the page on every open dashboard within a couple of seconds, and the
+  report follows each device's theme (*Settings > This device > Theme*): artifact pages that use the
+  usual `data-theme` attribute turn light or dark with it.
+- **Limits**: one report per request, up to 8 MiB; each send replaces it. It can be sent to a finished
+  request too (that does not reopen it), and it is deleted with its request. While the board is
+  unreachable, `taskctl report` queues it like any other write, and only the newest queued version is
+  sent.
+
+The board cannot fetch an artifact from claude.ai itself (artifacts are private to your account), so the
+agent sends the file it published.
+
 ## Live stream
 
 The board can play one network stream, video and audio, beside the dashboard on every open page, for
@@ -461,6 +502,7 @@ The installed CLI is `~/.claude/skills/task-status/taskctl`. From a clone, it is
 | `ping` | Check the board. Prints its URL, and how many writes are queued. |
 | `flush` | Replay the [offline queue](#offline-queue) now. |
 | `run TID [--every SEC] [--percent-regex RE] -- CMD...` | Run a command and report its output as it goes (below). |
+| `report RID FILE [--title T] [--artifact URL] [--format F]` | Send the request's [report](#reports): HTML or Markdown (`-` reads stdin, with `--format html` or `markdown`). Prints its page. `--delete` removes it. |
 | `usage` | Print the board's instructions for agents (`/api/usage`). |
 | `api METHOD PATH [JSON]` | Call any board route (`PATH` starts with `/api/`) and print the response body. |
 | `changelog` | Print what each board version added (`/api/changelog`). |
@@ -549,6 +591,8 @@ shapes, validation, errors and state rules, is the module docstring of
 | DELETE | `/api/requests/<rid>` | Delete a request and its tasks |
 | POST | `/api/requests/<rid>/complete` | Close it: `{status?: done\|failed, message?}` (cascades) |
 | POST, DELETE | `/api/requests/<rid>/attention` | Flag the request as waiting for input: `{message}`; clear it |
+| PUT, GET, DELETE | `/api/requests/<rid>/report` | The request's [report](#reports): `{format: html\|markdown, content, title?, artifact_url?}` (up to 8 MiB); read it with its content; delete it |
+| GET | `/api/requests/<rid>/report/page` | The report as a page (sandboxed by its Content-Security-Policy), `?theme=light\|dark` |
 | POST | `/api/requests/<rid>/tasks` | Add tasks: `{title, start?}` or `{titles: [...]}` |
 | GET | `/api/tasks/<tid>` | One task |
 | POST | `/api/tasks/<tid>/progress` | `{message, percent?, eta_seconds?}` |

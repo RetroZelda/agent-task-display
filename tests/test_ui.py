@@ -31,6 +31,10 @@ The pages case runs a board of its own with 37 finished requests and 2 running: 
 button, the page size (stored on the device), a reload and Back from a request keeping the page, a request finishing,
 requests deleted from under the page shown, and a list short enough for no pager.
 
+The reports case runs a board of its own with requests that have an HTML report (whose script probes its sandbox and
+posts what it found), a Markdown one and none: the report view and its frame, the sandbox, a new version, this
+device's theme, the Report button and the list's marker, a deleted report and request, an unknown request.
+
 The live stream's cases (stream_cases) run on boards of their own too (a board has one stream), each with
 tests/lib/fake_ffmpeg.py first on its PATH as `ffmpeg`, so a stream's URL (http://fake.invalid/live, /hang,
 /audio, /hevc?audio=0, /live?die=30...) says how the "source" behaves. They load the boards in iframes of a
@@ -43,7 +47,7 @@ failure paths, parking, going to a request and Back, and an outage. The streampl
 encode H.264, and this Firefox can decode it) plays a real source with the real MediaSource. The existing
 list and detail checks are repeated with a stream open (stream_check_*).
 
-    python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages]   only those groups of cases (all of them without arguments)
+    python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages] [reports]   only those groups of cases (all of them without arguments)
     FIREFOX=/path/to/firefox   use that binary
     UI_SHOTS_DIR=DIR           keep every case's screenshot there, for a human look (the stream cases then
                                leave their frames and stream open, so the screenshot shows them)
@@ -798,6 +802,113 @@ def assert_pages(r):
     s = r['short']
     check('pages: 8 left: no pager, all 8 listed, the count says 8', not s['pager'] and s['rows'] == s['want'] and len(s['rows']) == 8 and s['count'] == '8', s)
     check('pages: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+# A request's report on the dashboard (tests/ui/report.js), on a board of its own. A's report probes its sandbox and
+# posts what it found to its parent, the board page.
+PROBE_REPORT = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Probe report</title>
+<style>:root { --bg: #fffdf8; } @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #191815; } }
+:root[data-theme="dark"] { --bg: #191815; } body { background: var(--bg); }</style>
+</head>
+<body>
+<p><a id="ext" href="https://example.com/x">out</a> <a id="frag" href="#sec">in</a></p>
+<h2 id="sec">Section</h2>
+<script>
+(function () {
+  var out = { origin: String(self.origin), title: document.title, theme: document.documentElement.getAttribute('data-theme'),
+              dark: matchMedia('(prefers-color-scheme: dark)').matches, src: location.pathname + location.search,
+              read: null, write: null, done: false, targets: {} };
+  try { out.parent = parent.document.title; } catch (e) { out.parent = 'blocked'; }
+  try { localStorage.setItem('k', '1'); out.storage = 'ok'; } catch (e) { out.storage = 'blocked'; }
+  document.addEventListener('click', function (e) { var a = e.target.closest('a'); out.targets[a.id] = a.target; e.preventDefault(); });
+  document.getElementById('ext').click();
+  document.getElementById('frag').click();
+  fetch('/api/requests').then(function (r) { return r.text(); }).then(function () { out.read = 'read'; }, function () { out.read = 'blocked'; });
+  fetch('/api/requests/RID/complete', { method: 'POST', body: '{"status": "failed"}' })
+    .then(function (r) { out.write = 'status ' + r.status; }, function () { out.write = 'failed'; });
+  setInterval(function () { out.done = out.read !== null && out.write !== null; parent.postMessage({ probe: out }, '*'); }, 250);
+})();
+</script>
+</body>
+</html>
+"""
+REPORT_SANDBOX = 'allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads'
+
+
+def report_cases(env):
+    board = ScratchServer(TMP, '--host', '127.0.0.1', script=UI / 'harness.py', name='ui-report', env=env).start()
+    j = {'Content-Type': 'application/json'}
+    try:
+        ids = {k: api(board.url, 'POST', '/api/requests', {'title': title, 'tasks': ['a']}, headers=j)[1]['id']
+               for k, title in (('a', 'Request with an HTML report'), ('b', 'Request with a Markdown report'), ('c', 'Request with none'))}
+        api(board.url, 'PUT', f"/api/requests/{ids['a']}/report", {'format': 'html', 'content': PROBE_REPORT.replace('RID', ids['a']),
+                                                                   'artifact_url': 'https://claude.ai/artifact/a1'}, headers=j)
+        api(board.url, 'PUT', f"/api/requests/{ids['b']}/report", {'format': 'markdown', 'content': '# Findings\n\n| a | b |\n|---|---|\n| 1 | 2 |\n'},
+            headers=j)
+        assert_report(firefox('report', board.url, '/__frame', 1280, 'light', 'report', 60000, '&__ids=' + quote(json.dumps(ids))), ids)
+        check('report: the board logged no tracebacks', 'Traceback' not in board.log_text(), board.log_text()[-1500:])
+    finally:
+        board.stop()
+
+
+def assert_report(r, ids):
+    S.section("a request's report on the dashboard")
+    if not got('report', r):
+        return
+    A, a = ids['a'], r['a']
+
+    def fills(label, v, w, h):
+        f = v['frame']
+        check(f'report: {label}: the frame fills the window ({w}x{h}) from under the header to 12px above the bottom; nothing overflows',
+              f is not None and abs(f['rect']['y'] + f['rect']['h'] + 12 - h) <= 1 and abs(f['rect']['w'] - (w - 24 if w < 600 else 928)) <= 1
+              and v['scroll'][0] <= v['scroll'][1] and v['scroll'][2] <= h + 1, (f, v['scroll'], v['vh']))
+
+    check('report: the view: its title, back to the request, the meta line, the Claude artifact and the page on its own in new tabs',
+          a['shown'] and a['title'] == 'Probe report' and a['back'] == [f'/r/{A}', 'Request with an HTML report']
+          and a['meta'][0] == 'HTML' and a['meta'][1].startswith('updated ') and a['meta'][2] == 'version 1' and a['meta'][3].endswith(' KiB')
+          and a['artifact'] == {'href': 'https://claude.ai/artifact/a1', 'target': '_blank', 'rel': 'noopener noreferrer'}
+          and a['own'] == {'href': f'/api/requests/{A}/report/page?v=1', 'target': '_blank'} and a['none'] is None
+          and a['doc'] == 'Report · Probe report — Task Status', a)
+    check('report: the frame shows the board\'s page of it, sandboxed, no referrer', a['frame']['src'] == f'/api/requests/{A}/report/page?v=1'
+          and a['frame']['sandbox'] == REPORT_SANDBOX and a['frame']['referrer'] == 'no-referrer', a['frame'])
+    fills('phone (390x844)', a, 390, 844)
+    fills('desktop (1280x800)', r['aWide'], 1280, 800)
+    p = r['probe']
+    check('report: inside, its script ran, in an opaque origin: no parent access, no storage', p and p['origin'] == 'null'
+          and p['parent'] == 'blocked' and p['storage'] == 'blocked' and p['title'] == 'Probe report', p)
+    check('report: inside, it can read nothing from the board, and its write is refused (the request still running)',
+          p and p['read'] == 'blocked' and p['write'] == 'failed' and r['stillRunning'] == 'running', (p, r['stillRunning']))
+    check('report: inside, a link that leaves opens in a new tab, an in-page #link stays', p and p['targets'] == {'ext': '_blank', 'frag': ''}, p)
+    check('report: inside, the system\'s theme (no data-theme) while the device follows it', p and p['theme'] is None and p['dark'] is False, p)
+    v2, p2 = r['v2'], r['v2probe']
+    check('report: a new version: the frame reloads it (v=2), the header follows (title, version, artifact)', v2['frame']['src'] == f'/api/requests/{A}/report/page?v=2'
+          and p2['title'] == 'Probe report v2' and v2['title'] == 'Probe report v2' and v2['meta'][2] == 'version 2'
+          and v2['artifact']['href'] == 'https://claude.ai/artifact/a2', (v2, p2))
+    for name, theme, dark in (('dark', 'dark', True), ('light', 'light', False), ('system', None, False)):
+        st = r[name]
+        want = f'/api/requests/{A}/report/page?v=2' + (f'&theme={theme}' if theme else '')
+        check(f'report: this device\'s theme {name}: the frame reloads with it, the report\'s <html> carries data-theme {theme!r}',
+              st['src'] == want and st['probe']['src'] == want and st['probe']['theme'] == theme, st)
+    b = r['b']
+    check('report: a Markdown report: its view (title from its heading, Markdown, no artifact link)', b['shown'] and b['title'] == 'Findings'
+          and b['meta'][0] == 'Markdown' and b['artifact'] is None and b['frame']['src'] == f"/api/requests/{ids['b']}/report/page?v=1", b)
+    c = r['c']
+    check('report: a request with none: no frame, no links, how an agent sends one', c['shown'] and c['frame'] is None and c['own'] is None
+          and c['none'] == f"This request has no report. An agent sends one with taskctl report {ids['c']} FILE" and c['title'] == 'Request with none', c)
+    check('report: the request page has a Report button to it (A), none without a report (C)', r['detailA']['hidden'] is False
+          and r['detailA']['href'] == f'/r/{A}/report' and r['detailA']['text'] == 'Report' and r['detailA']['title'].startswith('Probe report v2 (updated ')
+          and r['detailC']['hidden'] is True, (r['detailA'], r['detailC']))
+    check('report: the list marks the requests with a report', r['list'] == {'a': 'report', 'b': 'report', 'c': None}, r['list'])
+    dl = r['deleted']
+    check('report: the report deleted under the view: the frame and links go, it says how to send one', dl['frame'] is None and dl['own'] is None
+          and dl['artifact'] is None and dl['none'].startswith('This request has no report.') and dl['title'] == 'Request with an HTML report', dl)
+    check('report: the request deleted: the not-found view', r['gone']['notFound'] == 'This request was deleted.', r['gone'])
+    check('report: an unknown request\'s report: not found', r['unknown'] and r['unknown']['notFound'] == 'Request not found', r['unknown'])
+    check('report: no JS errors in the board pages', all(e == [] for e in r['errors']), r['errors'])
 
 
 def one_request(base: str, title: str, n: int, start: bool = True):
@@ -1738,11 +1849,11 @@ def assert_streamplay(r, up, name='streamplay'):
 
 
 if __name__ == '__main__':
-    # python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages]: only those groups of cases (every one without arguments)
-    every = {'base', 'v2', 'stream', 'theme', 'clock', 'order', 'pages'}
+    # python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages] [reports]: only those groups of cases (every one without arguments)
+    every = {'base', 'v2', 'stream', 'theme', 'clock', 'order', 'pages', 'reports'}
     groups = set(sys.argv[1:]) or every
     if groups - every:
-        sys.exit(f'usage: test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages]   (no argument: all); not a group: {sorted(groups - every)}')
+        sys.exit(f'usage: test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages] [reports]   (no argument: all); not a group: {sorted(groups - every)}')
     env = clean_env(UI_RESULTS_DIR=RESULTS)
     board = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', str(STALE_AFTER), script=UI / 'harness.py',
                           name='ui', env=env).start()
@@ -1764,6 +1875,8 @@ if __name__ == '__main__':
             order_cases(env)
         if 'pages' in groups:
             pages_cases(env)
+        if 'reports' in groups:
+            report_cases(env)
         if 'v2' in groups:
             v2_cases(env)
         if 'stream' in groups:

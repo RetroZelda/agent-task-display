@@ -57,6 +57,12 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
   POST   /api/requests/{rid}/attention  {message} -> Request + tasks + now; a closed request is a 409
                                    {error, status, hint: "the request is closed"}
   DELETE /api/requests/{rid}/attention  -> Request + tasks + now (idempotent; the request's own only)
+  PUT    /api/requests/{rid}/report  {format: html|markdown, content, title?, artifact_url?} -> 201 (new) or 200
+                                   (replaced) Report + request_id + now; the body may be up to 8 MiB (see Reports)
+  GET    /api/requests/{rid}/report  Report + request_id + content + now; 404 when the request has none
+  DELETE /api/requests/{rid}/report  {deleted: bool, request_id, now} (idempotent)
+  GET    /api/requests/{rid}/report/page  the report as a page, text/html, sandboxed (see Reports); ?theme=light|dark;
+                                   404 with a small page when there is none
   GET    /api/tasks/{tid}          Task + now
   POST   /api/tasks/{tid}/progress {message, percent?, eta_seconds?} -> Task + now
   POST   /api/tasks/{tid}/complete {status?: done|failed, message?} -> Task + now
@@ -82,7 +88,8 @@ Shapes (every key always present, null when absent; times are float epoch second
            start_inferred updated_at completed_at elapsed stale url attention
   Request  id title origin status message created_at updated_at completed_at elapsed percent tasks_total
            tasks_done tasks_failed tasks_running tasks_pending tasks_cancelled current eta_at stale url
-           attention waiting tasks_waiting
+           attention waiting tasks_waiting report
+  Report   format title artifact_url size version created_at updated_at url page (a Request's report: this, or null)
   Event    id ts type request_id task_id request_title task_title status percent message replayed
   Task status: pending|running|done|failed|cancelled. Request status: running|done|failed.
   tasks_total counts NON-cancelled tasks (Y), tasks_done is X. Request percent = mean over non-cancelled
@@ -92,10 +99,12 @@ Shapes (every key always present, null when absent; times are float epoch second
   user (a Request's is its own, not its tasks'). waiting = running and (the request's attention or a
   running task's); tasks_waiting = running tasks with attention. stale = running, silent > --stale-after,
   not within 60s past a running eta_at, and never while it has attention (task) or is waiting (request).
-  url = <public>/r/<rid>, plus #<tid> for a task.
+  url = <public>/r/<rid>, plus #<tid> for a task. A Report's url is <public>/r/<rid>/report (the dashboard's view of
+  it), page <public>/api/requests/<rid>/report/page; size is its content's UTF-8 bytes; version counts its writes.
 
 Errors are {error, field?, hint?}: 400 validation, 403 cross-origin write, 404 unknown id/route, 405
-(+Allow), 409 state conflict, 410 a stream that was replaced or closed, 411 chunked, 413 body > 64 KiB, 500,
+(+Allow), 409 state conflict, 410 a stream that was replaced or closed, 411 chunked, 413 body > 64 KiB (8 MiB
+for PUT .../report), 500,
 503 database busy (+Retry-After: 1), or a stream not connected yet, full or shutting down (+Retry-After).
 http.server's own rejections (malformed request line 400, 414, 431, unknown method 501) are JSON too.
 Success bodies gain "warnings": [str] only when something was truncated, clamped or ignored.
@@ -120,7 +129,8 @@ Events: every change writes events in its own transaction; they outlive deletes.
 are the entity's after the change (the request's for request-level events), times the write's.
   request_created; request_reopened (a task added to a closed request); request_done, request_failed (a
   status change by request complete or expiry; message = the request's; the cascade writes no task
-  events); request_deleted; task_added (each task added to an existing request); task_started (pending ->
+  events); request_deleted; report_updated, report_deleted (message = the report's title); task_added
+  (each task added to an existing request); task_started (pending ->
   running by progress or attention, or a single add with start); task_progress (progress on a running
   task); task_done, task_failed (a status change by task complete); attention (message = the question;
   task_id null at request level); attention_cleared (message = the question that was cleared).
@@ -134,7 +144,7 @@ are the entity's after the change (the request's for request-level events), time
   board's local date and time are now + utc_offset (the dashboard's header shows them).
 
 Replays: taskctl queues writes while the board is unreachable and replays them later with the header
-X-Tasks-Replay: 1. On create request, request and task complete, progress and attention set/clear such a
+X-Tasks-Replay: 1. On create request, request and task complete, progress, attention set/clear and report put/delete such a
 request may carry a numeric body field "at": the write's own time, clamped to [now - 86400, now] and
 never before the entity's updated_at. The write's times (an ETA's base included) use it, and its events
 get ts = it and replayed = true. Without the header "at" is an unknown field.
@@ -181,6 +191,18 @@ Stream: one network stream can be open at a time, shown beside the board on ever
   <db>.stream.json (mode 600; --db tasks/data/tasks.db gives tasks/data/tasks.stream.json) and reopened
   after a restart; only DELETE removes it.
 
+Reports: a request's optional document, one at most: format html (the very file an agent publishes as a Claude
+  artifact, so both show the same) or markdown (rendered by the board: a GitHub-flavoured subset, raw HTML shown as
+  text). PUT replaces the whole report (version + 1, created_at kept); it is allowed whatever the request's status,
+  never reopens it and bumps its updated_at like any write; the report goes with its request. content: a non-empty
+  string, NULs dropped; title: up to 200 characters, else the HTML's <title> or the Markdown's first heading, else
+  null; artifact_url: an http(s) URL of up to 2048 characters (the Claude artifact it replicates), or null. The page
+  route serves HTML as sent (a fragment, with no doctype or <html>, gets a skeleton: doctype, charset, viewport),
+  and Markdown in a page of the board's styles, each with a small script first in its head (data-theme on <html>
+  from ?theme=, links that leave the page open in a new tab), Cache-Control: no-store and Content-Security-Policy:
+  sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads: an
+  opaque origin, so its scripts run but its writes to the board carry Origin: null (refused) and it can read nothing.
+
 Writes (POST, PUT, DELETE) carrying an Origin header are refused unless Origin equals Host and Host names
 this machine (IP literal, [IPv6] included, localhost, its hostname, the --public-url host). No auth.
 """
@@ -212,11 +234,12 @@ import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from html import unescape as html_unescape
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 
 VERSION = '3'
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 TASKS_DIR = Path(__file__).resolve().parent
 # The agent-facing files; X-Tasks-Docs hashes them so an installed skill can tell it is out of date.
 DOCS_FILES = ('skill/SKILL.md', 'templates/usage.md', 'templates/rule.md', 'templates/changelog.md',
@@ -441,6 +464,379 @@ def docs_version():
     with _docs_lock:
         _docs_cache.update(key=key if complete else None, value=value)
     return value
+
+
+# Reports
+
+# A request's optional report: an HTML document (the same file an agent publishes as a Claude artifact) or Markdown,
+# rendered here. GET /api/requests/<rid>/report/page serves it as a document of its own, sandboxed by its CSP: an
+# opaque origin, so its scripts run but can never reach the board (its writes carry Origin: null and are refused,
+# and no reply is readable without CORS).
+REPORT_FORMATS = ('html', 'markdown')
+REPORT_BODY_MAX = 8 * 1024 * 1024
+ARTIFACT_URL_MAX = 2048
+REPORT_CSP = 'sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads'
+# Put first in every report's <head>: the dashboard's theme as data-theme on <html> (the artifact pages' own
+# contract: :root[data-theme=dark|light] wins over the system's), and links that leave the page open in a new tab
+# (an in-page #link stays put).
+REPORT_SHIM = """<script>(function () {
+var t = %s; if (t) document.documentElement.setAttribute('data-theme', t);
+document.addEventListener('click', function (e) {
+  var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+  if (!a || a.target) return;
+  var h = a.getAttribute('href') || '';
+  if (h.charAt(0) === '#' || /^\\s*javascript:/i.test(h)) return;
+  a.target = '_blank'; a.rel = 'noopener';
+}, true);
+})();</script>"""
+REPORT_MISSING = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, '
+                  'initial-scale=1"><title>No report</title><style>:root{color-scheme:light dark}body{margin:0;display:grid;'
+                  'place-items:center;min-height:100vh;font:15px/1.5 system-ui,sans-serif;color:#6b7280}</style></head>'
+                  '<body><p>This request has no report.</p></body></html>')
+# How a Markdown report looks: a reading column in the system font, the artifact pages' colour contract (tokens on
+# :root, the dark ones for the system's dark theme unless data-theme says light, and for data-theme dark).
+MARKDOWN_CSS = """
+:root { color-scheme: light; --bg: #ffffff; --text: #1f2328; --muted: #59636e; --border: #d1d9e0; --soft: #f6f8fa;
+    --link: #0969da; --mark: #1f883d; }
+@media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { color-scheme: dark; --bg: #0d1117; --text: #e6edf3; --muted: #9198a1; --border: #3d444d;
+        --soft: #151b23; --link: #4493f8; --mark: #3fb950; }
+}
+:root[data-theme="dark"] { color-scheme: dark; --bg: #0d1117; --text: #e6edf3; --muted: #9198a1; --border: #3d444d;
+    --soft: #151b23; --link: #4493f8; --mark: #3fb950; }
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, "Noto Sans", sans-serif; }
+.md { max-width: 760px; margin: 0 auto; padding: 36px 24px 72px; overflow-wrap: anywhere; }
+.md > :first-child { margin-top: 0; }
+h1, h2, h3, h4, h5, h6 { margin: 1.6em 0 .6em; line-height: 1.25; font-weight: 650; }
+h1 { font-size: 2em; } h2 { font-size: 1.5em; padding-bottom: .25em; border-bottom: 1px solid var(--border); }
+h3 { font-size: 1.25em; } h4 { font-size: 1.05em; } h5, h6 { font-size: .95em; color: var(--muted); }
+p, ul, ol, blockquote, pre, .table { margin: 0 0 1em; }
+a { color: var(--link); text-underline-offset: 2px; }
+strong { font-weight: 650; }
+ul, ol { padding-left: 1.6em; } li + li { margin-top: .25em; } li > ul, li > ol { margin: .25em 0 0; }
+li.task { list-style: none; margin-left: -1.4em; } li.task input { margin: 0 .45em 0 0; vertical-align: -.1em; accent-color: var(--mark); }
+blockquote { margin-left: 0; padding: .1em 1em; color: var(--muted); border-left: 4px solid var(--border); }
+blockquote > :last-child { margin-bottom: 0; }
+code { font: .88em/1.5 ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    background: var(--soft); border-radius: 5px; padding: .15em .35em; }
+pre { background: var(--soft); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; overflow: auto; }
+pre code { background: none; padding: 0; font-size: .85em; white-space: pre; }
+hr { height: 0; margin: 2em 0; border: 0; border-top: 1px solid var(--border); }
+img { max-width: 100%; height: auto; border-radius: 6px; }
+.table { overflow-x: auto; }
+table { border-collapse: collapse; font-size: .95em; }
+th, td { padding: 6px 12px; border: 1px solid var(--border); }
+th { background: var(--soft); font-weight: 600; }
+tr:nth-child(2n) td { background: color-mix(in srgb, var(--soft) 55%, transparent); }
+@media (max-width: 600px) { body { font-size: 15px; } .md { padding: 22px 16px 56px; } }
+"""
+
+# Reports: Markdown
+
+# A GitHub-flavoured subset, rendered here so a Markdown report needs nothing from the network: ATX and setext
+# headings (with ids for #links), paragraphs, emphasis, strong, ~~strike~~, `code`, fenced and indented code blocks,
+# block quotes, bullet, numbered and task lists (nested), tables with alignment, rules, links, images, <autolinks>
+# and bare URLs, hard breaks (two spaces or a backslash at a line's end), backslash escapes. Raw HTML is shown as
+# text. Links to javascript:, data: (but images) and other odd schemes are dropped to their text.
+_MD_FENCE = re.compile(r' {0,3}(`{3,}|~{3,})[ \t]*([^`\s]*)[^`]*$')
+_MD_HR = re.compile(r' {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$')
+_MD_ATX = re.compile(r' {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$')
+_MD_SETEXT = re.compile(r' {0,3}(=+|-+)[ \t]*$')
+_MD_QUOTE = re.compile(r' {0,3}> ?(.*)$')
+_MD_ITEM = re.compile(r'( {0,3})([-*+]|\d{1,9}[.)])(?:([ \t]+)(.*)|[ \t]*$)')
+_MD_DELIM = re.compile(r' {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$')
+_MD_TASK = re.compile(r'\[([ xX])\][ \t]+')
+_MD_SAFE_URL = re.compile(r'(?:https?:|mailto:|tel:|#|/|\./|\.\./|[^:/?#]+(?:[/?#]|$))', re.I)
+
+
+def _md_escape(text):
+    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+
+def _md_url(url, image=False):
+    url = url.strip().replace(' ', '%20')
+    if _MD_SAFE_URL.match(url) or (image and url.lower().startswith('data:image/')):
+        return _md_escape(url)
+    return None
+
+
+def _md_emphasis(html):
+    html = re.sub(r'\*\*(?=\S)(.+?)(?<=\S)\*\*', r'<strong>\1</strong>', html)
+    html = re.sub(r'(?<![\w_])__(?=\S)(.+?)(?<=\S)__(?![\w_])', r'<strong>\1</strong>', html)
+    html = re.sub(r'(?<!\*)\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?!\*)', r'<em>\1</em>', html)
+    html = re.sub(r'(?<![\w_])_(?=[^\s_])(.+?)(?<=[^\s_])_(?![\w_])', r'<em>\1</em>', html)
+    return re.sub(r'~~(?=\S)(.+?)(?<=\S)~~', r'<del>\1</del>', html)
+
+
+def _md_inline(text):
+    """One block's inline Markdown as HTML. Code spans, escapes, links and autolinks are set aside as numbered
+    tokens (NUL n NUL) before the rest is escaped and marked up, and put back at the end."""
+    kept = []
+
+    def keep(html):
+        kept.append(html)
+        return f'\0{len(kept) - 1}\0'
+
+    text = text.replace('\0', '')
+    text = re.sub(r'(?<!\\)(`+)(.+?)(?<!`)\1(?!`)', lambda m: keep(f'<code>{_md_escape(m.group(2).strip() or m.group(2))}</code>'), text,
+                  flags=re.S)
+    text = re.sub(r'\\([!"#$%&\'()*+,\-./:;<=>?@\[\\\]^_`{|}~])', lambda m: keep(_md_escape(m.group(1))), text)
+    text = re.sub(r'<((?:https?|mailto):[^\s<>]+)>', lambda m: keep(f'<a href="{_md_escape(m.group(1))}">{_md_escape(m.group(1))}</a>'), text)
+
+    def link(m):
+        image, label, url, title = m.group(1), m.group(2), m.group(3), m.group(4)
+        href = _md_url(url, bool(image))
+        title_attr = f' title="{_md_escape(title)}"' if title else ''
+        if image:
+            return keep(f'<img src="{href}" alt="{_md_escape(label)}"{title_attr}>') if href else keep(_md_escape(label))
+        inner = _md_emphasis(_md_escape(label))   # its code spans and escapes are tokens already, put back below
+        return keep(f'<a href="{href}"{title_attr}>{inner}</a>') if href else keep(inner)
+
+    text = re.sub(r'(!?)\[((?:[^\[\]]|\[[^\[\]]*\])*)\]\(\s*<?([^\s()<>]*(?:\([^\s()<>]*\)[^\s()<>]*)*)>?(?:\s+"([^"]*)")?\s*\)', link, text)
+    text = re.sub(r'(?<![\w/="\'])(https?://[^\s<>\0]*[^\s<>\0.,:;!?"\')\]*_~])',
+                  lambda m: keep(f'<a href="{_md_escape(m.group(1))}">{_md_escape(m.group(1))}</a>'), text)
+    text = _md_emphasis(_md_escape(text))
+    text = re.sub(r'(?: {2,}|\\)\n', '<br>\n', text)
+    while '\0' in text:
+        text = re.sub(r'\0(\d+)\0', lambda m: kept[int(m.group(1))], text)
+    return text
+
+
+def _md_slug(text, used):
+    base = re.sub(r'[^\w\- ]', '', html_unescape(re.sub(r'<[^>]+>', '', text)).lower()).strip().replace(' ', '-') or 'section'
+    slug, n = base, 1
+    while slug in used:
+        slug, n = f'{base}-{n}', n + 1
+    used.add(slug)
+    return slug
+
+
+def _md_cells(line):
+    line = line.strip()
+    if line.startswith('|'):
+        line = line[1:]
+    if line.endswith('|') and not line.endswith('\\|'):
+        line = line[:-1]
+    return [cell.strip() for cell in re.split(r'(?<!\\)\|', line)]
+
+
+def _md_table_at(lines, i):
+    """Whether a table starts at line i: a header row with pipes, then a delimiter row of as many cells."""
+    return ('|' in lines[i] and i + 1 < len(lines) and '-' in lines[i + 1] and bool(_MD_DELIM.match(lines[i + 1]))
+            and len(_md_cells(lines[i])) == len(_md_cells(lines[i + 1])))
+
+
+def _md_starts_block(line, lines, i):
+    """Whether the line begins a block that ends the paragraph before it."""
+    if _MD_FENCE.match(line) or _MD_HR.match(line) or _MD_ATX.match(line) or _MD_QUOTE.match(line):
+        return True
+    item = _MD_ITEM.match(line)
+    if item and item.group(4) and (not item.group(2)[0].isdigit() or item.group(2)[:-1] == '1'):
+        return True
+    return _md_table_at(lines, i)
+
+
+def _md_blocks(lines, used, tight=False):
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        fence = _MD_FENCE.match(line)
+        if fence:
+            mark, lang, body = fence.group(1), fence.group(2), []
+            indent = len(line) - len(line.lstrip(' '))
+            i += 1
+            while i < n and not re.match(r' {0,3}' + re.escape(mark[0]) + '{' + str(len(mark)) + r',}[ \t]*$', lines[i]):
+                body.append(lines[i][min(indent, len(lines[i]) - len(lines[i].lstrip(' '))):])
+                i += 1
+            i += 1
+            cls = f' class="language-{_md_escape(lang)}"' if lang else ''
+            out.append(f'<pre><code{cls}>' + _md_escape('\n'.join(body)) + ('\n' if body else '') + '</code></pre>')
+            continue
+        if _MD_HR.match(line):
+            out.append('<hr>')
+            i += 1
+            continue
+        atx = _MD_ATX.match(line)
+        if atx:
+            level, inner = len(atx.group(1)), _md_inline(atx.group(2) or '')
+            out.append(f'<h{level} id="{_md_slug(inner, used)}">{inner}</h{level}>')
+            i += 1
+            continue
+        if _MD_QUOTE.match(line):
+            body = []
+            while i < n and lines[i].strip() and _MD_QUOTE.match(lines[i]):
+                body.append(_MD_QUOTE.match(lines[i]).group(1))
+                i += 1
+            out.append('<blockquote>\n' + '\n'.join(_md_blocks(body, used)) + '\n</blockquote>')
+            continue
+        if _md_table_at(lines, i):
+            head, aligns = _md_cells(line), []
+            for cell in _md_cells(lines[i + 1]):
+                left, right = cell.startswith(':'), cell.endswith(':')
+                aligns.append('center' if left and right else 'right' if right else 'left' if left else None)
+            i += 2
+            rows = []
+            while i < n and lines[i].strip() and '|' in lines[i]:
+                rows.append(_md_cells(lines[i]))
+                i += 1
+
+            def row_html(cells, tag):
+                tds = []
+                for k, align in enumerate(aligns):
+                    style = f' style="text-align:{align}"' if align else ''
+                    tds.append(f'<{tag}{style}>{_md_inline(cells[k]) if k < len(cells) else ""}</{tag}>')
+                return '<tr>' + ''.join(tds) + '</tr>'
+            body = ''.join(row_html(r, 'td') for r in rows)
+            out.append('<div class="table"><table><thead>' + row_html(head, 'th') + '</thead>'
+                       + (f'<tbody>{body}</tbody>' if body else '') + '</table></div>')
+            continue
+        item = _MD_ITEM.match(line)
+        if item:
+            ordered = item.group(2)[0].isdigit()
+            kind, start = item.group(2)[-1], int(item.group(2)[:-1]) if ordered else None
+            items, loose, blank_before = [], False, False
+            while i < n:
+                m = _MD_ITEM.match(lines[i])
+                if not m or m.group(2)[0].isdigit() != ordered or m.group(2)[-1] != kind:
+                    break
+                if blank_before:
+                    loose = True
+                width = len(m.group(1)) + len(m.group(2)) + (len(m.group(3)) if m.group(3) and len(m.group(3)) <= 4 else 1)
+                body = [m.group(4) or '']
+                i += 1
+                blank_before = False
+                while i < n:
+                    nxt = lines[i]
+                    if not nxt.strip():
+                        j = i
+                        while j < n and not lines[j].strip():
+                            j += 1
+                        if j < n and len(lines[j]) - len(lines[j].lstrip(' ')) >= width:
+                            body.extend([''] * (j - i))
+                            i = j
+                            loose = True    # blocks apart inside an item
+                            continue
+                        blank_before = j < n
+                        i = j
+                        break
+                    indent = len(nxt) - len(nxt.lstrip(' '))
+                    if indent >= width:
+                        body.append(nxt[width:])
+                    elif _MD_ITEM.match(nxt) or _md_starts_block(nxt, lines, i):
+                        break
+                    else:
+                        body.append(nxt.lstrip(' '))  # a lazy continuation of the item's paragraph
+                    i += 1
+                items.append(body)
+                if blank_before and not (i < n and _MD_ITEM.match(lines[i])):
+                    break
+            html = []
+            for body in items:
+                check = ''
+                task = _MD_TASK.match(body[0])
+                if task:
+                    body = [body[0][task.end():]] + body[1:]
+                    check = '<input type="checkbox" disabled' + (' checked' if task.group(1) != ' ' else '') + '> '
+                inner = '\n'.join(_md_blocks(body, used, tight=not loose))
+                html.append(f'<li{" class=task" if task else ""}>{check}{inner}</li>')
+            tag = 'ol' if ordered else 'ul'
+            first = f' start="{start}"' if ordered and start != 1 else ''
+            out.append(f'<{tag}{first}>\n' + '\n'.join(html) + f'\n</{tag}>')
+            continue
+        if line.startswith('    '):
+            body = []
+            while i < n and (lines[i].startswith('    ') or not lines[i].strip()):
+                body.append(lines[i][4:])
+                i += 1
+            while body and not body[-1].strip():
+                body.pop()
+            out.append('<pre><code>' + _md_escape('\n'.join(body)) + '\n</code></pre>')
+            continue
+        para = [line.lstrip()]
+        i += 1
+        while i < n and lines[i].strip():
+            setext = _MD_SETEXT.match(lines[i])
+            if setext:
+                level, inner = 1 if setext.group(1)[0] == '=' else 2, _md_inline('\n'.join(para))
+                out.append(f'<h{level} id="{_md_slug(inner, used)}">{inner}</h{level}>')
+                para = None
+                i += 1
+                break
+            if _md_starts_block(lines[i], lines, i):
+                break
+            para.append(lines[i].lstrip())
+            i += 1
+        if para is not None:
+            inner = _md_inline('\n'.join(para).rstrip())
+            out.append(inner if tight else f'<p>{inner}</p>')
+    return out
+
+
+def render_markdown(text):
+    """A Markdown report's body as HTML (see above)."""
+    lines = text.replace('\r\n', '\n').replace('\r', '\n').expandtabs(4).split('\n')
+    return '\n'.join(_md_blocks(lines, set()))
+
+
+_HTML_DOC_START = re.compile(r'\s*(?:<!--.*?-->\s*)*(?:<!doctype\b|<html\b)', re.I | re.S)
+_HTML_HEAD = re.compile(r'<head\b[^>]*>', re.I)
+_HTML_OPEN = re.compile(r'<!doctype\b[^>]*>|<html\b[^>]*>', re.I)
+
+
+def report_title(fmt, content):
+    """A report's title when none is given: an HTML report's <title>, a Markdown report's first heading; or None."""
+    if fmt == 'html':
+        m = re.search(r'<title\b[^>]*>(.*?)</title\s*>', content, re.I | re.S)
+        text = html_unescape(re.sub(r'<[^>]*>', '', m.group(1))) if m else ''
+    else:
+        m = re.search(r'^ {0,3}#{1,6}[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$', content, re.M)
+        text = re.sub(r'[*_`~]|\[([^\]]*)\]\([^)]*\)', lambda g: g.group(1) or '', m.group(1)) if m else ''
+    text = _squash(text)
+    return (text[:TITLE_MAX - 1].rstrip() + '…' if len(text) > TITLE_MAX else text) or None
+
+
+def report_document(fmt, content, title, theme):
+    """The page a report is shown as. HTML: the document as sent, the shim first in its <head> (a fragment, with no
+    doctype or <html>, gets the skeleton an artifact gets: doctype, charset, viewport). Markdown: rendered here, in a
+    page of its own styles. theme: 'light', 'dark' or None (the system's)."""
+    shim = REPORT_SHIM % json.dumps(theme)
+    if fmt == 'markdown':
+        return ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+                '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+                f'<title>{_md_escape(title or "Report")}</title>\n{shim}\n<style>{MARKDOWN_CSS}</style>\n</head>\n'
+                f'<body>\n<article class="md">\n{render_markdown(content)}\n</article>\n</body>\n</html>\n')
+    if not _HTML_DOC_START.match(content):
+        return ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+                f'<meta name="viewport" content="width=device-width, initial-scale=1">\n{shim}\n</head>\n<body>\n'
+                f'{content}\n</body>\n</html>\n')
+    m = _HTML_HEAD.search(content)
+    if not m:  # a doctype or <html> but no <head>: right after the last of them, in the head the parser implies
+        for m in _HTML_OPEN.finditer(content[:4096]):
+            pass
+    return content[:m.end()] + shim + content[m.end():] if m else shim + content
+
+
+def clean_artifact_url(value):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiError(400, 'artifact_url must be a string', field='artifact_url')
+    url = value.strip()
+    if not url:
+        return None
+    if len(url) > ARTIFACT_URL_MAX:
+        raise ApiError(400, f'artifact_url is longer than {ARTIFACT_URL_MAX} characters', field='artifact_url')
+    if not re.match(r'https?://[^\s/?#]+[^\s]*$', url, re.I) or any(ord(c) < 32 or ord(c) == 127 for c in url):
+        raise ApiError(400, 'artifact_url must be an http or https URL', field='artifact_url',
+                       hint='the link to the Claude artifact the report replicates, such as https://claude.ai/...')
+    return url
+
 
 
 # Settings
@@ -1815,14 +2211,26 @@ def _migrate_2(db):
     db.execute('CREATE INDEX IF NOT EXISTS events_ts ON events (ts)')
 
 
+def _migrate_3(db):
+    # Reports: one per request at most, gone with it.
+    db.execute("""CREATE TABLE IF NOT EXISTS reports (
+        request_id TEXT PRIMARY KEY REFERENCES requests (id) ON DELETE CASCADE,
+        format TEXT NOT NULL CHECK (format IN ('html', 'markdown')), title TEXT, artifact_url TEXT,
+        content TEXT NOT NULL, size INTEGER NOT NULL, version INTEGER NOT NULL,
+        created_at REAL NOT NULL, updated_at REAL NOT NULL
+    ) STRICT""")
+
+
 # user_version N-1 -> N. A fresh database is created at 1 and then runs them all, so a fresh and an
 # upgraded database are the same.
-MIGRATIONS = {2: _migrate_2}
+MIGRATIONS = {2: _migrate_2, 3: _migrate_3}
 
 # Aggregates live in SQL so the list and detail views can never disagree. {where} filters the
-# inner r.* rows; {order} sorts and limits the outer g.* rows.
+# inner r.* rows; {order} sorts and limits the outer g.* rows. A report's columns but its content.
 REQUEST_SELECT = """
-SELECT g.*, c.title AS current_title, c.message AS current_message FROM (
+SELECT g.*, c.title AS current_title, c.message AS current_message, rp.format AS report_format,
+    rp.title AS report_title, rp.artifact_url AS report_artifact_url, rp.size AS report_size,
+    rp.version AS report_version, rp.created_at AS report_created_at, rp.updated_at AS report_updated_at FROM (
     SELECT r.id, r.title, r.origin, r.status, r.message, r.created_at, r.updated_at, r.completed_at,
         r.attention_message, r.attention_at,
         COUNT(t.id) - IFNULL(SUM(t.status = 'cancelled'), 0) AS tasks_total,
@@ -1838,7 +2246,7 @@ SELECT g.*, c.title AS current_title, c.message AS current_message FROM (
          ORDER BY updated_at DESC, seq DESC LIMIT 1) AS current_id
     FROM requests r LEFT JOIN tasks t ON t.request_id = r.id
     {where} GROUP BY r.id
-) g LEFT JOIN tasks c ON c.id = g.current_id {order}
+) g LEFT JOIN tasks c ON c.id = g.current_id LEFT JOIN reports rp ON rp.request_id = g.id {order}
 """
 
 # A running request r is waiting while it, or one of its running tasks, has a question for the user.
@@ -2203,6 +2611,41 @@ class Store:
                             message=request['attention_message'])
             return (*self._detail(db, rid), cleared)
 
+    def put_report(self, rid, fmt, title, artifact_url, content, now, at=None):
+        """-> (report row, created). Replaces the request's report; any status, and it never reopens one."""
+        with self._write() as db:
+            request = self._request(db, rid)
+            stamp = self._stamp(now, at, request['updated_at'])
+            old = db.execute('SELECT version, created_at FROM reports WHERE request_id = ?', (rid,)).fetchone()
+            size = len(content.encode('utf-8'))
+            db.execute('INSERT OR REPLACE INTO reports (request_id, format, title, artifact_url, content, size, version,'
+                       ' created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                       (rid, fmt, title, artifact_url, content, size, old['version'] + 1 if old else 1,
+                        old['created_at'] if old else stamp[0], stamp[0]))
+            db.execute('UPDATE requests SET updated_at = ? WHERE id = ?', (stamp[0], rid))
+            self._event(db, stamp, 'report_updated', rid, status=request['status'], message=title)
+            return db.execute('SELECT * FROM reports WHERE request_id = ?', (rid,)).fetchone(), old is None
+
+    def get_report(self, rid):
+        with self._read() as db:
+            self._request(db, rid)
+            row = db.execute('SELECT * FROM reports WHERE request_id = ?', (rid,)).fetchone()
+            if row is None:
+                raise ApiError(404, f'request {rid} has no report',
+                               hint=f'an agent sends one with: taskctl report {rid} FILE (or PUT /api/requests/{rid}/report)')
+            return row
+
+    def delete_report(self, rid, now, at=None):
+        with self._write() as db:
+            request = self._request(db, rid)
+            old = db.execute('SELECT title FROM reports WHERE request_id = ?', (rid,)).fetchone()
+            if old is not None:
+                stamp = self._stamp(now, at, request['updated_at'])
+                db.execute('DELETE FROM reports WHERE request_id = ?', (rid,))
+                db.execute('UPDATE requests SET updated_at = ? WHERE id = ?', (stamp[0], rid))
+                self._event(db, stamp, 'report_deleted', rid, status=request['status'], message=old['title'])
+            return old is not None
+
     def events(self, since, limit, now, stale_after):
         with self._read() as db:
             # The last id ever handed out (sqlite_sequence), so a cursor never moves back after pruning.
@@ -2296,7 +2739,19 @@ def request_json(row, now, public, stale_after):
         'stale': running and not waiting and is_stale(row['updated_at'], row['eta_at'], now, stale_after),
         'url': f"{public}/r/{row['id']}",
         'attention': attention, 'waiting': waiting, 'tasks_waiting': row['tasks_waiting'],
+        'report': report_json(row, public, 'report_'),
     }
+
+
+def report_json(row, public, prefix=''):
+    """A report's shape (no content), from a reports row (prefix '') or a request row's report_ columns; None if none."""
+    if row[prefix + 'format'] is None:
+        return None
+    rid = row['id'] if prefix else row['request_id']
+    return {'format': row[prefix + 'format'], 'title': row[prefix + 'title'], 'artifact_url': row[prefix + 'artifact_url'],
+            'size': row[prefix + 'size'], 'version': row[prefix + 'version'], 'created_at': row[prefix + 'created_at'],
+            'updated_at': row[prefix + 'updated_at'], 'url': f'{public}/r/{rid}/report',
+            'page': f'{public}/api/requests/{rid}/report/page'}
 
 
 def event_json(row):
@@ -2338,6 +2793,10 @@ ROUTES = (
     _route('POST', r'/api/requests/(?P<rid>[^/]+)/tasks', 'add_tasks'),
     _route('POST', r'/api/requests/(?P<rid>[^/]+)/attention', 'request_attention'),
     _route('DELETE', r'/api/requests/(?P<rid>[^/]+)/attention', 'request_resume'),
+    _route('PUT', r'/api/requests/(?P<rid>[^/]+)/report', 'put_report'),
+    _route('GET', r'/api/requests/(?P<rid>[^/]+)/report', 'get_report'),
+    _route('DELETE', r'/api/requests/(?P<rid>[^/]+)/report', 'delete_report'),
+    _route('GET', r'/api/requests/(?P<rid>[^/]+)/report/page', 'report_page'),
     _route('GET', r'/api/tasks/(?P<tid>[^/]+)', 'get_task'),
     _route('POST', r'/api/tasks/(?P<tid>[^/]+)/progress', 'progress'),
     _route('POST', r'/api/tasks/(?P<tid>[^/]+)/complete', 'complete_task'),
@@ -2515,7 +2974,7 @@ class Handler(BaseHTTPRequestHandler):
         if not host or netloc != host or not (is_ip(name) or name in self.server.local_names):
             raise ApiError(403, 'cross-origin write refused')
 
-    def _body(self, known):
+    def _body(self, known, limit=BODY_MAX):
         if 'chunked' in self.headers.get('Transfer-Encoding', '').lower():
             raise ApiError(411, 'chunked request bodies are not supported; send Content-Length')
         try:
@@ -2524,9 +2983,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
         except ValueError:
             raise ApiError(400, 'invalid Content-Length') from None
-        if length > BODY_MAX:
+        if length > limit:
             self.close_connection = True
-            raise ApiError(413, f'request body is larger than {BODY_MAX // 1024} KiB')
+            raise ApiError(413, f'request body is larger than {limit // 1024} KiB')
         try:
             data = self.rfile.read(length)
         except OSError:
@@ -2545,10 +3004,10 @@ class Handler(BaseHTTPRequestHandler):
         check_fields(body, known, self.warnings)
         return body
 
-    def _write_body(self, known):
+    def _write_body(self, known, limit=BODY_MAX):
         # The writes taskctl may queue offline: a replay (X-Tasks-Replay: 1) may also carry "at".
         self.replay = self.headers.get('X-Tasks-Replay', '').strip() == '1'
-        return self._body(known | {'at'} if self.replay else known)
+        return self._body(known | {'at'} if self.replay else known, limit)
 
     def _at(self, body, now):
         """A replayed write's own time, clamped to [now - REPLAY_WINDOW, now]; None when not a replay."""
@@ -2782,6 +3241,55 @@ class Handler(BaseHTTPRequestHandler):
         if cleared:
             log.info('request %s resumed', rid)
         self._reply(200, self._detail(row, tasks, now))
+
+    def h_put_report(self, rid):
+        body, w = self._write_body({'format', 'content', 'title', 'artifact_url'}, REPORT_BODY_MAX), self.warnings
+        fmt = body.get('format')
+        if fmt is None:
+            raise ApiError(400, 'format is required', field='format', hint='html or markdown')
+        if not isinstance(fmt, str) or fmt.strip().lower() not in REPORT_FORMATS:
+            raise ApiError(400, 'format must be html or markdown', field='format')
+        fmt = fmt.strip().lower()
+        content = body.get('content')
+        if content is None:
+            raise ApiError(400, 'content is required', field='content', hint='the whole document, as a string')
+        if not isinstance(content, str):
+            raise ApiError(400, 'content must be a string', field='content')
+        content = content.encode('utf-8', 'replace').decode('utf-8').replace('\0', '')
+        if not content.strip():
+            raise ApiError(400, 'content must not be empty', field='content')
+        title = clean_text(body.get('title'), 'title', TITLE_MAX, w) or report_title(fmt, content)
+        artifact_url = clean_artifact_url(body.get('artifact_url'))
+        now = ts()
+        row, created = self.server.store.put_report(rid, fmt, title, artifact_url, content, now, self._at(body, now))
+        log.info('%s the report of request %s (%s, %d bytes, version %d)%s', 'added' if created else 'replaced', rid, fmt,
+                 row['size'], row['version'], ' (replayed)' if self.replay else '')
+        self._reply(201 if created else 200, {**report_json(row, self.public_url()), 'request_id': rid, 'now': now})
+
+    def h_get_report(self, rid):
+        row = self.server.store.get_report(rid)
+        self._reply(200, {**report_json(row, self.public_url()), 'request_id': rid, 'content': row['content'], 'now': ts()})
+
+    def h_delete_report(self, rid):
+        body = self._write_body(set())
+        now = ts()
+        deleted = self.server.store.delete_report(rid, now, self._at(body, now))
+        if deleted:
+            log.info('deleted the report of request %s', rid)
+        self._reply(200, {'deleted': deleted, 'request_id': rid, 'now': now})
+
+    def h_report_page(self, rid):
+        theme = self._query('theme')
+        headers = {'Content-Security-Policy': REPORT_CSP, 'Referrer-Policy': 'no-referrer'}
+        try:
+            row = self.server.store.get_report(rid)
+        except ApiError as exc:
+            if exc.code != 404:
+                raise
+            self._send(404, REPORT_MISSING.encode('utf-8'), 'text/html; charset=utf-8', 'no-store', headers)
+            return
+        page = report_document(row['format'], row['content'], row['title'], theme if theme in ('light', 'dark') else None)
+        self._send(200, page.encode('utf-8', 'replace'), 'text/html; charset=utf-8', 'no-store', headers)
 
     def h_get_task(self, tid):
         now = ts()

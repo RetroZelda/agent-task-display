@@ -261,6 +261,7 @@ def rec(method, path, body=None, at=1.0):
 
 for label, record, want in [('a progress', rec('POST', '/api/tasks/k3m9qa-1/progress', {'message': 'x'}), True),
                             ('a DELETE without a body', rec('DELETE', '/api/requests/k3m9qa/attention'), True),
+                            ('a report PUT', rec('PUT', '/api/requests/k3m9qa/report', {'format': 'html', 'content': 'x'}), True),
                             ('a GET', rec('GET', '/api/requests'), False), ('a path outside /api/', rec('POST', '/x'), False),
                             ('a list body', rec('POST', '/api/requests', [1]), False), ('at true', rec('POST', '/api/requests', {}, True), False),
                             ('at NaN', rec('POST', '/api/requests', {}, float('nan')), False), ('at a string', rec('POST', '/api/requests', {}, '1'), False),
@@ -271,7 +272,9 @@ for record, want in [(rec('POST', '/api/tasks/k3m9qa-2/progress'), (('tasks', 'k
                      (rec('DELETE', '/api/tasks/k3m9qa-2/attention'), (('tasks', 'k3m9qa-2'), 'attention')),
                      (rec('POST', '/api/requests', {'id': 'k3m9qa', 'title': 'x'}), (('requests', 'k3m9qa'), 'create')),
                      (rec('POST', '/api/requests', {'title': 'x'}), (None, None)),
-                     (rec('POST', '/api/requests/k3m9qa/tasks', {'title': 'x'}), (None, None))]:
+                     (rec('POST', '/api/requests/k3m9qa/tasks', {'title': 'x'}), (None, None)),
+                     (rec('PUT', '/api/requests/k3m9qa/report', {}), (('requests', 'k3m9qa'), 'report')),
+                     (rec('DELETE', '/api/requests/k3m9qa/report'), (('requests', 'k3m9qa'), 'report'))]:
     eq(f"write_target {record['path']}", tc.write_target(record), want)
 R, T1, T2 = 'k3m9qa', 'k3m9qa-1', 'k3m9qa-2'
 recs = [rec('POST', '/api/requests', {'id': R, 'title': 'x'}), rec('POST', f'/api/tasks/{T1}/progress', {'message': 'a'}),
@@ -293,6 +296,12 @@ eq('coalesce: a progress on another task keeps an attention', len(tc.coalesce([r
 eq('coalesce: closes are all kept (they are not superseded)', len(tc.coalesce([rec('POST', f'/api/tasks/{T1}/complete', {}),
                                                                                 rec('POST', f'/api/tasks/{T1}/complete', {})])), 2)
 eq('coalesce is idempotent', tc.coalesce(tc.coalesce(recs)), tc.coalesce(recs))
+reports = [rec('PUT', f'/api/requests/{R}/report', {'content': 'v1'}), rec('POST', f'/api/requests/{R}/attention', {'message': 'q'}),
+           rec('PUT', f'/api/requests/{R}/report', {'content': 'v2'}), rec('PUT', '/api/requests/x2y3z4/report', {'content': 'other'}),
+           rec('DELETE', f'/api/requests/{R}/report'), rec('PUT', f'/api/requests/{R}/report', {'content': 'v3'})]
+got = [(r['method'], r['path'].split('/')[3], (r['body'] or {}).get('content') or (r['body'] or {}).get('message')) for r in tc.coalesce(reports)]
+eq('coalesce: a report (put or delete) superseded by a later one on the same request; others kept, in order', got,
+   [('POST', R, 'q'), ('PUT', 'x2y3z4', 'other'), ('PUT', R, 'v3')])
 
 S.section('where the queue lives')
 with environ(TASKS_SPOOL_DIR='/x/spool', XDG_CACHE_HOME='/y'):

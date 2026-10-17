@@ -81,6 +81,7 @@ workflow work. taskctl commands: `new TITLE [-t TASK]...`, `add RID TITLE... [--
 your user), `resume ID` (they answered), `done ID [MSG]`, `fail ID MSG`, `show ID`, `list [--all]`
 (every running request; `--all` adds the 20 most recently finished), `ping` (also shows queued
 reports), `flush`, `run TID [--every SEC] [--percent-regex RE] -- CMD...`, `usage` (this text),
+`report RID FILE [--title T] [--artifact URL]` (the request's report; `--delete` removes it),
 `api METHOD PATH [JSON]` (any route below), `changelog`, `update [--force]`,
 `install-rule [--file PATH]`. If the board is unreachable (the connection is refused, has no route,
 the name does not resolve, a local firewall blocks it, or it is not made in time), taskctl queues
@@ -130,6 +131,11 @@ have changed: read {{BASE_URL}}/api/changelog and this page again.
                                           auto_closed[] (were running) and cancelled[] (were pending)
     POST   /api/requests/<rid>/attention  {message} -> the request with its tasks[]: it waits for its user
     DELETE /api/requests/<rid>/attention  clear the request's own flag -> the request with its tasks[]
+    PUT    /api/requests/<rid>/report     {format: html|markdown, content, title?, artifact_url?} -> 201 new,
+                                          200 replaced: the request's report (below)
+    GET    /api/requests/<rid>/report     the report with its content; 404 when there is none
+    DELETE /api/requests/<rid>/report     {deleted, request_id, now}
+    GET    /api/requests/<rid>/report/page  the report as a web page (what the dashboard shows)
     POST   /api/requests/<rid>/tasks      {title, start?: true} -> 201 one task, running unless start is false
                                           {titles: [title, ...]} -> 201 {tasks[]}, all pending
     GET    /api/tasks/<tid>               one task
@@ -211,6 +217,20 @@ field), merges it into the current settings, saves the whole result and answers 
 removes the file. `version` (also `settings_version` in /api/events) changes whenever the settings
 do. Leave the settings to your user unless they ask you to change them.
 
+Reports. A request can have one report: a document the dashboard shows on a page of its own
+(`<board>/r/<rid>/report`, linked from the request's page). When you publish a report as a Claude
+artifact for work tracked here, send the very same file to its request, and again after each update,
+so both always show the same: `taskctl report RID report.html --artifact URL` (or `findings.md`, or
+`-` with `--format html|markdown` for stdin); it prints the report's page. Over HTTP: `PUT
+/api/requests/<rid>/report` with `{"format": "html" | "markdown", "content": "<the whole document>",
+"title": "...", "artifact_url": "https://claude.ai/..."}` (title and artifact_url optional; the body may
+be up to 8 MiB). HTML is shown as sent, its scripts running in a sandbox that cannot reach the board;
+Markdown (a GitHub-flavoured subset; raw HTML is shown as text) is rendered by the board. Each PUT
+replaces the whole report (its `version` counts them); it works on a closed request and never reopens
+it. The title defaults to the HTML's `<title>` or the first Markdown heading. Every request carries
+`report`: null, or `{format, title, artifact_url, size, version, created_at, updated_at, url, page}`
+(no content: GET the report route for that). `DELETE` removes it; it also goes with its request.
+
 Live stream. The dashboard can show one network video or audio stream beside the board on every open
 page (below it on a portrait screen, to its right on a landscape one). Do this only when your user asks.
 `taskctl api POST /api/stream '{"url": "http://camera.lan:8554/"}'` opens a stream (201; a newer url
@@ -261,6 +281,8 @@ Keep the JSON in single quotes, and keep apostrophes, backticks and `$` out of t
 - Close every task, then the request, also on failure or cancel (status failed plus a one-line
   reason). Never leave a request running.
 - Give your user the request's page link once.
+- When you publish a report as a Claude artifact for a request, also send the same file to it
+  (`taskctl report`), and again after each update; give your user the report's page with the artifact.
 - Open or close the board's live stream only when your user asks for it.
 - Titles and hints: in single quotes, with no backticks, `$` or quote characters. No secrets: the
   board is visible on the LAN.

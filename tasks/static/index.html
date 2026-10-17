@@ -44,6 +44,12 @@
   last first. The board's settings ("tasks": {"order"}) set it for every viewer; the toggle on the Tasks heading, or
   Settings > This device > Appearance > Task order, picks this device's own. The request list keeps its own order.
 
+  Report: a request may have one (an agent's HTML, the very file it published as a Claude artifact, or Markdown the
+  board renders). /r/<rid>/report shows it in a sandboxed frame of the board's page route (an opaque origin: its
+  scripts run, but never reach the board), filling the window under a slim header; the request's polls bring a new
+  version, which reloads the frame, as does this device's theme (passed as ?theme=). The request's page has a
+  Report button, and list rows say "report".
+
   Pages: the list shows every running request, and the finished ones a page at a time (newest first), 10, 20, 50 or
   100 to a page as this device chose (kept in this browser); the page itself is kept in the history entry, so Back
   from a request returns to it. Clear deletes every finished request, on every page.
@@ -265,6 +271,13 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
 .rid { font: 13px var(--mono); color: var(--muted); }
 .rid code { color: var(--text); user-select: all; }
 .actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px; }
+a.btn { display: inline-block; text-decoration: none; }
+/* Report view: a slim header, then the report in a sandboxed frame filling the rest of the window (sizeReport) */
+.report-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin: 0 0 10px; }
+.report-head h1 { flex: 1 1 240px; min-width: 0; margin: 0; font-size: 19px; line-height: 1.3; overflow-wrap: anywhere; }
+.report-head .meta { flex: 1 1 100%; order: 3; }
+.report-links { display: flex; flex-wrap: wrap; gap: 6px; }
+#report-frame { display: block; width: 100%; height: 70vh; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
 .btn { font: 500 13px/1.2 var(--sans); padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
     background: var(--surface-2); color: var(--text); cursor: pointer; }
 .btn:hover { border-color: var(--muted); }
@@ -501,6 +514,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             <div class="foot">
                 <span class="rid">request <code data-ref="rid" title="Request ID (click to select)"></code></span>
                 <span class="actions">
+                    <a class="btn" data-ref="report" hidden>Report</a>
                     <button type="button" class="btn good" data-ref="markDone">Mark done</button>
                     <button type="button" class="btn" data-ref="markFailed">Mark failed</button>
                     <button type="button" class="btn danger" data-ref="del">Delete</button>
@@ -511,6 +525,17 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             <span class="order" id="task-order" role="group" aria-label="Order of the tasks"><button type="button" class="btn small" data-order="number" aria-pressed="true" title="List the tasks by number">Number</button><button type="button" class="btn small" data-order="progress" aria-pressed="false" title="List the tasks running first, then queued, then finished">Progress</button><button type="button" class="btn small" data-order="updated" aria-pressed="false" title="List the tasks updated last first">Updated</button></span></h2>
         <p id="task-empty" class="none" hidden>No tasks yet. Agents add them with <code id="task-empty-cmd"></code></p>
         <ol id="task-list" class="rows"></ol>
+    </section>
+
+    <section id="view-report" hidden>
+        <a class="back" id="report-back" href="/">&larr; <span id="report-back-title">the request</span></a>
+        <div class="report-head">
+            <h1 id="report-title"></h1>
+            <span class="report-links"><a class="btn small" id="report-artifact" target="_blank" rel="noopener noreferrer" hidden>Claude artifact &#8599;</a><a class="btn small" id="report-own" target="_blank" rel="noopener" hidden>Open on its own &#8599;</a></span>
+            <div class="meta"><span id="report-format"></span><span id="report-updated"></span><span id="report-version"></span><span id="report-size"></span></div>
+        </div>
+        <p id="report-none" class="none" hidden>This request has no report. An agent sends one with <code id="report-none-cmd"></code></p>
+        <iframe id="report-frame" title="Report" hidden sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads" referrerpolicy="no-referrer"></iframe>
     </section>
 
     <section id="view-notfound" class="empty" hidden>
@@ -621,7 +646,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         <div class="bar" data-ref="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div class="fill" data-ref="fill"></div></div>
         <div class="ask" data-ref="ask" hidden><div class="ask-head dots"><span class="ask-label">Question</span><span data-ref="askWho"></span><span data-ref="askWhen"></span><span data-ref="askMore"></span></div><div class="ask-q" data-ref="askQ"></div></div>
         <div class="hint" data-ref="hint"><span class="ht" data-ref="ht"></span><span class="hm" data-ref="hm"></span></div>
-        <div class="meta"><span data-ref="tasks"></span><span data-ref="failed" class="bad"></span><span data-ref="time"></span><span data-ref="eta"></span><span data-ref="updated"></span><span data-ref="origin"></span><span data-ref="rid"></span></div>
+        <div class="meta"><span data-ref="tasks"></span><span data-ref="failed" class="bad"></span><span data-ref="time"></span><span data-ref="eta"></span><span data-ref="updated"></span><span data-ref="report"></span><span data-ref="origin"></span><span data-ref="rid"></span></div>
     </a>
 </template>
 <template id="tpl-task">
@@ -645,6 +670,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     const WRITE_TIMEOUT_MS = 10000;
     const BANNER_AFTER_FAILS = 2;
     const TICK_MS = 500;
+    const REPORT_GAP = 12;              // px under a report's frame
     const STRIPED ='[data-status=running] > .bar > .fill, .bar.indeterminate > .fill';   // the bars with stripes (the CSS's)
     const ALERT_TICK_MS = 1500;         // the tab title alternates and the reminder is checked at this pace
     const CHIME_GAP_MS = 2000;          // sounds never start closer together than this
@@ -1082,7 +1108,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     }
 
     function showView(name) {
-        for (const v of ['loading', 'list', 'detail', 'notfound']) setHidden($('view-' + v), v !== name);
+        for (const v of ['loading', 'list', 'detail', 'report', 'notfound']) setHidden($('view-' + v), v !== name);
     }
 
     // Network
@@ -1176,7 +1202,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     function getData(done) {
         const path = view === 'list' ? listPath() : apiPath;
         xhrGet(path, (status, body, error, t0, t1) => {
-            if (view === 'detail' && (status === 404 || status === 400)) {
+            if ((view === 'detail' || view === 'report') && (status === 404 || status === 400)) {
                 done({ data: null, missing: status, error: (body && body.error) || '' });
             } else if (!status) {
                 done({ data: null, missing: 0, error });
@@ -1298,6 +1324,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         }
         lastData = data;
         if (view === 'list') renderList(data);
+        else if (view === 'report') renderReport(data);
         else renderDetail(data);
         restoreBoardScroll();
         loaded = true;
@@ -1435,6 +1462,8 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
 
         setText(refs.tasks, tasksText(r));
         setPart(refs.failed, r.tasks_failed ? r.tasks_failed + ' failed' : '');
+        setPart(refs.report, r.report ? 'report' : '');
+        setAttr(refs.report, 'title', r.report ? 'has a report: ' + (r.report.title || r.report.format) : null);
         setPart(refs.origin, r.origin || '');
         setAttr(refs.origin, 'title', r.origin ? 'origin: ' + r.origin : null);
         setText(refs.rid, '#' + r.id);
@@ -1479,6 +1508,65 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
                                       : 'finished ' + fmtAgo(now - (r.completed_at ?? r.updated_at)));
         refs.updated.classList.toggle('warn', running && r.stale);
         tickAsk(refs, row.ask, now);
+    }
+
+    // Report view: the request's polls drive it. The frame is the board's page route for the report (sandboxed there by
+    // its CSP, and here by the frame's own sandbox); it reloads when the version or this device's theme changes.
+    let reportShown = '';       // the page the frame shows; '' none
+
+    function reportPage(d) {
+        const theme = local.theme === 'light' || local.theme === 'dark' ? '&theme=' + local.theme : '';
+        return '/api/requests/' + encodeURIComponent(d.id) + '/report/page?v=' + d.report.version + theme;
+    }
+
+    function renderReport(d) {
+        const rep = d.report, frame = $('report-frame');
+        setAttr($('report-back'), 'href', '/r/' + encodeURIComponent(d.id));
+        setText($('report-back-title'), d.title);
+        setText($('report-title'), (rep && rep.title) || d.title);
+        setHidden($('report-none'), !!rep);
+        setText($('report-none-cmd'), 'taskctl report ' + d.id + ' FILE');
+        setHidden(frame, !rep);
+        setHidden($('report-own'), !rep);
+        setHidden($('report-artifact'), !(rep && rep.artifact_url));
+        setPart($('report-format'), rep ? (rep.format === 'markdown' ? 'Markdown' : 'HTML') : '');
+        setPart($('report-version'), rep ? 'version ' + rep.version : '');
+        setPart($('report-size'), rep ? fmtSize(rep.size) : '');
+        setAttr($('report-updated'), 'title', rep ? fmtStamp(rep.updated_at) : null);
+        if (rep && rep.artifact_url) setAttr($('report-artifact'), 'href', rep.artifact_url);
+        const page = rep ? reportPage(d) : '';
+        if (page) setAttr($('report-own'), 'href', page);
+        if (page !== reportShown) {
+            reportShown = page;
+            if (page) frame.src = page;
+            else frame.removeAttribute('src');
+        }
+        if (!loaded) showView('report');
+        baseTitle = 'Report · ' + ((rep && rep.title) || d.title) + ' — Task Status';
+        baseIcon = [reqStatus(d), d.status === 'running' && d.tasks_total === 0 ? null : d.percent];
+        updateAttention();
+        sizeReport();
+    }
+
+    function tickReport(now) {
+        const rep = lastData.report;
+        setPart($('report-updated'), rep ? 'updated ' + fmtAgo(now - rep.updated_at) : '');
+    }
+
+    // The frame fills the window (or, beside a stream, the board) from where it starts down to REPORT_GAP above the
+    // bottom: a report is made for a viewport, as an artifact is, and scrolls inside it. Checked on every tick too, so
+    // a header that wraps differently after a resize is caught.
+    function sizeReport() {
+        const frame = $('report-frame');
+        if (view !== 'report' || frame.hidden) return;
+        const box = splitLayout ? $('board') : null, doc = document.scrollingElement || document.documentElement;
+        const top = frame.getBoundingClientRect().top - (box ? box.getBoundingClientRect().top - box.scrollTop : -doc.scrollTop);
+        const height = Math.max(360, Math.floor((box ? box.clientHeight : innerHeight) - top - REPORT_GAP));
+        if (frame.style.height !== height + 'px') frame.style.height = height + 'px';
+    }
+
+    function fmtSize(n) {
+        return n < 1024 ? n + ' bytes' : n < 1048576 ? (n / 1024).toFixed(1) + ' KiB' : (n / 1048576).toFixed(1) + ' MiB';
     }
 
     function renderDetail(d) {
@@ -1548,6 +1636,11 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         setText(h.message, r.message || '');
         setHidden(h.message, !r.message);
         setText(h.rid, r.id);
+        setHidden(h.report, !r.report);
+        if (r.report) {
+            setAttr(h.report, 'href', '/r/' + encodeURIComponent(r.id) + '/report');
+            setAttr(h.report, 'title', (r.report.title || 'The report') + ' (updated ' + fmtStamp(r.report.updated_at) + ')');
+        }
         setHidden(h.markDone, !running);
         setHidden(h.markFailed, !running);
     }
@@ -1664,6 +1757,10 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         const now = serverNow();
         for (const row of rows.values()) row.tick(row, now);
         if (view === 'detail' && headRefs && lastData) tickHeader(now);
+        if (view === 'report' && lastData) {
+            tickReport(now);
+            sizeReport();
+        }
         tickStream(now);
         renderClock(now);
         stepStripes(now);
@@ -1732,6 +1829,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     function applyTheme() {
         if (local.theme === 'light' || local.theme === 'dark') document.documentElement.dataset.theme = local.theme;
         else delete document.documentElement.dataset.theme;
+        if (view === 'report' && lastData && !notFound) renderReport(lastData);   // the report takes the theme too
     }
 
     const systemDark = () => matchMedia('(prefers-color-scheme: dark)').matches;
@@ -2685,6 +2783,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         setHidden($('stream'), !on);
         if (on) board.scrollTop = y;
         else doc.scrollTop = y;
+        sizeReport();
     }
 
     // Going to a request and coming Back keeps the board's scroll position: the browser restores the document's,
@@ -3288,6 +3387,14 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     function route() {
         const path = location.pathname.replace(/\/+$/, '') || '/';
         if (path === '/' || path === '/r') return { view: 'list' };
+        const rep = path.match(/^\/r\/([^/]+)\/report$/);
+        if (rep) {
+            let id = rep[1];
+            try {
+                id = decodeURIComponent(id);
+            } catch (e) { /* keep the raw segment */ }
+            return { view: 'report', rid: id.toLowerCase() };
+        }
         const m = path.match(/^\/r\/([^/]+)$/);
         if (!m) return { view: 'notfound' };
         let id = m[1];
@@ -3340,6 +3447,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         });
         $('clear').addEventListener('click', clearFinished);
         initPager();
+        addEventListener('resize', sizeReport);
 
         headRefs = collectRefs($('req-head'));
         headRefs.markDone.addEventListener('click', () => completeRequest('done'));

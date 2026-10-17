@@ -6,7 +6,9 @@ the stale and expiry exemptions); the event log (the events each change writes, 
 /api/events: baseline, cursor, limit, truncation, pruned detection); replayed writes (X-Tasks-Replay and
 their `at`); the settings file (defaults, PUT validation, atomic writes, hand edits, DELETE, a broken
 file, --config / TASKS_CONFIG / the default path); event pruning by the maintenance thread; and the
-in-place migration of a real v1 database (made by the v1 server from git). TLS is the tls suite's.
+in-place migration of a real v1 database (made by the v1 server from git), and a v2 one; reports (PUT,
+GET, DELETE, the sandboxed page, validation and limits, events, replays, the Markdown renderer). TLS is the
+tls suite's.
 """
 from __future__ import annotations
 
@@ -59,6 +61,183 @@ def kinds(events, *fields):
     """(type, task_id) per event, or the named fields."""
     fields = fields or ('type', 'task_id')
     return [tuple(e[f] for f in fields) for e in events]
+
+
+# ---------------------------------------------------------------- reports
+
+REPORT_KEYS = ['format', 'title', 'artifact_url', 'size', 'version', 'created_at', 'updated_at', 'url', 'page']
+REPORT_CSP = 'sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads'
+
+
+def phase_reports():
+    S.section('reports: PUT, GET, DELETE, the page, validation, events, replays')
+    srv = ScratchServer(TMP, name='reports').start()
+    call = srv.call
+    sys.path.insert(0, str(REPO / 'tasks'))
+    import server as board  # the renderer, for its units below
+    try:
+        rid = call('POST', '/api/requests', {'title': 'With a report', 'tasks': ['a']})[2]['id']
+        s, h, b = call('GET', f'/api/requests/{rid}/report')
+        check('no report yet: 404 with a hint, and the request says null', s == 404 and b['error'] == f'request {rid} has no report'
+              and 'taskctl report' in b['hint'] and call('GET', f'/api/requests/{rid}')[2]['report'] is None, b)
+        doc = ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<title>Build &amp; test — résumé</title>\n'
+               '<style>:root{--bg:#fff}</style>\n</head>\n<body>\n<h1>Weekly ✓</h1>\n<script>document.body.dataset.ran = 1</script>\n'
+               '</body>\n</html>\n')
+        s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': doc,
+                                                              'artifact_url': 'https://claude.ai/artifact/0123'})
+        base = f'http://127.0.0.1:{srv.port}'
+        check('PUT html: 201, the Report shape in order, the title from <title> (entities read), size in UTF-8 bytes, version 1',
+              s == 201 and list(b) == REPORT_KEYS + ['request_id', 'now'] and b['format'] == 'html' and b['title'] == 'Build & test — résumé'
+              and b['size'] == len(doc.encode()) and b['version'] == 1 and b['created_at'] == b['updated_at']
+              and b['artifact_url'] == 'https://claude.ai/artifact/0123' and b['url'] == f'{base}/r/{rid}/report'
+              and b['page'] == f'{base}/api/requests/{rid}/report/page' and b['request_id'] == rid, b)
+        first = b
+        s, h, b = call('GET', f'/api/requests/{rid}/report')
+        check('GET: the same report and its content, exactly as sent', s == 200 and list(b) == REPORT_KEYS + ['request_id', 'content', 'now']
+              and b['content'] == doc and {k: b[k] for k in REPORT_KEYS} == {k: first[k] for k in REPORT_KEYS}, b)
+        d = call('GET', f'/api/requests/{rid}')[2]
+        lst = [r for r in call('GET', '/api/requests')[2]['requests'] if r['id'] == rid][0]
+        check('the request (detail and list) carries the Report without its content; the write bumped updated_at',
+              d['report'] == {k: first[k] for k in REPORT_KEYS} and lst['report'] == d['report'] and 'content' not in d['report']
+              and d['updated_at'] == first['updated_at'], d['report'])
+        md = '# Findings: *all* good\n\n- one\n- two\n'
+        s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'Markdown', 'content': md, 'title': '  Final   report  '})
+        check('PUT again: 200, replaced (version 2, created_at kept), format case-insensitive, the given title squashed, '
+              'artifact_url gone (a PUT replaces it all)', s == 200 and b['version'] == 2 and b['format'] == 'markdown'
+              and b['created_at'] == first['created_at'] and b['updated_at'] > first['updated_at'] and b['title'] == 'Final report'
+              and b['artifact_url'] is None, b)
+        s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'markdown', 'content': md})
+        check('a Markdown title from its first heading, its marks dropped', b['title'] == 'Findings: all good', b)
+
+        S.section('reports: validation and limits')
+        for body, field in (({'content': 'x'}, 'format'), ({'format': 'pdf', 'content': 'x'}, 'format'), ({'format': 1, 'content': 'x'}, 'format'),
+                            ({'format': 'html'}, 'content'), ({'format': 'html', 'content': '  \n '}, 'content'),
+                            ({'format': 'html', 'content': ['x']}, 'content'), ({'format': 'html', 'content': 'x', 'artifact_url': 'ftp://x/y'}, 'artifact_url'),
+                            ({'format': 'html', 'content': 'x', 'artifact_url': 'javascript:alert(1)'}, 'artifact_url'),
+                            ({'format': 'html', 'content': 'x', 'artifact_url': 5}, 'artifact_url'),
+                            ({'format': 'html', 'content': 'x', 'artifact_url': 'https://a.example/' + 'x' * 2048}, 'artifact_url'),
+                            ({'format': 'html', 'content': 'x', 'artifact_url': 'https://a.example/a b'}, 'artifact_url'),
+                            ({'format': 'html', 'content': 'x', 'title': 7}, 'title')):
+            s, h, b = call('PUT', f'/api/requests/{rid}/report', body)
+            check(f'PUT {json.dumps(body)[:70]}: 400 field {field}', s == 400 and b.get('field') == field, b)
+        s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': 'x\0y', 'title': 'T' * 300, 'extra': 1})
+        check('a long title truncated, an unknown field ignored (warnings); NULs dropped from the content', s == 200 and len(b['title']) == 200
+              and b['warnings'] == ["unknown field 'extra' ignored", 'title truncated to 200 characters']
+              and call('GET', f'/api/requests/{rid}/report')[2]['content'] == 'xy', b)
+        big = '<p>' + 'x' * (6 * 1024 * 1024) + '</p>'
+        s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': big}, timeout=60)
+        check('a 6 MiB report: accepted (the route takes up to 8 MiB)', s == 200 and b['size'] == len(big), (s, b.get('error')))
+        def claim(method, path, length):     # only the headers: the board answers 413 before it reads a body that large
+            s, h, raw = raw_request(srv.port, f'{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{srv.port}\r\nContent-Type: application/json\r\n'
+                                              f'Content-Length: {length}\r\nConnection: close\r\n\r\n'.encode())
+            return s, json.loads(raw)
+        s, b = claim('PUT', f'/api/requests/{rid}/report', 8 * 1024 * 1024 + 1)
+        check('a body over 8 MiB: 413', s == 413 and b['error'] == 'request body is larger than 8192 KiB', b)
+        s, b = claim('POST', f'/api/requests/{rid}/attention', 64 * 1024 + 1)
+        check('other routes keep their 64 KiB limit', s == 413 and b['error'] == 'request body is larger than 64 KiB', b)
+        s, h, b = call('PUT', '/api/requests/zzzzzz/report', {'format': 'html', 'content': 'x'})
+        check('an unknown request: 404', s == 404 and b['error'] == "unknown request 'zzzzzz'", b)
+        s, h, b = call('PUT', f'/api/requests/{rid}-1/report', {'format': 'html', 'content': 'x'})
+        check('a task id: 400 naming its request', s == 400 and b['hint'] == f'{rid}-1 is a task id; its request is {rid}', b)
+        s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': 'x'}, headers={'Origin': 'null'})
+        check('a write from a sandboxed report (Origin: null): 403', s == 403, b)
+        s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': 'x'}, headers=EVIL)
+        check('a cross-origin write: 403', s == 403, b)
+        done = call('POST', '/api/requests', {'title': 'Already done'})[2]['id']
+        call('POST', f'/api/requests/{done}/complete', {'status': 'done'})
+        s, h, b = call('PUT', f'/api/requests/{done}/report', {'format': 'markdown', 'content': '# Wrap-up'})
+        check('a report on a done request: allowed, and the request stays done', s == 201
+              and call('GET', f'/api/requests/{done}')[2]['status'] == 'done', b)
+
+        S.section('reports: the page')
+        call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': doc})
+        s, h, page = call('GET', f'/api/requests/{rid}/report/page')
+        check('the page: text/html, sandboxed by its CSP, not cached, not sniffed, no referrer, no CORS',
+              s == 200 and h['content-type'] == 'text/html; charset=utf-8' and h['content-security-policy'] == REPORT_CSP
+              and h['cache-control'] == 'no-store' and h['x-content-type-options'] == 'nosniff' and h['referrer-policy'] == 'no-referrer'
+              and 'access-control-allow-origin' not in h, h)
+        shim = board.REPORT_SHIM % 'null'
+        check('an HTML document: as sent, the shim right after <head> (and nothing else changed)',
+              page == doc.replace('<head>\n', '<head>\n' + shim, 1) if False else page == doc.replace('<head>', '<head>' + shim, 1), page[:300])
+        s, h, page = call('GET', f'/api/requests/{rid}/report/page?theme=dark')
+        check('?theme=dark: the shim sets data-theme "dark"', board.REPORT_SHIM % '"dark"' in page, page[:300])
+        s, h, page = call('GET', f'/api/requests/{rid}/report/page?theme=sepia')
+        check('an unknown theme: none (the system\'s)', shim in page)
+        s, h, body = call('HEAD', f'/api/requests/{rid}/report/page')
+        check('HEAD: the headers only', s == 200 and h['content-security-policy'] == REPORT_CSP and not body, (s, body))
+        call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': '<h1>Fragment</h1><p>no doctype</p>'})
+        page = call('GET', f'/api/requests/{rid}/report/page')[2]
+        check('a fragment: the artifact skeleton (doctype, charset, viewport, the shim) around it', page.startswith('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">')
+              and 'name="viewport"' in page and shim in page and '<body>\n<h1>Fragment</h1><p>no doctype</p>\n</body>' in page, page)
+        call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': '<!DOCTYPE html><title>T</title><p>x'})
+        page = call('GET', f'/api/requests/{rid}/report/page')[2]
+        check('a doctype and no <head>: the shim right after the doctype', page == '<!DOCTYPE html>' + shim + '<title>T</title><p>x', page)
+        call('PUT', f'/api/requests/{rid}/report', {'format': 'markdown', 'content': '# A <b>bold</b> & title\n\nText', 'title': 'x < y'})
+        page = call('GET', f'/api/requests/{rid}/report/page?theme=light')[2]
+        check('a Markdown page: the board\'s page around the rendering, the title escaped, the theme set, the styles in',
+              '<title>x &lt; y</title>' in page and board.REPORT_SHIM % '"light"' in page and board.MARKDOWN_CSS in page
+              and '<article class="md">\n<h1 id="a-bboldb--title">A &lt;b&gt;bold&lt;/b&gt; &amp; title</h1>\n<p>Text</p>\n</article>' in page, page[-400:])
+
+        S.section('reports: DELETE, events, replays, and the request going')
+        s, h, b = call('DELETE', f'/api/requests/{rid}/report')
+        check('DELETE: deleted, the request says null', s == 200 and b == {'deleted': True, 'request_id': rid, 'now': b['now']}
+              and call('GET', f'/api/requests/{rid}')[2]['report'] is None, b)
+        s, h, b = call('DELETE', f'/api/requests/{rid}/report')
+        check('DELETE again: 200, deleted false', s == 200 and b['deleted'] is False, b)
+        s, h, page = call('GET', f'/api/requests/{rid}/report/page')
+        check('the page of no report: 404, a small page saying so, sandboxed too', s == 404 and 'This request has no report.' in page
+              and h['content-security-policy'] == REPORT_CSP, page)
+        evs = [e for e in srv.events(0)['events'] if e['type'].startswith('report_') and e['request_id'] == rid]
+        check('events: report_updated per write (message: the title), report_deleted once', [e['type'] for e in evs].count('report_updated') == 9
+              and [e['type'] for e in evs][-1] == 'report_deleted' and evs[0]['message'] == 'Build & test — résumé'
+              and evs[-1]['message'] == 'x < y' and all(list(e) == EVENT_KEYS for e in evs), [(e['type'], e['message']) for e in evs])
+        before = call('GET', f'/api/requests/{rid}')[2]['updated_at']
+        at = time.time() - 30
+        s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'markdown', 'content': 'late', 'at': at}, headers=REPLAY)
+        check('a replayed PUT: its own time, never before the request\'s last write; the event replayed', s == 201
+              and b['updated_at'] == max(round(at, 3), before) and srv.events(0)['events'][-1]['replayed'] is True, (b, before, at))
+        s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'markdown', 'content': 'x', 'at': at})
+        check('"at" without the replay header: an unknown field', s == 200 and b['warnings'] == ["unknown field 'at' ignored"], b)
+        call('DELETE', f'/api/requests/{rid}')
+        with sqlite3.connect(srv.db) as db:
+            left = db.execute('SELECT COUNT(*) FROM reports WHERE request_id = ?', (rid,)).fetchone()[0]
+        check('deleting the request deletes its report', left == 0, left)
+    finally:
+        srv.stop()
+    check('the reports board logged no tracebacks', 'Traceback' not in srv.log_text(), srv.log_text()[-1500:])
+
+    S.section('reports: the Markdown renderer')
+    md = board.render_markdown
+    cases = (
+        ('# Title *x*\n## Two\n### Two', '<h1 id="title-x">Title <em>x</em></h1>\n<h2 id="two">Two</h2>\n<h3 id="two-1">Two</h3>'),
+        ('Setext\n===\n\nAnd\n---', '<h1 id="setext">Setext</h1>\n<h2 id="and">And</h2>'),
+        ('**b** __b__ *i* _i_ ~~s~~ `c<d>` snake_case_name', '<p><strong>b</strong> <strong>b</strong> <em>i</em> <em>i</em> <del>s</del> '
+                                                            '<code>c&lt;d&gt;</code> snake_case_name</p>'),
+        ('a  \nb\\\nc\nd', '<p>a<br>\nb<br>\nc\nd</p>'),
+        ('[t](https://x.example/a_(b) "T") <https://y.example> https://z.example/p.', '<p><a href="https://x.example/a_(b)" title="T">t</a> '
+         '<a href="https://y.example">https://y.example</a> <a href="https://z.example/p">https://z.example/p</a>.</p>'),
+        ('[x](javascript:alert(1)) ![y](javascript:x) ![z](data:image/png;base64,AA) [**w**](#top)',
+         '<p>x y <img src="data:image/png;base64,AA" alt="z"> <a href="#top"><strong>w</strong></a></p>'),
+        ('<script>alert(1)</script> & "q"', '<p>&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;q&quot;</p>'),
+        ('[a](http://e.example/" onmouseover="x)',   # no link (a destination has no spaces), and the quote stays text
+         '<p>[a](<a href="http://e.example/">http://e.example/</a>&quot; onmouseover=&quot;x)</p>'),
+        ('\\*no\\* \\_no\\_ \\`no\\`', '<p>*no* _no_ `no`</p>'),
+        ('- a\n- b\n  - c\n- [x] d\n- [ ] e', '<ul>\n<li>a</li>\n<li>b\n<ul>\n<li>c</li>\n</ul></li>\n<li class=task><input type="checkbox" disabled checked> d</li>\n'
+                                                '<li class=task><input type="checkbox" disabled> e</li>\n</ul>'),
+        ('- a\n\n- b', '<ul>\n<li><p>a</p></li>\n<li><p>b</p></li>\n</ul>'),
+        ('3. x\n4. y', '<ol start="3">\n<li>x</li>\n<li>y</li>\n</ol>'),
+        ('> q **b**\n> > n', '<blockquote>\n<p>q <strong>b</strong></p>\n<blockquote>\n<p>n</p>\n</blockquote>\n</blockquote>'),
+        ('```js\nif (a < b) {}\n```\n\n    code\n\n***', '<pre><code class="language-js">if (a &lt; b) {}\n</code></pre>\n<pre><code>code\n</code></pre>\n<hr>'),
+        ('| A | B |\n|:--|--:|\n| 1 | **2** |\n| x \\| y |', '<div class="table"><table><thead><tr><th style="text-align:left">A</th>'
+         '<th style="text-align:right">B</th></tr></thead><tbody><tr><td style="text-align:left">1</td><td style="text-align:right">'
+         '<strong>2</strong></td></tr><tr><td style="text-align:left">x | y</td><td style="text-align:right"></td></tr></tbody></table></div>'),
+        ('a | b\n---', '<h2 id="a--b">a | b</h2>'),
+        ('para\n# head\n- item', '<p>para</p>\n<h1 id="head">head</h1>\n<ul>\n<li>item</li>\n</ul>'),
+        ('', ''),
+    )
+    for src, want in cases:
+        got = md(src)
+        check(f'markdown {src[:40]!r}', got == want, (got, want))
 
 
 # ---------------------------------------------------------------- headers, docs, changelog
@@ -752,7 +931,7 @@ def phase_clock():
 
 def schema_of(path: Path):
     with sqlite3.connect(path) as db:
-        tables = {t: [(r[1], r[2], r[3], r[4]) for r in db.execute(f'PRAGMA table_info({t})')] for t in ('requests', 'tasks', 'events')}
+        tables = {t: [(r[1], r[2], r[3], r[4]) for r in db.execute(f'PRAGMA table_info({t})')] for t in ('requests', 'tasks', 'events', 'reports')}
         indexes = sorted(r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"))
         version = db.execute('PRAGMA user_version').fetchone()[0]
     return tables, indexes, version
@@ -806,7 +985,7 @@ def phase_migration():
     with new:
         call = new.call
         log = new.log_text()
-        check('the upgrade is logged', f'database {db} upgraded from schema 1 to 2' in log, log[-800:])
+        check('the upgrade is logged', f'database {db} upgraded from schema 1 to 3' in log, log[-800:])
         for rid, old_body in before.items():
             b = call('GET', f'/api/requests/{rid}')[2]
             # (url: another port; elapsed, eta_remaining: the clock moved on)
@@ -814,7 +993,7 @@ def phase_migration():
             same_tasks = all(all(t[k] == o[k] for k in o if k not in ('elapsed', 'eta_remaining', 'stale', 'url'))
                              for t, o in zip(b['tasks'], old_body['tasks'], strict=True))
             check(f"v1 request {old_body['title']!r}: every v1 field as it was, the v2 fields empty", same and same_tasks
-                  and b['attention'] is None and b['waiting'] is False and b['tasks_waiting'] == 0
+                  and b['attention'] is None and b['waiting'] is False and b['tasks_waiting'] == 0 and b['report'] is None
                   and all(t['attention'] is None for t in b['tasks']), (b, old_body))
         ev = new.events(None)
         check('the migrated database has an empty event log', ev['cursor'] == 0 and ev['waiting'] == [] and new.events(0)['events'] == [], ev)
@@ -824,7 +1003,7 @@ def phase_migration():
                                                                                                 ('attention', f'{run_id}-3')])
         check('a migrated request reopens like any other', call('POST', f'/api/requests/{done_id}/tasks', {'title': 'more'})[2]['reopened'] is True)
     tables, indexes, version = schema_of(db)
-    check('user_version 2', version == 2, version)
+    check('user_version 3, with a reports table', version == 3 and tables['reports'] != [], (version, tables.get('reports')))
     with sqlite3.connect(db) as conn:
         cols = {t: [r[1] for r in conn.execute(f'PRAGMA table_info({t})')] for t in ('requests', 'tasks')}
         check('the attention columns were added at the end', cols['requests'][-2:] == ['attention_message', 'attention_at']
@@ -837,7 +1016,7 @@ def phase_migration():
               again.log_text()[-600:])
     fresh = ScratchServer(TMP, name='freshdb').start()
     fresh.stop()
-    check('a fresh database has exactly the upgraded schema and indexes', schema_of(fresh.db) == (tables, indexes, 2)
+    check('a fresh database has exactly the upgraded schema and indexes', schema_of(fresh.db) == (tables, indexes, 3)
           and 'upgraded' not in fresh.log_text(), (schema_of(fresh.db), (tables, indexes)))
 
     partial = TMP / 'partial.db'
@@ -846,19 +1025,30 @@ def phase_migration():
         conn.execute('ALTER TABLE requests ADD COLUMN attention_message TEXT')
     with ScratchServer(TMP, name='partial', fresh_db=False) as srv:
         pass
-    check('a half-upgraded v1 database finishes the upgrade', schema_of(srv.db) == (tables, indexes, 2), schema_of(srv.db))
+    check('a half-upgraded v1 database finishes the upgrade', schema_of(srv.db) == (tables, indexes, 3), schema_of(srv.db))
+    v2db = TMP / 'v2.db'     # a v2 database (the schema before reports): the reports table added, the rest kept
+    shutil.copy2(fresh.db, v2db)
+    with sqlite3.connect(v2db) as conn:
+        conn.execute('DROP TABLE reports')
+        conn.execute('PRAGMA user_version=2')
+    with ScratchServer(TMP, name='v2', fresh_db=False) as srv2:
+        upgraded = f'database {srv2.db} upgraded from schema 2 to 3' in srv2.log_text()
+        rid2 = srv2.call('POST', '/api/requests', {'title': 'on a v2 database'})[2]['id']
+        put2 = srv2.call('PUT', f'/api/requests/{rid2}/report', {'format': 'markdown', 'content': '# Done'})
+    check('a v2 database upgrades to 3 (logged), and takes a report', upgraded and put2[0] == 201
+          and schema_of(srv2.db) == (tables, indexes, 3), (srv2.log_text()[-400:], put2))
     newer = TMP / 'newer.db'
     shutil.copy2(fresh.db, newer)
     with sqlite3.connect(newer) as conn:
-        conn.execute('PRAGMA user_version = 3')
+        conn.execute('PRAGMA user_version = 4')
     res = subprocess.run([sys.executable, str(SERVER), '--port', str(free_port()), '--db', str(newer), '--pidfile', str(TMP / 'newer.pid'),
                           '--config', str(TMP / 'newer.json')], capture_output=True, text=True, timeout=15, env=clean_env())
-    check('a newer schema (3) is refused: exit 2, a clear error, the database untouched', res.returncode == 2
-          and 'schema version 3 is newer than this server supports (2)' in res.stderr
-          and schema_of(newer)[2] == 3, (res.returncode, res.stderr[-300:]))
+    check('a newer schema (4) is refused: exit 2, a clear error, the database untouched', res.returncode == 2
+          and 'schema version 4 is newer than this server supports (3)' in res.stderr
+          and schema_of(newer)[2] == 4, (res.returncode, res.stderr[-300:]))
     res = subprocess.run([sys.executable, str(v1), '--port', str(free_port()), '--db', str(fresh.db), '--pidfile', str(TMP / 'down.pid')],
                          capture_output=True, text=True, timeout=15, env=clean_env())
-    check('the v1 server refuses a v2 database (no silent downgrade)', res.returncode == 2 and 'newer than this server supports' in res.stderr,
+    check('the v1 server refuses a v3 database (no silent downgrade)', res.returncode == 2 and 'newer than this server supports' in res.stderr,
           (res.returncode, res.stderr[-300:]))
 
 
@@ -870,4 +1060,5 @@ if __name__ == '__main__':
     phase_prune()
     phase_clock()
     phase_migration()
+    phase_reports()
     sys.exit(S.finish())

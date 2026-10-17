@@ -1,6 +1,6 @@
 ---
 name: task-status
-description: Report live progress to the user's task-status web board with the bundled taskctl CLI, so the user can watch a page instead of asking you for status. Use it BEFORE starting multi-step work or anything likely to take longer than about 2 minutes (builds, deploys, test suites, migrations, data processing, long investigations or refactors), before any Bash command you run with run_in_background, before launching subagents or a Workflow, whenever your prompt contains a task-status id (a request id like k3m9qa or a task id like k3m9qa-3) or a STATUS REPORTING block, and whenever the user asks for a status report, progress, an ETA or how it is going. One titled request per user request, one task per step or agent, percent plus hint plus ETA at milestones, every task and the request closed at the end. While a request is open, flag it with taskctl ask before you stop to ask the user a question or wait for their input. Skip it for quick answers and single short commands.
+description: Report live progress to the user's task-status web board with the bundled taskctl CLI, so the user can watch a page instead of asking you for status. Use it BEFORE starting multi-step work or anything likely to take longer than about 2 minutes (builds, deploys, test suites, migrations, data processing, long investigations or refactors), before any Bash command you run with run_in_background, before launching subagents or a Workflow, whenever your prompt contains a task-status id (a request id like k3m9qa or a task id like k3m9qa-3) or a STATUS REPORTING block, and whenever the user asks for a status report, progress, an ETA or how it is going. One titled request per user request, one task per step or agent, percent plus hint plus ETA at milestones, every task and the request closed at the end. While a request is open, flag it with taskctl ask before you stop to ask the user a question or wait for their input. When you publish a report (a Claude artifact or a document) for work tracked there, send the same file to its request with taskctl report. Skip it for quick answers and single short commands.
 allowed-tools:
   - Bash(${CLAUDE_SKILL_DIR}/taskctl new *)
   - Bash(${CLAUDE_SKILL_DIR}/taskctl add *)
@@ -17,6 +17,7 @@ allowed-tools:
   - Bash(${CLAUDE_SKILL_DIR}/taskctl usage *)
   - Bash(${CLAUDE_SKILL_DIR}/taskctl changelog *)
   - Bash(${CLAUDE_SKILL_DIR}/taskctl api *)
+  - Bash(${CLAUDE_SKILL_DIR}/taskctl report *)
 ---
 
 # Task status board
@@ -144,14 +145,34 @@ ${CLAUDE_SKILL_DIR}/taskctl fail k3m9qa 'Built fine, the staging upload was reje
 - Closing twice is harmless. Progress on a closed task is refused (a warning, nothing else). If the
   user asks for more work after you closed the request, `add` tasks to it: that reopens it.
 
-## 7. Status questions
+## 7. Send your report to its request
+
+When you write a report for work tracked on the board and publish it as a Claude artifact (or hand it
+to the user as a document), also send the very same file to its request, so the board shows exactly
+what the artifact shows. Send it again after every update you publish.
+
+```
+${CLAUDE_SKILL_DIR}/taskctl report k3m9qa report.html --artifact https://claude.ai/code/artifact/0123abcd
+${CLAUDE_SKILL_DIR}/taskctl report k3m9qa findings.md --title 'Migration findings'
+```
+
+- FILE is the `.html` page you published, or Markdown (`.md`); `-` reads stdin, with `--format html`
+  or `--format markdown`. The board shows HTML as sent (scripts and all, sandboxed) and renders Markdown.
+- `--artifact URL` links the board's report page to the artifact. The title defaults to the page's
+  `<title>` or the first Markdown heading; `--title` sets another.
+- stdout is the report's page on the board, `http://HOST:8765/r/k3m9qa/report`: give it to the user
+  along with the artifact's link.
+- A request has one report: each send replaces it (up to 8 MiB), and `--delete` removes it. It works on
+  a closed request too, and is queued like the other writes while the board is unreachable.
+
+## 8. Status questions
 
 When the user asks for a status report, progress or how it is going, run
 `${CLAUDE_SKILL_DIR}/taskctl show k3m9qa` (or `show k3m9qa-2` for one task), summarize it and include
 the page link. If you lost the id, `${CLAUDE_SKILL_DIR}/taskctl list` shows every running request
 (`list --all` adds the 20 most recently finished ones). Answer from the board, not from memory.
 
-## 8. Staying current
+## 9. Staying current
 
 The board gains features over time, and taskctl keeps this skill in step with it. When the board's
 agent instructions change, the next taskctl command that talks to this skill's own board updates this
@@ -178,7 +199,7 @@ taskctl: re-read DIR/SKILL.md before continuing; the copy loaded in your context
   `TASKS_URL` never changes the skill (taskctl says so in a note), and `update` refuses another board
   unless the user wants the skill moved there (`--force`).
 
-## 9. If the board is unreachable
+## 10. If the board is unreachable
 
 If taskctl prints `taskctl: warning: board unreachable at URL (REASON); queued for replay (N queued)`,
 keep working. Do not retry, debug or restart the board; mention it once in your final reply.
@@ -195,7 +216,7 @@ keep working. Do not retry, debug or restart the board; mention it once in your 
 - `${CLAUDE_SKILL_DIR}/taskctl ping` checks the board and says how many reports are queued;
   `${CLAUDE_SKILL_DIR}/taskctl flush` replays them now. The queue outlives your session.
 
-## 10. Workflows and subagents
+## 11. Workflows and subagents
 
 Workflow scripts have no network access, and a subagent may not have this skill loaded. So you, the
 orchestrator, create the request and one task per planned agent before launching them, and each agent
@@ -269,6 +290,7 @@ you ran `new`, pass its ids on anyway; the agents' reports queue on this machine
 | `ping` | check the board; prints its URL, and how many reports are queued |
 | `flush` | replay the reports queued while the board was unreachable |
 | `run TID [--every SEC] [--percent-regex RE] -- CMD...` | run a command and report its output |
+| `report RID FILE [--title T] [--artifact URL]` | send the request's report (HTML or Markdown, `-` for stdin); prints its page; `--delete` removes it |
 | `usage` | the board's full HTTP API reference |
 | `api METHOD PATH ['JSON']` | call any board route; prints the response body |
 | `changelog` | what each board version added |

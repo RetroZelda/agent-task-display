@@ -89,7 +89,13 @@ CHANGELOG_ENTRY_RE = re.compile(r'^## v(\d+)\b', re.M)
 SKILL_FILES = (('SKILL.md', b'---', 0o644), ('taskctl', b'#!', 0o755), ('taskctl.py', None, 0o755))
 API_PATH_RE = re.compile(r'/api/[^\s\x00-\x1f\x7f]*')
 # A queued write: /api/tasks/<tid>/progress, /api/requests/<rid>/complete and so on.
-WRITE_PATH_RE = re.compile(r'/api/(tasks|requests)/([^/?#]+)/(progress|complete|attention)')
+# Reports: what a FILE's extension says it is, the --format names, and the board's limit on a report's body.
+REPORT_EXTENSIONS = {'.html': 'html', '.htm': 'html', '.xhtml': 'html', '.md': 'markdown', '.markdown': 'markdown',
+                     '.mdown': 'markdown', '.mkd': 'markdown'}
+REPORT_FORMATS = {'html': 'html', 'markdown': 'markdown', 'md': 'markdown'}
+REPORT_BODY_MAX = 8 * 1024 * 1024
+REPORT_TIMEOUT = 30.0  # seconds for a report's upload (other calls keep --timeout)
+WRITE_PATH_RE = re.compile(r'/api/(tasks|requests)/([^/?#]+)/(progress|complete|attention|report)')
 # connect() failed: the call certainly never reached the board, so it is safe to queue and replay.
 # EPERM and EACCES are a local firewall dropping the connection (a VPN kill switch, say).
 CONNECT_ERRNOS = frozenset(getattr(errno, name) for name in (
@@ -487,7 +493,7 @@ def private_dir(path: str) -> None:
 
 
 def valid_record(record) -> bool:
-    return (isinstance(record, dict) and record.get('method') in ('POST', 'DELETE')
+    return (isinstance(record, dict) and record.get('method') in ('POST', 'PUT', 'DELETE')
             and isinstance(record.get('path'), str) and record['path'].startswith('/api/')
             and isinstance(record.get('body'), (dict, type(None)))
             and isinstance(record.get('at'), (int, float)) and not isinstance(record['at'], bool)
@@ -514,16 +520,20 @@ def write_target(record):
 
 def coalesce(records):
     """Drop the writes a later one supersedes: a progress update when a later write is about the same
-    task, and an attention set or clear when a later one is about the same request or task."""
-    kept, later, later_attention = [], set(), set()
+    task, an attention set or clear when a later one is about the same request or task, and a report
+    (put or delete) when a later one is about the same request's report."""
+    kept, later, later_attention, later_report = [], set(), set(), set()
     for record in reversed(records):
         target, action = write_target(record)
         if target is not None:
-            if (action == 'progress' and target in later) or (action == 'attention' and target in later_attention):
+            if ((action == 'progress' and target in later) or (action == 'attention' and target in later_attention)
+                    or (action == 'report' and target in later_report)):
                 continue
             later.add(target)
             if action == 'attention':
                 later_attention.add(target)
+            if action == 'report':
+                later_report.add(target)
         kept.append(record)
     kept.reverse()
     return kept
@@ -1188,7 +1198,10 @@ def cmd_show(board: Board, args) -> int:
         emit([task_line(t, t.get('now'))] + waiting_lines(t, ''))
         return 0
     r = board.call('GET', '/api/requests/%s' % v)
-    emit([request_line(r)] + waiting_lines(r, '') + ['page: %s' % r.get('url')])
+    report = r.get('report')
+    emit([request_line(r)] + waiting_lines(r, '') + ['page: %s' % r.get('url')]
+         + (['report: %s (%s, %s, version %s)' % (report.get('url'), report.get('format'), size_text(report.get('size')),
+                                                  report.get('version'))] if isinstance(report, dict) else []))
     for t in r.get('tasks') or []:
         emit(['  ' + task_line(t, r.get('now'))] + waiting_lines(t, '    '))
     return 0
@@ -1202,6 +1215,64 @@ def cmd_list(board: Board, args) -> int:
     if not requests:
         note('no requests' if args.all else 'no running requests')
     emit([request_line(q) for q in requests])
+    return 0
+
+
+def size_text(n) -> str:
+    if not isinstance(n, (int, float)):
+        return '? bytes'
+    return '%d bytes' % n if n < 1024 else '%.1f KiB' % (n / 1024) if n < 1024 * 1024 else '%.1f MiB' % (n / 1048576)
+
+
+def cmd_report(board: Board, args) -> int:
+    v = need_id(args.rid, 'request')
+    path = '/api/requests/%s/report' % v
+    if args.delete:
+        if args.file or args.title or args.artifact or args.format:
+            raise UsageError('report RID --delete takes nothing else')
+        if skip_offline(v):
+            return 0
+        r = board.call('DELETE', path, spool=True)
+        note('the report of %s deleted' % v if r.get('deleted') else '%s had no report' % v)
+        return 0
+    if not args.file:
+        raise UsageError('report needs the FILE to send (- for stdin): taskctl report RID FILE [--title T] [--artifact URL]')
+    name = 'stdin' if args.file == '-' else args.file
+    fmt = REPORT_FORMATS.get(args.format) if args.format else REPORT_EXTENSIONS.get(os.path.splitext(args.file)[1].lower())
+    if not fmt:
+        raise UsageError("can't tell whether %s is HTML or Markdown; add --format html or --format markdown" % name)
+    try:
+        if args.file == '-':
+            data = sys.stdin.buffer.read()
+        else:
+            with open(args.file, 'rb') as f:
+                data = f.read()
+    except OSError as e:
+        raise UsageError('cannot read %s: %s' % (name, e.strerror or e))
+    try:
+        content = data.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        raise UsageError('%s is not UTF-8 text' % name)
+    if not content.strip():
+        raise UsageError('%s is empty' % name)
+    body = {'format': fmt, 'content': content}
+    if args.title:
+        body['title'] = args.title
+    if args.artifact:
+        body['artifact_url'] = args.artifact.strip()
+    if len(json.dumps(body).encode('utf-8')) > REPORT_BODY_MAX:
+        raise UsageError('%s is too large: the board takes reports of up to 8 MiB (as JSON)' % name)
+    if skip_offline(v):
+        return 0
+    board.timeout = max(board.timeout, REPORT_TIMEOUT)  # megabytes, over a slow link
+    try:
+        r = board.call('PUT', path, body, spool=True)
+    except BoardError as e:
+        if e.status == 404 and 'no route' in str(e):
+            raise BoardError('this board keeps no reports (it runs an older version): %s' % e, False, status=404)
+        raise
+    emit([r.get('url') or '%s/r/%s/report' % (board.base, v)])
+    note('report of %s saved (%s, %s, version %s)' % (v, r.get('format'), size_text(r.get('size')), r.get('version')))
     return 0
 
 
@@ -1572,6 +1643,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('-a', '--all', action='store_true', help='also list the 20 most recently finished requests')
     command('ping', cmd_ping, 'check the board; prints its URL')
     command('flush', cmd_flush, 'replay the writes queued while the board was unreachable')
+    p = command('report', cmd_report, "send a request's report (HTML or Markdown): report RID FILE; prints its page")
+    p.add_argument('rid')
+    p.add_argument('file', nargs='?', metavar='FILE', help='the report: .html or .md (- for stdin, with --format)')
+    p.add_argument('--title', help='default: the HTML <title> or the first Markdown heading')
+    p.add_argument('--artifact', metavar='URL', help='the Claude artifact it replicates, linked from its page')
+    p.add_argument('--format', choices=sorted(REPORT_FORMATS), help='when FILE has no .html or .md extension')
+    p.add_argument('--delete', action='store_true', help="delete the request's report")
     p = command('run', cmd_run, 'run CMD and report its latest output line: run TID -- CMD...')
     p.usage = '%(prog)s [-h] [--every SEC] [--percent-regex RE] TID -- CMD...'
     p.add_argument('tid')
