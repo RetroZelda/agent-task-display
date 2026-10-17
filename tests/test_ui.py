@@ -1311,6 +1311,11 @@ def assert_streamlayout(r, name='streamlayout', tag='layout', note=''):
     check(f'{tag}: the video, 16:9, portrait 390x844: the whole width, the height the ratio gives (219.4), at the bottom',
           at(vp, 0, 844 - 390 * 9 / 16, 390, 390 * 9 / 16) and abs(vp['board']['h'] + vp['rect']['h'] - 844) < 0.01 and vp['ar'] == '1.7778', vp)
     check(f'{tag}: the video, 16:9, landscape 1280x800: half the width (640)', at(vw, 640, 0, 640, 800), vw)
+    vx, ve, hw = r['videoWider'], r['videoEdge'], r['hangWider']
+    check(f'{tag}: the video, 16:9, landscape 2560x1440: all but the list\'s column (2560 - 976 = 1584, more than half), the list beside it at its full 960px',
+          at(vx, 976, 0, 1584, 1440) and abs(vx['board']['w'] - 976) < 1 and abs(vx['wrap']['w'] - 960) < 1, vx)
+    check(f'{tag}: the video, 16:9, landscape 1952x1080: where the two meet, half the width (976)', at(ve, 976, 0, 976, 1080), ve)
+    check(f'{tag}: not connected, landscape 2560x1440: the same width as a picture would take (1584)', at(hw, 976, 0, 1584, 1440), hw)
     check(f'{tag}: the video, 16:9, portrait 800x1280: the ratio gives 450 of the 640 allowed', at(vt, 0, 1280 - 450, 800, 450), vt)
     tp, tw = r['sourceTallPortrait'], r['sourceTallWide']
     check(f'{tag}: the video, 9:16, portrait 390x844: capped at half the window (422), the width of the window', tp['state'] == 'video' and at(tp, 0, 422, 390, 422) and tp['ar'] == '0.5625', tp)

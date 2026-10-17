@@ -31,6 +31,8 @@ __t.run(async () => {
     const doc = f.contentDocument;
     out.hangRoles = [doc.getElementById('stream-line').getAttribute('role'), doc.getElementById('stream-timer').getAttribute('role'),
                      doc.getElementById('stream').getAttribute('aria-label')];
+    await size(f, 2560, 1440);
+    out.hangWider = pane(f);
     await size(f, 844, 390);
     out.hangLandscape = pane(f);
     out.hangLandscape.setupWide = f.contentWindow.getComputedStyle(doc.querySelector('.setup .wide')).display;
@@ -54,6 +56,12 @@ __t.run(async () => {
     out.videoPortrait = pane(f);
     await size(f, 1280, 800);
     out.videoWide = pane(f);
+    // wider than twice the list: the pane takes all but the list's column (976 of 2560), up to its ratio (1440 * 16/9)
+    await size(f, 2560, 1440);
+    out.videoWider = pane(f);
+    out.videoWider.wrap = __t.rect(f.contentDocument.querySelector('main.wrap'));
+    await size(f, 1952, 1080);
+    out.videoEdge = pane(f);
     await size(f, 800, 1280);
     out.videoTall = pane(f);
 

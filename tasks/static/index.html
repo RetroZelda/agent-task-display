@@ -328,13 +328,15 @@ body.calm .row[data-waiting]:not(.flash), body.calm .card[data-waiting]:not(.fla
 /* Live stream: only while one is open (html and body carry .streaming). The board becomes an inner scroller with
    the pane below it in portrait and to its right in landscape; the pane is black in both colour schemes. Its
    size by state: connecting, buffering or unsupported: half the window; video: the picture's aspect ratio
-   (--ar) up to half the window, black bars where the cap applies; audio only: 15% of it. */
+   (--ar) up to half the window, black bars where the cap applies; audio only: 15% of it. In landscape "half" is
+   at least half: on a window wider than twice the list, the pane takes all but the list's column (--board-w: the
+   .wrap's 960px and room for the board's scrollbar), so the board keeps no empty margins beside it. */
 html.streaming { overflow: hidden; }
 body.streaming { height: 100vh; height: 100dvh; overflow: hidden; display: grid;
     grid-template: "board" minmax(0, 1fr) "stream" auto / minmax(0, 1fr); }
 body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: contain; container: board / inline-size; }
 #stream { grid-area: stream; position: relative; overflow: hidden; container: stream / inline-size; background: #000; color: #e6edf3;
-    --ar: 1.7778; height: 50vh; }
+    --ar: 1.7778; --board-w: 976px; height: 50vh; }
 #stream[data-state=video] { height: min(50vh, 100vw / var(--ar)); }
 #stream[data-state=audio] { height: 15vh; }
 /* The dynamic viewport (a phone's toolbars come and go) only where the browser knows dvh (Chrome 108+, Safari 15.4+,
@@ -347,13 +349,13 @@ body.streaming #board { grid-area: board; overflow: auto; overscroll-behavior: c
 }
 @media (orientation: landscape) {
     body.streaming { grid-template: "board stream" minmax(0, 1fr) / minmax(0, 1fr) auto; }
-    #stream { height: auto; width: 50vw; }
-    #stream[data-state=video] { height: auto; width: min(50vw, 100vh * var(--ar)); }
+    #stream { height: auto; width: max(50vw, 100vw - var(--board-w)); }
+    #stream[data-state=video] { height: auto; width: min(max(50vw, 100vw - var(--board-w)), 100vh * var(--ar)); }
     #stream[data-state=audio] { height: auto; width: 15vw; }
 }
 @supports (height: 1dvh) {
     @media (orientation: landscape) {
-        #stream[data-state=video] { width: min(50vw, 100dvh * var(--ar)); }
+        #stream[data-state=video] { width: min(max(50vw, 100vw - var(--board-w)), 100dvh * var(--ar)); }
     }
 }
 /* Transparent, not visibility: hidden, until there is a picture: Firefox may not decode a video it considers invisible. */
