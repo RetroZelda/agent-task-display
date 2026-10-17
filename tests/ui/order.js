@@ -28,6 +28,7 @@ __t.run(async () => {
     };
     const NUMBER = [1, 2, 3, 4, 5, 6, 7, 8, 9];
     const PROGRESS = [6, 3, 8, 4, 7, 1, 5, 9, 2];
+    const UPDATED = [9, 5, 6, 8, 3, 4, 7, 2, 1];    // the seed's updates, the last first (4 and 7, added together and untouched since, by number)
     const out = {};
     await api('DELETE', '/api/settings');
     await until(() => seqs().length === 9, 5000);
@@ -45,6 +46,11 @@ __t.run(async () => {
     out.sameRows = [...document.querySelectorAll('#task-list > .row')].every((el) => rows0.get(el.id) === el);
     $('task-order').querySelector('[data-order=number]').click();
     out.toggleNumber = await settle(NUMBER, 1000);
+    $('task-order').querySelector('[data-order=updated]').click();
+    out.toggleUpdated = await settle(UPDATED, 1000);
+    // an update moves the task to the top (3 stays running, so the progress order below is the same)
+    await api('POST', `/api/tasks/${rid}-3/progress`, { message: 'still compiling', percent: 40 });
+    out.updatedMoved = await settle([3, 9, 5, 6, 8, 4, 7, 2, 1]);
     $('task-order').querySelector('[data-order=progress]').click();
     await settle(PROGRESS, 1000);
 
@@ -52,6 +58,8 @@ __t.run(async () => {
     $('settings-btn').click();
     await sleep(500);
     out.devProgress = look();
+    out.devRadios = [...document.querySelectorAll('input[name=dev-order]')].map((r) => r.value);
+    out.globRadios = [...document.querySelectorAll('input[name=glob-order]')].map((r) => r.value);
     document.querySelector('input[name=dev-order][value=board]').click();
     out.devBoard = await settle(NUMBER, 1000);
 

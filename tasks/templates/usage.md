@@ -119,10 +119,11 @@ have changed: read {{BASE_URL}}/api/changelog and this page again.
                                           config_path, pid, now, started_at, requests_running}
     POST   /api/requests                  {title, origin?, tasks?: [title, ...], id?} -> 201 the request
                                           with its id, url and tasks[] (all pending); see "Request ids"
-    GET    /api/requests                  ?status=running|done|failed&limit=N -> {now, stale_after, counts,
-                                          requests[]}: running ones first, then finished ones; without
-                                          status every running request is included and limit (default
-                                          100, max 500) caps only the finished ones
+    GET    /api/requests                  ?status=running|done|failed&limit=N&offset=M -> {now, stale_after,
+                                          counts, requests[]}: running ones first, then finished ones;
+                                          without status every running request is included, and offset
+                                          (default 0) and limit (default 100, max 500) page only the
+                                          finished ones, newest first
     GET    /api/requests/<rid>            the request with its tasks[]
     DELETE /api/requests/<rid>            delete a request and its tasks (cleanup only)
     POST   /api/requests/<rid>/complete   {status?: done|failed, message?} -> the request, plus
@@ -201,10 +202,10 @@ file on the board host (`config_path` in /api/health). `GET /api/settings` retur
 version, exists, error, settings, defaults}`: `settings` is what is in effect (the defaults merged
 with the file; the defaults alone, with `error` set, when the file is not valid). The shape is
 `{"events": {KEY: {"highlight": bool, "title": bool, "sound": bool, "notify": bool}}, "sound":
-{"volume": 0.0-1.0}, "tasks": {"order": "number" | "progress"}}` with KEY one of waiting, task_failed,
+{"volume": 0.0-1.0}, "tasks": {"order": "number" | "progress" | "updated"}}` with KEY one of waiting, task_failed,
 request_failed, request_done, task_done, task_started, task_progress, request_created and stale.
-`tasks.order` is how a request's page lists its tasks: by number (the default), or by progress (running,
-then queued, then done and failed); the API always lists them by number. `PUT /api/settings` with `{"settings":
+`tasks.order` is how a request's page lists its tasks: by number (the default), by progress (running,
+then queued, then done and failed) or by the latest update first; the API always lists them by number. `PUT /api/settings` with `{"settings":
 {...}}` (any part of that shape) validates it (an unknown key, a non-boolean or an unknown order is a 400 naming the
 field), merges it into the current settings, saves the whole result and answers like GET; `DELETE`
 removes the file. `version` (also `settings_version` in /api/events) changes whenever the settings

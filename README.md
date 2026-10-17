@@ -244,9 +244,14 @@ The full wording, including the template for agents that register themselves, is
 - The list shows the active requests first, then the finished ones, with running, stale, done and
   failed counts at the top. Each request's page lists its tasks, and `/r/<rid>#<tid>` links straight
   to one task.
-- **Task order**: a request's page lists its tasks by **Number** (the order they were added) or by
+- **Pages**: every active request is always listed; the finished ones come a page at a time, newest
+  first, with first, previous, next and last buttons under them and a *Per page* choice of 10 (the
+  default), 20, 50 or 100. Each device keeps its own page size. Going to a request and back returns to
+  the same page, and when requests are deleted from under it the list moves to the last page left.
+- **Task order**: a request's page lists its tasks by **Number** (the order they were added), by
   **Progress**: running tasks first (those waiting for input at the top), then queued ones, then done
-  and failed ones, then cancelled ones, by number within each group. The toggle on the *Tasks* heading
+  and failed ones, then cancelled ones, by number within each group, or by **Updated**: the task with
+  the latest report first, so whatever just changed is at the top. The toggle on the *Tasks* heading
   switches it for this device. The default for every viewer is in the [settings file](#the-settings-file),
   and *Settings > This device > Task order > The board's* follows it again. The request list keeps its own order.
 - **Waiting** requests come first. They and their waiting tasks pulse (a steady outline if your
@@ -255,8 +260,8 @@ The full wording, including the template for agents that register themselves, is
 - The page polls every 1.5 s, and every 5 s in a background tab, so notifications and the tab title
   keep working while you look elsewhere. It follows the system's light or dark theme, unless this
   device's Settings say Light or Dark, and works at phone width.
-- **Mark done**, **Mark failed** and **Delete** act on a request. **Clear** deletes the finished
-  requests listed. **Agent setup** opens `/api/usage`. The gear button opens the **Settings** (the
+- **Mark done**, **Mark failed** and **Delete** act on a request. **Clear** deletes every finished
+  request, on every page (it asks first, with the count). **Agent setup** opens `/api/usage`. The gear button opens the **Settings** (the
   theme, the clock, alerts, and the live stream's sound and quality), and the bell turns this device's sound on or off.
 - **The clock** in the middle of the header is the board host's date and time, in the host's own time zone,
   not the browser's, so every screen shows the same moment however it is set (on a narrow window it takes a
@@ -326,7 +331,7 @@ settings, and the defaults apply until then. The format:
 
 The event keys are `waiting`, `task_failed`, `request_failed`, `request_done`, `task_done`,
 `task_started`, `task_progress`, `request_created` and `stale`. `tasks.order` is `"number"` (the
-default) or `"progress"` (see [task order](#the-dashboard)). You can edit the file by hand: leave
+default), `"progress"` or `"updated"` (see [task order](#the-dashboard)). You can edit the file by hand: leave
 out anything you do not want to change (it keeps its default), and open dashboards pick up the
 change within seconds. If the file is not valid JSON, or has an unknown key, a value that is not `true` or
 `false` or an unknown order, the board uses the defaults and reports the problem (in `/api/settings`, and on the
@@ -539,7 +544,7 @@ shapes, validation, errors and state rules, is the module docstring of
 | GET | `/api/skill/SKILL.md`, `/api/skill/taskctl`, `/api/skill/taskctl.py` | The skill and CLI files (`taskctl.py` has the board URL built in) |
 | GET | `/api/health` | `{ok, service, version, docs_version, tls_port, config_path, pid, now, started_at, requests_running}` |
 | POST | `/api/requests` | Create a request: `{title, origin?, tasks?: [title], id?}` (an existing `id` with the same title returns that request) |
-| GET | `/api/requests` | List: running requests first, then finished ones (`?status=`, `?limit=`) |
+| GET | `/api/requests` | List: running requests first, then finished ones (`?status=`, `?limit=`, `?offset=` to page the finished ones) |
 | GET | `/api/requests/<rid>` | One request with its tasks |
 | DELETE | `/api/requests/<rid>` | Delete a request and its tasks |
 | POST | `/api/requests/<rid>/complete` | Close it: `{status?: done\|failed, message?}` (cascades) |

@@ -83,7 +83,8 @@ __t.run(async () => {
     const waitingList = (await (await fetch('/api/events')).json()).waiting;
     const askText = (el) => { const a = el.querySelector(':scope > .ask'); return a.hidden ? null : a.querySelector('[data-ref=askQ]').textContent; };
     if (!m) {
-        const d = await (await fetch('/api/requests')).json();
+        // the page of finished requests the board shows (the first, at this device's page size)
+        const d = await (await fetch('/api/requests?limit=' + ($('page-size').value || 10))).json();
         const active = [...$('list-active').children].map((e) => e.getAttribute('href').slice(3));
         const firstPlain = active.findIndex((id) => !d.requests.find((r) => r.id === id).waiting);
         if (firstPlain >= 0 && active.slice(firstPlain).some((id) => d.requests.find((r) => r.id === id).waiting)) bad('a waiting request sorts after one that is not: ' + active.join(','));

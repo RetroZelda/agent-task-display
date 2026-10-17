@@ -39,10 +39,14 @@
   is narrow): the polls' clock moved by the zone the board reports in /api/events ("clock": utc_offset and tz), so this
   device's own clock and zone play no part. Settings > This device > Appearance > Clock can switch it to this device's own.
 
-  Task order: a request's page lists its tasks by number (as the board sends them) or by progress: running (waiting
-  first), then queued, then done and failed, then cancelled, by number within each. The board's settings ("tasks":
-  {"order"}) set it for every viewer; the toggle on the Tasks heading, or Settings > This device > Appearance > Task
-  order, picks this device's own. The request list keeps its own order.
+  Task order: a request's page lists its tasks by number (as the board sends them), by progress: running (waiting
+  first), then queued, then done and failed, then cancelled, by number within each, or by update: the one updated
+  last first. The board's settings ("tasks": {"order"}) set it for every viewer; the toggle on the Tasks heading, or
+  Settings > This device > Appearance > Task order, picks this device's own. The request list keeps its own order.
+
+  Pages: the list shows every running request, and the finished ones a page at a time (newest first), 10, 20, 50 or
+  100 to a page as this device chose (kept in this browser); the page itself is kept in the history entry, so Back
+  from a request returns to it. Clear deletes every finished request, on every page.
 -->
 <script>
 try {
@@ -146,9 +150,16 @@ summary.section .btn { margin-left: auto; text-transform: none; letter-spacing: 
 .order { display: inline-flex; margin-left: auto; text-transform: none; letter-spacing: 0; }
 .order .btn { border-radius: 0; color: var(--muted); }
 .order .btn:first-child { border-radius: 6px 0 0 6px; }
-.order .btn:last-child { margin-left: -1px; border-radius: 0 6px 6px 0; }
+.order .btn + .btn { margin-left: -1px; }
+.order .btn:last-child { border-radius: 0 6px 6px 0; }
 .order .btn[aria-pressed=true] { position: relative; color: var(--text); background: var(--surface); border-color: var(--muted); }
 .none { color: var(--muted); font-size: 14px; margin: 4px 0; }
+/* The pages of the finished requests: first, previous, which ones, next, last, and the page size */
+.pager { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+.pager .btn { min-width: 32px; }
+.page-info { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.per-page { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.per-page select { font: inherit; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); }
 .empty { text-align: center; color: var(--muted); padding: 32px 0; }
 .empty .big { font-size: 18px; color: var(--text); font-weight: 600; margin: 0 0 6px; }
 .empty pre { text-align: left; margin: 16px auto 0; max-width: 820px; padding: 12px 14px; background: var(--surface);
@@ -466,8 +477,14 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         </div>
         <details id="group-finished" open>
             <summary class="section">Finished <span class="count" id="count-finished"></span>
-                <button type="button" class="btn small" id="clear" title="Delete the finished requests listed below">Clear</button></summary>
+                <button type="button" class="btn small" id="clear" title="Delete every finished request, on every page">Clear</button></summary>
             <div id="list-finished" class="rows"></div>
+            <nav class="pager" id="pager" aria-label="Pages of finished requests" hidden>
+                <span class="btns"><button type="button" class="btn small" id="page-first" aria-label="First page" title="First page (the newest)">&laquo;</button><button type="button" class="btn small" id="page-prev" aria-label="Previous page" title="Previous page (newer)">&lsaquo;</button></span>
+                <span class="page-info" id="page-info" role="status"></span>
+                <span class="btns"><button type="button" class="btn small" id="page-next" aria-label="Next page" title="Next page (older)">&rsaquo;</button><button type="button" class="btn small" id="page-last" aria-label="Last page" title="Last page (the oldest)">&raquo;</button></span>
+                <label class="per-page">Per page <select id="page-size"><option value="10">10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select></label>
+            </nav>
         </details>
     </section>
 
@@ -489,7 +506,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             </div>
         </div>
         <h2 class="section">Tasks <span class="count" id="count-tasks"></span>
-            <span class="order" id="task-order" role="group" aria-label="Order of the tasks"><button type="button" class="btn small" data-order="number" aria-pressed="true" title="List the tasks by number">Number</button><button type="button" class="btn small" data-order="progress" aria-pressed="false" title="List the tasks running first, then queued, then finished">Progress</button></span></h2>
+            <span class="order" id="task-order" role="group" aria-label="Order of the tasks"><button type="button" class="btn small" data-order="number" aria-pressed="true" title="List the tasks by number">Number</button><button type="button" class="btn small" data-order="progress" aria-pressed="false" title="List the tasks running first, then queued, then finished">Progress</button><button type="button" class="btn small" data-order="updated" aria-pressed="false" title="List the tasks updated last first">Updated</button></span></h2>
         <p id="task-empty" class="none" hidden>No tasks yet. Agents add them with <code id="task-empty-cmd"></code></p>
         <ol id="task-list" class="rows"></ol>
     </section>
@@ -538,6 +555,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             <label class="check"><input type="radio" name="dev-order" value="board"> The board's</label>
             <label class="check"><input type="radio" name="dev-order" value="number"> By number</label>
             <label class="check"><input type="radio" name="dev-order" value="progress"> By progress</label>
+            <label class="check"><input type="radio" name="dev-order" value="updated"> By last update</label>
             <span id="dev-order-note" class="inline-note"></span></div>
 
         <h3>Sound</h3>
@@ -587,6 +605,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         <div class="field" role="radiogroup" aria-labelledby="glob-order-label"><span class="label" id="glob-order-label">Task order</span>
             <label class="check"><input type="radio" name="glob-order" value="number"> By number</label>
             <label class="check"><input type="radio" name="glob-order" value="progress"> By progress</label>
+            <label class="check"><input type="radio" name="glob-order" value="updated"> By last update</label>
             <span id="glob-order-note" class="inline-note"></span></div>
         <p class="note">Settings file on the board: <code id="glob-path"></code> <span id="glob-exists"></span></p>
         <div class="field"><span class="btns"><button type="button" class="btn good" id="glob-save">Save</button><button type="button" class="btn" id="glob-discard" hidden>Discard changes</button>
@@ -634,12 +653,15 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     const SETTINGS_RETRY_MS = 10000;
     const CLAIM_MS = 120000;
     const FINISHED_OPEN_KEY = 'taskstatus.finishedOpen';
+    const PAGE_SIZE_KEY = 'taskstatus.finishedPageSize';  // this device's page size for the finished requests
+    const PAGE_SIZES = [10, 20, 50, 100];
     const LOCAL_KEY = 'taskstatus.settings.local';
     const THEMES = ['system', 'light', 'dark'];     // this device's theme: the system's own, or Light or Dark whatever it says
     const CLOCKS = ['board', 'device'];             // whose clock the header shows: the board host's, or this device's own
-    // How a request's page lists its tasks: by number, or by progress (running, then queued, then finished; see orderTasks).
-    const TASK_ORDERS = ['number', 'progress'];
-    const ORDER_TEXT = { number: 'by number', progress: 'running first, then queued, then finished' };
+    // How a request's page lists its tasks: by number, by progress (running, then queued, then finished) or by the latest
+    // update (see orderTasks).
+    const TASK_ORDERS = ['number', 'progress', 'updated'];
+    const ORDER_TEXT = { number: 'by number', progress: 'running first, then queued, then finished', updated: 'the latest updated first' };
     const PROGRESS_RANK = { running: 1, pending: 2, done: 3, failed: 3, cancelled: 4 };   // a waiting task is 0
     // What this device asks the board for: the stream as the source sends it, or a lighter copy the board makes of it.
     const STREAM_QUALITIES = ['original', 'light', 'stills'];
@@ -707,7 +729,9 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
 
     let view = 'list';
     let rid = null;
-    let apiPath = '/api/requests';
+    let apiPath = '/api/requests';    // the detail view's; the list's is listPath(), the page of finished requests shown
+    let pageSize = PAGE_SIZES[0];       // finished requests per page (this device's choice)
+    let finishedPage = 0;               // which page of them, from 0 (the newest); kept in this history entry
     let clockOffset = 0;        // server clock minus client clock, in seconds
     let timer = 0;
     let busy = false;
@@ -1148,7 +1172,8 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
 
     // done({data, missing, error})
     function getData(done) {
-        xhrGet(apiPath, (status, body, error, t0, t1) => {
+        const path = view === 'list' ? listPath() : apiPath;
+        xhrGet(path, (status, body, error, t0, t1) => {
             if (view === 'detail' && (status === 404 || status === 400)) {
                 done({ data: null, missing: status, error: (body && body.error) || '' });
             } else if (!status) {
@@ -1159,6 +1184,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
                 done({ data: null, missing: 0, error: 'bad response' });
             } else {
                 clockOffset = body.now - (t0 + t1) / 2000;
+                if (view === 'list') body.asked = path;     // which page this answer is, for render
                 done({ data: body, missing: 0, error: '' });
             }
         });
@@ -1264,6 +1290,10 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     // Rendering
 
     function render(data) {
+        if (view === 'list' && !listCurrent(data)) {   // a page of finished requests since left: ask again at once
+            wantPoll = true;
+            return;
+        }
         lastData = data;
         if (view === 'list') renderList(data);
         else renderDetail(data);
@@ -1293,13 +1323,80 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         setHidden($('group-active'), empty);
         setHidden($('active-empty'), active.length > 0);
         setText($('count-active'), active.length ? String(active.length) : '');
-        setHidden($('group-finished'), finished.length === 0);
-        setText($('count-finished'), finished.length < totalFinished ? finished.length + ' of ' + totalFinished : String(finished.length));
+        setHidden($('group-finished'), totalFinished === 0);
+        setText($('count-finished'), totalFinished ? String(totalFinished) : '');
+        renderPager(totalFinished);
         if (!loaded) showView('list');
 
         baseTitle = c.running ? '(' + c.running + ' running) Task Status' : 'Task Status';
         baseIcon = [c.running ? (c.stale >= c.running ? 'stale' : 'running') : 'idle', null];
         updateAttention();
+    }
+
+    // The list: every running request, then one page of the finished ones (newest first).
+    const listPath = () => '/api/requests?limit=' + pageSize + '&offset=' + finishedPage * pageSize;
+
+    // Whether a list answer is the page shown now. A page past the last one (requests deleted, another page size)
+    // moves to the last, and the answer is asked again.
+    function listCurrent(data) {
+        const c = data.counts || {}, total = (c.done || 0) + (c.failed || 0);
+        const last = Math.max(0, Math.ceil(total / pageSize) - 1);
+        if (finishedPage > last) {
+            setFinishedPage(last);
+            return false;
+        }
+        return data.asked === listPath();
+    }
+
+    function renderPager(total) {
+        const pages = Math.max(1, Math.ceil(total / pageSize)), first = finishedPage * pageSize;
+        setHidden($('pager'), total <= PAGE_SIZES[0]);      // one page at any size: nothing to choose
+        setText($('page-info'), total ? (first + 1) + '–' + Math.min(total, first + pageSize) + ' of ' + total : '');
+        $('page-first').disabled = $('page-prev').disabled = finishedPage === 0;
+        $('page-next').disabled = $('page-last').disabled = finishedPage >= pages - 1;
+        $('page-size').value = String(pageSize);
+    }
+
+    // The page is kept in this history entry, so going to a request and Back comes back to it.
+    function setFinishedPage(n) {
+        finishedPage = Math.max(0, n);
+        try {
+            history.replaceState(Object.assign({}, history.state, { finishedPage }), '');
+        } catch (e) { /* no history access: page 1 after Back */ }
+    }
+
+    // A click on the pager: the counts and buttons follow at once, the rows with the answer.
+    function goToPage(n) {
+        const c = lastData && lastData.counts, total = c ? c.done + c.failed : 0;
+        setFinishedPage(Math.min(n, Math.max(0, Math.ceil(total / pageSize) - 1)));
+        renderPager(total);
+        pollSoon();
+    }
+
+    function finishedPages() {
+        const c = lastData && lastData.counts;
+        return c ? Math.max(1, Math.ceil((c.done + c.failed) / pageSize)) : 1;
+    }
+
+    function initPager() {
+        try {
+            const n = Number(localStorage.getItem(PAGE_SIZE_KEY));
+            if (PAGE_SIZES.includes(n)) pageSize = n;
+        } catch (e) { /* storage unavailable: the default */ }
+        const kept = history.state && history.state.finishedPage;
+        if (Number.isInteger(kept) && kept > 0) finishedPage = kept;
+        $('page-first').addEventListener('click', () => goToPage(0));
+        $('page-prev').addEventListener('click', () => goToPage(finishedPage - 1));
+        $('page-next').addEventListener('click', () => goToPage(finishedPage + 1));
+        $('page-last').addEventListener('click', () => goToPage(finishedPages() - 1));
+        $('page-size').addEventListener('change', (e) => {
+            const first = finishedPage * pageSize;     // the page that holds the first request shown now
+            pageSize = PAGE_SIZES.includes(Number(e.target.value)) ? Number(e.target.value) : PAGE_SIZES[0];
+            try {
+                localStorage.setItem(PAGE_SIZE_KEY, String(pageSize));
+            } catch (e2) { /* this page keeps it until it is closed */ }
+            goToPage(Math.floor(first / pageSize));
+        });
     }
 
     function createReqRow(r) {
@@ -1405,8 +1502,9 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
 
     // A request's tasks as this page lists them: by number is the board's own order; by progress puts the running
     // ones first (those waiting for input ahead of the rest), then the queued, then the done and failed, then the
-    // cancelled, by number within each.
+    // cancelled, by number within each; by update puts the one updated last first (ties by number).
     function orderTasks(tasks, order) {
+        if (order === 'updated') return tasks.slice().sort((a, b) => b.updated_at - a.updated_at || a.seq - b.seq);
         if (order !== 'progress') return tasks;
         const rank = (t) => t.status === 'running' && t.attention ? 0 : PROGRESS_RANK[t.status] ?? 5;
         return tasks.slice().sort((a, b) => rank(a) - rank(b) || a.seq - b.seq);
@@ -2501,14 +2599,32 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
 
     // Actions
 
+    // Every finished request, on every page: their ids first, page by page (deleting while paging would shift the
+    // pages), then one DELETE each. Stops paging at a short page, or one with nothing new (a board without offset).
     async function clearFinished(e) {
         e.preventDefault();
         e.stopPropagation();
-        const ids = lastData ? lastData.requests.filter((r) => r.status !== 'running').map((r) => r.id) : [];
-        if (!ids.length || !confirm('Delete ' + plural(ids.length, 'finished request') + '? This cannot be undone.')) return;
+        const c = lastData && lastData.counts, total = c ? c.done + c.failed : 0;
+        const ask = total === 1 ? 'Delete the finished request?' : 'Delete all ' + plural(total, 'finished request') + ', on every page?';
+        if (!total || !confirm(ask + ' This cannot be undone.')) return;
         const btn = $('clear');
         btn.disabled = true;
+        const ids = new Set();
         let failed = 0, error = '';
+        for (const status of ['done', 'failed']) {
+            for (let offset = 0; ; offset += 500) {
+                const res = await apiSend('GET', '/api/requests?status=' + status + '&limit=500&offset=' + offset);
+                const page = res.ok && res.data && Array.isArray(res.data.requests) ? res.data.requests : null;
+                if (!page) {
+                    failed++;
+                    error = res.error || 'bad response';
+                    break;
+                }
+                const before = ids.size;
+                for (const r of page) ids.add(r.id);
+                if (page.length < 500 || ids.size === before) break;
+            }
+        }
         for (const id of ids) {
             const res = await apiSend('DELETE', '/api/requests/' + encodeURIComponent(id));
             if (!res.ok && res.status !== 404) {
@@ -2517,7 +2633,8 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             }
         }
         btn.disabled = false;
-        if (failed) alert('Could not delete ' + plural(failed, 'request') + ': ' + error);
+        setFinishedPage(0);
+        if (failed) alert('Could not delete every finished request (' + failed + ' failed): ' + error);
         pollSoon();
     }
 
@@ -3220,6 +3337,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             } catch (e) { /* ignore */ }
         });
         $('clear').addEventListener('click', clearFinished);
+        initPager();
 
         headRefs = collectRefs($('req-head'));
         headRefs.markDone.addEventListener('click', () => completeRequest('done'));

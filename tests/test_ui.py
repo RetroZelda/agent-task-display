@@ -27,6 +27,10 @@ by progress (running, waiting first; queued; done and failed; cancelled), from t
 This device (the board's, or its own) and from All viewers (saved on the board), the board's setting changed behind the
 page, another tab changing the choice, the order following the tasks as they change, and a board too old to know it.
 
+The pages case runs a board of its own with 37 finished requests and 2 running: the list a page at a time, every pager
+button, the page size (stored on the device), a reload and Back from a request keeping the page, a request finishing,
+requests deleted from under the page shown, and a list short enough for no pager.
+
 The live stream's cases (stream_cases) run on boards of their own too (a board has one stream), each with
 tests/lib/fake_ffmpeg.py first on its PATH as `ffmpeg`, so a stream's URL (http://fake.invalid/live, /hang,
 /audio, /hevc?audio=0, /live?die=30...) says how the "source" behaves. They load the boards in iframes of a
@@ -39,7 +43,7 @@ failure paths, parking, going to a request and Back, and an outage. The streampl
 encode H.264, and this Firefox can decode it) plays a real source with the real MediaSource. The existing
 list and detail checks are repeated with a stream open (stream_check_*).
 
-    python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order]   only those groups of cases (all of them without arguments)
+    python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages]   only those groups of cases (all of them without arguments)
     FIREFOX=/path/to/firefox   use that binary
     UI_SHOTS_DIR=DIR           keep every case's screenshot there, for a human look (the stream cases then
                                leave their frames and stream open, so the screenshot shows them)
@@ -280,7 +284,7 @@ def assert_check(name, r, theme, rows=None, running=True):
 
 def read_only_cases(base, empty_base, ids):
     main = ids['main']
-    lst = api(base, 'GET', '/api/requests')[1]
+    lst = api(base, 'GET', '/api/requests?limit=10')[1]     # the list shows the running ones and the first page of 10 finished
     n_requests = len(lst['requests'])
     detail_rows = {rid: len(api(base, 'GET', f'/api/requests/{rid}')[1]['tasks']) for rid in (main, ids['xss'], ids['failed'], ids['long'])}
     cases = [
@@ -440,8 +444,11 @@ def stateful_cases(base, srv, ids):
     S.section('Clear finished (last: it deletes every finished request)')
     r = res['clear']
     if got('clear', r):
-        check('clear: confirm asked with the count', any(a.startswith(f"confirm:Delete {r['finishedBefore']} finished requests?") for a in r['alerts']), r['alerts'])
-        check('clear: every finished request deleted on the server', r['finishedBefore'] > 0 and r['apiFinished'] == 0, r)
+        check('clear: the board has more finished requests than one page shows (10), the count says them all', r['finishedBefore'] > r['rowsBefore'] == 10
+              and r['countBefore'] == str(r['finishedBefore']), r)
+        check('clear: confirm asked with the count of them all', any(a.startswith(f"confirm:Delete all {r['finishedBefore']} finished requests, on every page?")
+                                                                 for a in r['alerts']), r['alerts'])
+        check('clear: every finished request deleted on the server, every page', r['finishedBefore'] > 0 and r['apiFinished'] == 0, r)
         check('clear: the Finished group empties and hides', r['finishedAfter'] == 0 and r['groupHidden'] is True, r)
         check('clear: the running requests stay', r['activeAfter'] == r['activeBefore'] == r['apiRunning'] > 0, r)
         check('clear: the click did not toggle the group', r['openAfter'] == r['openBefore'], r)
@@ -646,7 +653,7 @@ def seed_v2(base: str) -> dict:
 # The task order on a request's page (tests/ui/order.js), on a board of its own (the case saves the board's settings)
 ORDER_STATES = ['done', 'cancelled', 'running', 'pending', 'failed', 'running', 'pending', 'running', 'done']  # tasks 1..9
 ORDER_NUMBER, ORDER_PROGRESS = [1, 2, 3, 4, 5, 6, 7, 8, 9], [6, 3, 8, 4, 7, 1, 5, 9, 2]
-ORDER_TEXT = {'number': 'by number', 'progress': 'running first, then queued, then finished'}
+ORDER_TEXT = {'number': 'by number', 'progress': 'running first, then queued, then finished', 'updated': 'the latest updated first'}
 
 
 def seed_order(base: str) -> str:
@@ -696,7 +703,7 @@ def assert_order(name, r, rid):
     check(f'{name}: at load: nothing is stored on the device', r['initial']['stored'] is None, r['initial'])
     lay = r['layout']
     check(f'{name}: the toggle is Number and Progress, at the right end of the Tasks heading, level with the list\'s edge; nothing overflows at 390px',
-          lay['labels'] == ['Number', 'Progress'] and abs(lay['toggle']['x'] + lay['toggle']['w'] - (lay['list']['x'] + lay['list']['w'])) < 1
+          lay['labels'] == ['Number', 'Progress', 'Updated'] and abs(lay['toggle']['x'] + lay['toggle']['w'] - (lay['list']['x'] + lay['list']['w'])) < 1
           and lay['head']['y'] <= lay['toggle']['y'] and lay['toggle']['y'] + lay['toggle']['h'] <= lay['head']['y'] + lay['head']['h'] + 1
           and lay['buttons'][0]['y'] == lay['buttons'][1]['y'] and lay['scroll'][0] <= lay['scroll'][1], lay)
     rows('Progress clicked: waiting, running, queued, done and failed, cancelled', r['toggleProgress'], P, 'progress')
@@ -704,12 +711,17 @@ def assert_order(name, r, rid):
           and r['sameRows'] is True, r['toggleProgress'])
     rows('Number clicked', r['toggleNumber'], N, 'number')
     check(f'{name}: Number clicked: stored on the device', r['toggleNumber']['stored'] == 'number', r['toggleNumber'])
+    rows('Updated clicked: the task updated last first', r['toggleUpdated'], [9, 5, 6, 8, 3, 4, 7, 2, 1], 'updated')
+    check(f'{name}: Updated clicked: stored on the device', r['toggleUpdated']['stored'] == 'updated', r['toggleUpdated'])
+    rows('task 3 reported progress: it goes to the top', r['updatedMoved'], [3, 9, 5, 6, 8, 4, 7, 2, 1], 'updated')
+    check(f'{name}: the settings offer The board\'s, By number, By progress and By last update here; the three orders for all viewers',
+          r['devRadios'] == ['board', 'number', 'progress', 'updated'] and r['globRadios'] == ['number', 'progress', 'updated'], (r['devRadios'], r['globRadios']))
     device('the settings opened after the toggle', r['devProgress'], 'progress', ORDER_TEXT['progress'] + ' on this device', 'progress')
     rows('This device: The board\'s', r['devBoard'], N, 'number')
     device('This device: The board\'s', r['devBoard'], 'board', "the board's: by number", None)
     g = r['globLoaded']
     check(f'{name}: All viewers: By number (the board\'s default), editable, the note says what it sets', g['globRadio'] == 'number'
-          and g['globDisabled'] == [False, False] and g['globNote'] == "each request's page, unless a device picks its own", g)
+          and g['globDisabled'] == [False, False, False] and g['globNote'] == "each request's page, unless a device picks its own", g)
     check(f'{name}: All viewers: By progress picked: unsaved, Save offered, nothing moved yet', r['globDirty']['globRadio'] == 'progress'
           and r['globDirty']['status'] == 'unsaved changes' and r['globDirty']['save'] is True and r['globDirty']['seqs'] == N, r['globDirty'])
     rows('All viewers: By progress saved; this device follows the board', r['globSaved'], P, 'progress')
@@ -732,12 +744,60 @@ def assert_order(name, r, rid):
     check(f'{name}: a deep link to a task finds it where it went', r['target'] == [f'{rid}-1'], r['target'])
     o = r['oldBoard']
     check(f'{name}: a board too old to know the task order: All viewers shows the default, read-only, and says why',
-          o['globRadio'] == 'number' and o['globDisabled'] == [True, True] and o['globNote'] == 'the board runs an older version: restart it to save this', o)
+          o['globRadio'] == 'number' and o['globDisabled'] == [True, True, True] and o['globNote'] == 'the board runs an older version: restart it to save this', o)
     s = r['oldSave']
     check(f'{name}: and a save there sends only what that board knows (no tasks), and is saved', len(s['puts']) == 1
           and list(s['puts'][0]['settings']) == ['events', 'sound'] and s['puts'][0]['settings']['sound'] == {'volume': 0.4}
           and s['status'] == 'saved' and s['server']['sound']['volume'] == 0.4 and s['server']['tasks'] == {'order': 'number'}, s)
     check(f'{name}: no JS errors', r['errors'] == [], r['errors'])
+
+
+# The finished requests a page at a time (tests/ui/pager.js), on a board of its own: 37 finished, 2 running
+def pages_cases(env):
+    board = ScratchServer(TMP, '--host', '127.0.0.1', script=UI / 'harness.py', name='ui-pages', env=env).start()
+    try:
+        j = {'Content-Type': 'application/json'}
+        rids = [api(board.url, 'POST', '/api/requests', {'title': f'Paged request {i + 1:02d}'}, headers=j)[1]['id'] for i in range(39)]
+        for i, rid in enumerate(rids[:37]):
+            api(board.url, 'POST', f'/api/requests/{rid}/complete', {'status': 'failed' if i % 4 == 3 else 'done'}, headers=j)
+        assert_pages(firefox('pager', board.url, '/__frame', 1280, 'light', 'pager', 40000, '', (), 900))
+        check('pages: the board logged no tracebacks', 'Traceback' not in board.log_text(), board.log_text()[-1500:])
+    finally:
+        board.stop()
+
+
+def assert_pages(r):
+    S.section('the finished requests a page at a time')
+    if not got('pager', r):
+        return
+
+    def page(label, p, info, disabled, size, running=2):
+        check(f'pages: {label}: the rows are the API\'s page, the pager says {info}, buttons disabled {disabled}, {size} to a page, '
+              f'every running request listed ({running}); nothing overflows at 390px',
+              p['rows'] == p['want'] and len(p['rows']) > 0 and p['info'] == info and p['pager'] and p['disabled'] == disabled
+              and p['size'] == str(size) and p['running'] == running and p['scroll'][0] <= p['scroll'][1], p)
+
+    F, T = False, True
+    page('at first, 10 to a page', r['first'], '1–10 of 37', [T, T, F, F], 10)
+    check('pages: at first: the count is every finished request, nothing stored, page 1', r['first']['count'] == '37' and r['first']['stored'] is None
+          and r['first']['kept'] in (None, 0), r['first'])
+    page('next', r['second'], '11–20 of 37', [F, F, F, F], 10)
+    page('last', r['last'], '31–37 of 37', [F, F, T, T], 10)
+    check('pages: the last page has the 7 oldest', len(r['last']['rows']) == 7, r['last']['rows'])
+    page('previous', r['prev'], '21–30 of 37', [F, F, F, F], 10)
+    page('first', r['backFirst'], '1–10 of 37', [T, T, F, F], 10)
+    page('20 to a page, from the last page: the page holding the first request shown', r['size20'], '21–37 of 37', [F, F, T, T], 20)
+    check('pages: the page size is stored on the device, the page in this history entry', r['size20']['stored'] == '20' and r['size20']['kept'] == 1, r['size20'])
+    page('reloaded: the same page size and page', r['reloaded'], '21–37 of 37', [F, F, T, T], 20)
+    check('pages: the request page has no pager', r['detail']['path'].startswith('/r/') and r['detail']['pager'] is False, r['detail'])
+    page('Back from a request: the same page', r['back'], '21–37 of 37', [F, F, T, T], 20)
+    page('a running request finished: every page moves along by one', r['finishedOne'], '21–38 of 38', [F, F, T, T], 20, running=1)
+    check('pages: and it is the newest, first on the first page', r['finishedOne']['newest'] is True)
+    page('back to 10 to a page: the page holding the first request shown', r['size10'], '21–30 of 38', [F, F, F, F], 10, running=1)
+    page('20 deleted from under the last page: the last page there is now', r['shrunk'], '11–18 of 18', [F, F, T, T], 10, running=1)
+    s = r['short']
+    check('pages: 8 left: no pager, all 8 listed, the count says 8', not s['pager'] and s['rows'] == s['want'] and len(s['rows']) == 8 and s['count'] == '8', s)
+    check('pages: no JS errors', r['errors'] == [[]], r['errors'])
 
 
 def one_request(base: str, title: str, n: int, start: bool = True):
@@ -782,7 +842,7 @@ def _v2_cases(boards, tls_port):
     api(boards['panel'].url, 'POST', f'/api/tasks/{panel_tids[0]}/attention', {'message': 'Waiting while the panel is tested?'},
         headers={'Content-Type': 'application/json'})
     stub = '&__stub=1&__local=' + json.dumps({'sound_enabled': True, 'notify_enabled': True, 'remind_every': 0})
-    lst = api(v2, 'GET', '/api/requests')[1]
+    lst = api(v2, 'GET', '/api/requests?limit=10')[1]
     rows = {rid: len(api(v2, 'GET', f'/api/requests/{rid}')[1]['tasks']) for rid in (ids['task_wait'], ids['req_wait'], ids['two_wait'])}
     cases = [
         ('v2_list_390_light', v2, '/', 390, 'light', 'check', 7000), ('v2_list_390_dark', v2, '/', 390, 'dark', 'check', 7000),
@@ -1157,7 +1217,7 @@ def _stream_cases(boards, play):
     check_board = boards['check'].url
     ids = seed_v2(check_board)
     api(check_board, 'POST', '/api/stream', {'url': 'http://fake.invalid/hang'}, headers=STREAM_JSON)
-    n_requests = len(api(check_board, 'GET', '/api/requests')[1]['requests'])
+    n_requests = len(api(check_board, 'GET', '/api/requests?limit=10')[1]['requests'])
     wait_rows = len(api(check_board, 'GET', f"/api/requests/{ids['task_wait']}")[1]['tasks'])
 
     def frame_case(name, wait):
@@ -1673,11 +1733,11 @@ def assert_streamplay(r, up, name='streamplay'):
 
 
 if __name__ == '__main__':
-    # python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order]: only those groups of cases (every one without arguments)
-    every = {'base', 'v2', 'stream', 'theme', 'clock', 'order'}
+    # python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages]: only those groups of cases (every one without arguments)
+    every = {'base', 'v2', 'stream', 'theme', 'clock', 'order', 'pages'}
     groups = set(sys.argv[1:]) or every
     if groups - every:
-        sys.exit(f'usage: test_ui.py [base] [v2] [stream] [theme] [clock] [order]   (no argument: all); not a group: {sorted(groups - every)}')
+        sys.exit(f'usage: test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages]   (no argument: all); not a group: {sorted(groups - every)}')
     env = clean_env(UI_RESULTS_DIR=RESULTS)
     board = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', str(STALE_AFTER), script=UI / 'harness.py',
                           name='ui', env=env).start()
@@ -1697,6 +1757,8 @@ if __name__ == '__main__':
             clock_cases()
         if 'order' in groups:
             order_cases(env)
+        if 'pages' in groups:
+            pages_cases(env)
         if 'v2' in groups:
             v2_cases(env)
         if 'stream' in groups:

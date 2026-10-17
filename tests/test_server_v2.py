@@ -558,7 +558,9 @@ def phase_settings():
         s, h, b = call('PUT', '/api/settings', {'settings': {'events': {'waitng': {}}}})
         check('an unknown KEY: a did-you-mean hint', s == 400 and b.get('hint') == "did you mean 'waiting'?", b)
         s, h, b = call('PUT', '/api/settings', {'settings': {'tasks': {'order': 'seq'}}})
-        check('an unknown task order: the error names both orders', s == 400 and b['error'] == 'settings.tasks.order must be one of: number, progress', b)
+        check('an unknown task order: the error names the three orders', s == 400 and b['error'] == 'settings.tasks.order must be one of: number, progress, updated', b)
+        s, h, b = call('PUT', '/api/settings', {'settings': {'tasks': {'order': 'updated'}}})
+        check('PUT tasks.order updated: saved', s == 200 and b['settings']['tasks'] == {'order': 'updated'}, b)
         s, h, b = call('PUT', '/api/settings', {'settings': {'task': {'order': 'progress'}}})
         check('a misspelt tasks: a did-you-mean hint', s == 400 and b.get('field') == 'settings.task' and b.get('hint') == "did you mean 'tasks'?", b)
         s, h, b = call('PUT', '/api/settings', raw=b'{"settings": {"sound": {"volume": NaN}}}')
@@ -592,7 +594,7 @@ def phase_settings():
         cfg.write_text('{"tasks": {"order": "random"}, "sound": {"volume": 0.1}}\n')
         s, h, b = call('GET', '/api/settings')
         check('an unknown order in the file: the whole file ignored (the defaults), the error names the field', b['settings'] == D
-              and 'tasks.order must be one of: number, progress' in b['error'], b)
+              and 'tasks.order must be one of: number, progress, updated' in b['error'], b)
         cfg.write_text('{"events": ')
         s, h, b = call('GET', '/api/settings')
         check('invalid JSON: the defaults, error says invalid JSON, exists true', b['settings'] == D and b['exists'] is True

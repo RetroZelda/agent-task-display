@@ -382,6 +382,30 @@ def phase_api():
         s, _, b = call('GET', '/api/requests?limit=0')
         check('limit clamped + warning', s == 200 and b.get('warnings'), b.get('warnings'))
 
+        S.section('list: offset pages the finished requests')
+        whole = [x['id'] for x in call('GET', '/api/requests?limit=500')[2]['requests'] if x['status'] != 'running']
+        check('offset: there are enough finished requests to page', len(whole) >= 3, len(whole))
+        pages = []
+        for off in range(0, len(whole), 2):
+            got = call('GET', f'/api/requests?limit=2&offset={off}')[2]['requests']
+            check(f'offset={off}: every running request, then the finished ones from there',
+                  len([x for x in got if x['status'] == 'running']) == dbcounts['running'], [x['status'] for x in got])
+            pages += [x['id'] for x in got if x['status'] != 'running']
+        check('offset: the pages put together are the whole list, in order, none twice', pages == whole, (pages, whole))
+        s, _, b = call('GET', f'/api/requests?limit=2&offset={len(whole)}')
+        check('offset past the end: the running ones only', s == 200 and all(x['status'] == 'running' for x in b['requests'])
+              and len(b['requests']) == dbcounts['running'] and b['counts']['done'] + b['counts']['failed'] == len(whole), b)
+        done_ids = [x['id'] for x in call('GET', '/api/requests?status=done&limit=500')[2]['requests']]
+        s, _, b = call('GET', '/api/requests?status=done&limit=1&offset=1')
+        check('offset with a status filter: within that status', s == 200 and [x['id'] for x in b['requests']] == done_ids[1:2], b['requests'])
+        s, _, b = call('GET', '/api/requests?status=running&offset=1')
+        check('offset with status=running: running requests are never paged', len(b['requests']) == dbcounts['running'], len(b['requests']))
+        s, _, b = call('GET', '/api/requests?offset=abc')
+        check('bad offset: 400 field offset', s == 400 and b.get('field') == 'offset' and b['error'] == 'offset must be an integer', b)
+        s, _, b = call('GET', '/api/requests?offset=-3')
+        check('negative offset: clamped to 0 with a warning', s == 200 and b.get('warnings') == ['offset -3 clamped to 0..1000000']
+              and [x['id'] for x in b['requests'] if x['status'] != 'running'] == whole[:100], b.get('warnings'))
+
         S.section('stale')
         st = new_request('stale me', tasks=['a', 'b'])
         sa, sb = (t['id'] for t in st['tasks'])

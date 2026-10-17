@@ -43,10 +43,11 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
                                    id -> 400): if it exists with the same title -> 200 that request + tasks +
                                    now + existing: true (an idempotent replay, nothing written); with another
                                    title -> 409 {"error": "request id already exists"}
-  GET    /api/requests             ?status=running|done|failed&limit=1..500 (100) -> {now, stale_after,
-                                   counts: {running, stale, done, failed, waiting}, requests}: running
-                                   (created_at DESC, max 500) then finished (completed_at DESC, limited);
-                                   counts = all; waiting = running requests with waiting true
+  GET    /api/requests             ?status=running|done|failed&limit=1..500 (100)&offset=0..1000000 (0) ->
+                                   {now, stale_after, counts: {running, stale, done, failed, waiting}, requests}:
+                                   running (created_at DESC, max 500, never paged) then finished (completed_at
+                                   DESC: offset of them skipped, then at most limit); counts = all; waiting =
+                                   running requests with waiting true
   GET    /api/requests/{rid}       Request + tasks (by seq) + now + stale_after
   DELETE /api/requests/{rid}       {deleted, now}
   POST   /api/requests/{rid}/complete  {status?: done|failed, message?}
@@ -141,11 +142,11 @@ get ts = it and replayed = true. Without the header "at" is an unknown field.
 Settings: the notification and display defaults for every viewer, a JSON file (--config), re-read whenever its
 mtime or size changes:
   {"events": {KEY: {"highlight": bool, "title": bool, "sound": bool, "notify": bool}}, "sound": {"volume": 0..1},
-   "tasks": {"order": "number" | "progress"}}
+   "tasks": {"order": "number" | "progress" | "updated"}}
   KEY: waiting task_failed request_failed request_done task_done task_started task_progress request_created
   stale. tasks.order is how a request's page lists its tasks (number, the default: by seq; progress: running,
-  waiting first, then pending, then done and failed, then cancelled, by seq within each); the API itself always
-  lists them by seq. settings = the defaults deep-merged with the file; a file that is not valid JSON or breaks the
+  waiting first, then pending, then done and failed, then cancelled, by seq within each; updated: updated_at
+  descending, then by seq); the API itself always lists them by seq. settings = the defaults deep-merged with the file; a file that is not valid JSON or breaks the
   schema counts as absent (the defaults) and says why in error. PUT validates its partial settings
   (unknown key, channel or field, non-bool, volume outside 0..1, an unknown order -> 400 with field), merges them onto the
   current settings and writes the full result atomically. version = sha256 of the settings as compact
@@ -452,8 +453,9 @@ _DEFAULT_EVENTS = {
     'stale': 'TTFF',
 }
 EVENT_KEYS = tuple(_DEFAULT_EVENTS)
-# How a request's page lists its tasks: by number, or running, then queued, then finished (the dashboard sorts).
-TASK_ORDERS = ('number', 'progress')
+# How a request's page lists its tasks: by number; running, then queued, then finished; or the latest updated first
+# (the dashboard sorts).
+TASK_ORDERS = ('number', 'progress', 'updated')
 DEFAULT_SETTINGS = {
     'events': {key: {channel: flag == 'T' for channel, flag in zip(CHANNELS, flags)}
                for key, flags in _DEFAULT_EVENTS.items()},
@@ -2025,16 +2027,16 @@ class Store:
         with self._read() as db:
             return self._detail(db, rid)
 
-    def list_requests(self, status, limit, now, stale_after):
+    def list_requests(self, status, limit, now, stale_after, offset=0):
         with self._read() as db:
             rows = []
             if status in (None, 'running'):
                 rows += self._requests(db, "WHERE r.status = 'running'", (RUNNING_LIST_MAX,),
                                        'ORDER BY g.created_at DESC LIMIT ?')
             if status != 'running':
-                where, params = ('WHERE r.status = ?', (status, limit)) if status else \
-                    ("WHERE r.status != 'running'", (limit,))
-                rows += self._requests(db, where, params, 'ORDER BY g.completed_at DESC, g.created_at DESC LIMIT ?')
+                where, params = ('WHERE r.status = ?', (status, limit, offset)) if status else \
+                    ("WHERE r.status != 'running'", (limit, offset))
+                rows += self._requests(db, where, params, 'ORDER BY g.completed_at DESC, g.created_at DESC, g.id LIMIT ? OFFSET ?')
             counts = {'running': 0, 'stale': 0, 'done': 0, 'failed': 0, 'waiting': 0}
             counts.update(db.execute('SELECT status, COUNT(*) FROM requests GROUP BY status').fetchall())
             counts['stale'] = db.execute(STALE_COUNT, (now, stale_after, now)).fetchone()[0]
@@ -2695,8 +2697,9 @@ class Handler(BaseHTTPRequestHandler):
         if status is not None and status not in ('running', 'done', 'failed'):
             raise ApiError(400, 'status must be running, done or failed', field='status')
         limit = self._int_query('limit', 100, 1, 500)
+        offset = self._int_query('offset', 0, 0, 1_000_000)
         now, stale_after, public = ts(), self.server.stale_after, self.public_url()
-        rows, counts = self.server.store.list_requests(status, limit, now, stale_after)
+        rows, counts = self.server.store.list_requests(status, limit, now, stale_after, offset)
         self._reply(200, {'now': now, 'stale_after': stale_after, 'counts': counts,
                           'requests': [request_json(row, now, public, stale_after) for row in rows]})
 
