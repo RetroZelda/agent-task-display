@@ -234,8 +234,35 @@ def arg_errors():
     check('no database and no pidfile after any of these', not bad_db.exists() and not bad_pid.exists())
 
 
+def report_ports():
+    S.section('the report port and its https twin')
+    tp, rp, rtp = free_port(), free_port(), free_port()
+    srv = ScratchServer(TMP, '--tls-port', str(tp), '--tls-cert', str(CERT), '--tls-key', str(KEY), '--report-port', str(rp),
+                        '--report-tls-port', str(rtp), name='tlsreport').start()
+    try:
+        rid = srv.call('POST', '/api/requests', {'title': 'Report over https'})[2]['id']
+        srv.call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': '<title>T</title><p>x</p>'})
+        check('health: both report ports', srv.call('GET', '/api/health')[2]['report_port'] == rp
+              and tcall(tp, 'GET', '/api/health')[2]['report_tls_port'] == rtp)
+        check('over http, a report\'s page is on the http report port', srv.call('GET', f'/api/requests/{rid}')[2]['report']['page']
+              == f'http://127.0.0.1:{rp}/api/requests/{rid}/report/page')
+        check('over https, on the https report port (a dashboard on https frames https)', tcall(tp, 'GET', f'/api/requests/{rid}')[2]['report']['page']
+              == f'https://127.0.0.1:{rtp}/api/requests/{rid}/report/page')
+        s, h, body = tcall(rtp, 'GET', f'/api/requests/{rid}/report/page')
+        check('the https report port serves the page with an origin of its own', s == 200 and h['content-security-policy'].startswith('sandbox allow-same-origin ')
+              and '<p>x</p>' in body, (s, h.get('content-security-policy')))
+        s, h, b = tcall(rtp, 'GET', '/api/health')
+        check('and nothing else (naming the board\'s https port)', s == 404 and b['hint'] == f'the board is on port {tp}', b)
+        log = srv.log_text()
+        check('both report ports are logged', re.search(rf'report pages on http://\S+:{rp}\b', log) is not None
+              and re.search(rf'report pages on https://\S+:{rtp}\b', log) is not None, log[-800:])
+    finally:
+        srv.stop()
+
+
 if __name__ == '__main__':
     main_listener()
+    report_ports()
     rendering()
     env_config()
     arg_errors()

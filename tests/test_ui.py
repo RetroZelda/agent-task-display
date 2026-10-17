@@ -31,6 +31,9 @@ The pages case runs a board of its own with 37 finished requests and 2 running: 
 button, the page size (stored on the device), a reload and Back from a request keeping the page, a request finishing,
 requests deleted from under the page shown, and a list short enough for no pager.
 
+The artifacts case sets an artifact page as claude.ai serves it beside the board's report page of the same artifact and
+compares them pixel for pixel (our fixture, and with UI_ARTIFACTS pages saved from claude.ai; needs Pillow).
+
 The reports case runs a board of its own with requests that have an HTML report (whose script probes its sandbox and
 posts what it found), a Markdown one and none: the report view and its frame, the sandbox, a new version, this
 device's theme, the Report button and the list's marker, a deleted report and request, an unknown request.
@@ -47,7 +50,7 @@ failure paths, parking, going to a request and Back, and an outage. The streampl
 encode H.264, and this Firefox can decode it) plays a real source with the real MediaSource. The existing
 list and detail checks are repeated with a stream open (stream_check_*).
 
-    python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages] [reports]   only those groups of cases (all of them without arguments)
+    python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages] [reports] [artifacts]   only those groups of cases (all of them without arguments)
     FIREFOX=/path/to/firefox   use that binary
     UI_SHOTS_DIR=DIR           keep every case's screenshot there, for a human look (the stream cases then
                                leave their frames and stream open, so the screenshot shows them)
@@ -836,11 +839,12 @@ PROBE_REPORT = """<!doctype html>
 </body>
 </html>
 """
-REPORT_SANDBOX = 'allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads'
+REPORT_SANDBOX = 'allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-pointer-lock'   # the artifact viewer's
 
 
 def report_cases(env):
-    board = ScratchServer(TMP, '--host', '127.0.0.1', script=UI / 'harness.py', name='ui-report', env=env).start()
+    rport = free_port()
+    board = ScratchServer(TMP, '--host', '127.0.0.1', '--report-port', str(rport), script=UI / 'harness.py', name='ui-report', env=env).start()
     j = {'Content-Type': 'application/json'}
     try:
         ids = {k: api(board.url, 'POST', '/api/requests', {'title': title, 'tasks': ['a']}, headers=j)[1]['id']
@@ -849,8 +853,25 @@ def report_cases(env):
                                                                    'artifact_url': 'https://claude.ai/artifact/a1'}, headers=j)
         api(board.url, 'PUT', f"/api/requests/{ids['b']}/report", {'format': 'markdown', 'content': '# Findings\n\n| a | b |\n|---|---|\n| 1 | 2 |\n'},
             headers=j)
+        ids['rport'] = rport
         assert_report(firefox('report', board.url, '/__frame', 1280, 'light', 'report', 60000, '&__ids=' + quote(json.dumps(ids))), ids)
         check('report: the board logged no tracebacks', 'Traceback' not in board.log_text(), board.log_text()[-1500:])
+    finally:
+        board.stop()
+    # a board without a report port: the page on the board's own port, in an opaque origin (never the board's own)
+    board = ScratchServer(TMP, '--host', '127.0.0.1', '--report-port', '0', script=UI / 'harness.py', name='ui-report0', env=env).start()
+    try:
+        rid = api(board.url, 'POST', '/api/requests', {'title': 'No report port'}, headers=j)[1]['id']
+        api(board.url, 'PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': PROBE_REPORT.replace('RID', rid)}, headers=j)
+        r = firefox('reportopaque', board.url, f'/r/{rid}/report', 390, 'light', 'reportopaque', 9000)
+        S.section('a report on a board without a report port')
+        if got('reportopaque', r):
+            check('report: no report port: the frame shows the board\'s own page of it, sandboxed without an origin of its own',
+                  r['src'] == f'{board.url}/api/requests/{rid}/report/page?v=1' and r['sandbox'] == REPORT_SANDBOX, r)
+            check('report: no report port: inside, an opaque origin: no parent, no storage, no reads, the write refused',
+                  r['probe'] and r['probe']['origin'] == 'null' and r['probe']['parent'] == 'blocked' and r['probe']['storage'] == 'blocked'
+                  and r['probe']['read'] == 'blocked' and r['probe']['write'] == 'failed'
+                  and api(board.url, 'GET', f'/api/requests/{rid}')[1]['status'] == 'running', r)
     finally:
         board.stop()
 
@@ -859,7 +880,8 @@ def assert_report(r, ids):
     S.section("a request's report on the dashboard")
     if not got('report', r):
         return
-    A, a = ids['a'], r['a']
+    A, a, R = ids['a'], r['a'], ids['rport']
+    page = f'http://127.0.0.1:{R}/api/requests/{A}/report/page'
 
     def fills(label, v, w, h):
         f = v['frame']
@@ -871,31 +893,33 @@ def assert_report(r, ids):
           a['shown'] and a['title'] == 'Probe report' and a['back'] == [f'/r/{A}', 'Request with an HTML report']
           and a['meta'][0] == 'HTML' and a['meta'][1].startswith('updated ') and a['meta'][2] == 'version 1' and a['meta'][3].endswith(' KiB')
           and a['artifact'] == {'href': 'https://claude.ai/artifact/a1', 'target': '_blank', 'rel': 'noopener noreferrer'}
-          and a['own'] == {'href': f'/api/requests/{A}/report/page?v=1', 'target': '_blank'} and a['none'] is None
+          and a['own'] == {'href': page + '?v=1', 'target': '_blank'} and a['none'] is None
           and a['doc'] == 'Report · Probe report — Task Status', a)
-    check('report: the frame shows the board\'s page of it, sandboxed, no referrer', a['frame']['src'] == f'/api/requests/{A}/report/page?v=1'
-          and a['frame']['sandbox'] == REPORT_SANDBOX and a['frame']['referrer'] == 'no-referrer', a['frame'])
+    check('report: the frame shows the page from the report port, sandboxed as the artifact viewer is, with an origin of its own '
+          '(fullscreen and clipboard writes allowed), no referrer',
+          a['frame']['src'] == page + '?v=1' and a['frame']['sandbox'] == REPORT_SANDBOX + ' allow-same-origin'
+          and a['frame']['allow'] == 'fullscreen; clipboard-write' and a['frame']['referrer'] == 'no-referrer', a['frame'])
     fills('phone (390x844)', a, 390, 844)
     fills('desktop (1280x800)', r['aWide'], 1280, 800)
     p = r['probe']
-    check('report: inside, its script ran, in an opaque origin: no parent access, no storage', p and p['origin'] == 'null'
-          and p['parent'] == 'blocked' and p['storage'] == 'blocked' and p['title'] == 'Probe report', p)
+    check('report: inside, its script ran, in the report port\'s origin: no access to the board page around it, but storage as an artifact has',
+          p and p['origin'] == f'http://127.0.0.1:{R}' and p['parent'] == 'blocked' and p['storage'] == 'ok' and p['title'] == 'Probe report', p)
     check('report: inside, it can read nothing from the board, and its write is refused (the request still running)',
           p and p['read'] == 'blocked' and p['write'] == 'failed' and r['stillRunning'] == 'running', (p, r['stillRunning']))
     check('report: inside, a link that leaves opens in a new tab, an in-page #link stays', p and p['targets'] == {'ext': '_blank', 'frag': ''}, p)
     check('report: inside, the system\'s theme (no data-theme) while the device follows it', p and p['theme'] is None and p['dark'] is False, p)
     v2, p2 = r['v2'], r['v2probe']
-    check('report: a new version: the frame reloads it (v=2), the header follows (title, version, artifact)', v2['frame']['src'] == f'/api/requests/{A}/report/page?v=2'
+    check('report: a new version: the frame reloads it (v=2), the header follows (title, version, artifact)', v2['frame']['src'] == page + '?v=2'
           and p2['title'] == 'Probe report v2' and v2['title'] == 'Probe report v2' and v2['meta'][2] == 'version 2'
           and v2['artifact']['href'] == 'https://claude.ai/artifact/a2', (v2, p2))
     for name, theme, dark in (('dark', 'dark', True), ('light', 'light', False), ('system', None, False)):
         st = r[name]
         want = f'/api/requests/{A}/report/page?v=2' + (f'&theme={theme}' if theme else '')
         check(f'report: this device\'s theme {name}: the frame reloads with it, the report\'s <html> carries data-theme {theme!r}',
-              st['src'] == want and st['probe']['src'] == want and st['probe']['theme'] == theme, st)
+              st['src'] == f'http://127.0.0.1:{R}' + want and st['probe']['src'] == want and st['probe']['theme'] == theme, st)
     b = r['b']
     check('report: a Markdown report: its view (title from its heading, Markdown, no artifact link)', b['shown'] and b['title'] == 'Findings'
-          and b['meta'][0] == 'Markdown' and b['artifact'] is None and b['frame']['src'] == f"/api/requests/{ids['b']}/report/page?v=1", b)
+          and b['meta'][0] == 'Markdown' and b['artifact'] is None and b['frame']['src'] == f"http://127.0.0.1:{R}/api/requests/{ids['b']}/report/page?v=1", b)
     c = r['c']
     check('report: a request with none: no frame, no links, how an agent sends one', c['shown'] and c['frame'] is None and c['own'] is None
           and c['none'] == f"This request has no report. An agent sends one with taskctl report {ids['c']} FILE" and c['title'] == 'Request with none', c)
@@ -911,6 +935,108 @@ def assert_report(r, ids):
     check('report: no JS errors in the board pages', all(e == [] for e in r['errors']), r['errors'])
 
 
+# Artifacts as reports (tests/ui/artifact.js): a page as claude.ai serves it, beside the board's report page of the same
+# artifact, compared pixel for pixel at a phone's and the dashboard frame's width, in either system theme and with the
+# board passing an explicit theme. Our own fixture always; UI_ARTIFACTS adds pages saved from claude.ai (paths separated
+# by os.pathsep). Needs Pillow for the comparison (skipped without it).
+ARTIFACT_SERVED = ('<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,'
+                   'viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);'
+                   'padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;'
+                   'padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}'
+                   '[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>\n')   # as claude.ai serves every artifact
+ARTIFACT_WIDTHS = (390, 928)
+ARTIFACT_THEMES = (('light', None), ('dark', None), ('light', 'dark'), ('dark', 'light'))
+ARTIFACT_SLICE = 16000
+
+
+def artifact_right(w):
+    """Where tests/ui/artifact.js puts the board's side: the next multiple of 256px after w + 10 (Firefox's raster tiles)."""
+    return -(-(w + 10) // 256) * 256
+
+
+def artifact_cases(env):
+    try:
+        from PIL import Image, ImageChops  # noqa: F401
+    except ImportError:
+        S.skip('artifacts', 'comparing screenshots needs Pillow (python3-pil)')
+        return
+    pages = [TESTS / 'fixtures' / 'artifacts' / 'pit-lane.html'] + [Path(x) for x in os.environ.get('UI_ARTIFACTS', '').split(os.pathsep) if x.strip()]
+    fixtures = TMP / 'fixtures'
+    fixtures.mkdir(exist_ok=True)
+    rport = free_port()
+    board = ScratchServer(TMP, '--host', '127.0.0.1', '--report-port', str(rport), script=UI / 'harness.py', name='ui-artifacts',
+                          env=dict(env, UI_FIXTURE_DIR=str(fixtures))).start()
+    board.rport = rport
+    j = {'Content-Type': 'application/json'}
+    try:
+        for i, page in enumerate(pages):
+            name = f'{i}-{re.sub(r"[^A-Za-z0-9._-]", "_", page.name)}'
+            shutil.copy2(page, fixtures / name)
+            served = page.read_bytes().decode('utf-8-sig')
+            S.section(f'an artifact as a report: {name}')
+            if not check(f'{name}: the page is as claude.ai serves an artifact (its skeleton first)', served.startswith(ARTIFACT_SERVED), served[:200]):
+                continue
+            # what an agent sends: the page it wrote, without the skeleton claude.ai wraps it in
+            source = served[len(ARTIFACT_SERVED):]
+            source = source[:-len('</body></html>')] if source.endswith('</body></html>') else source
+            rid = api(board.url, 'POST', '/api/requests', {'title': f'Artifact {name}'}, headers=j)[1]['id']
+            code, rep, _ = api(board.url, 'PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': source}, headers=j)
+            check(f'{name}: sent as a report ({len(source.encode())} bytes)', code == 201, rep)
+            for w in ARTIFACT_WIDTHS:
+                for system, forced in ARTIFACT_THEMES:
+                    compare_artifact(board, name, rid, w, system, forced)
+        check('artifacts: the board logged no tracebacks', 'Traceback' not in board.log_text(), board.log_text()[-1500:])
+    finally:
+        board.stop()
+
+
+def compare_artifact(board, name, rid, w, system, forced):
+    """Screenshots both sides a slice at a time and compares them. A slice that differs is shot again with the reference
+    on both sides (__self=1): a difference that only falls where the browser differs from itself (a long SVG line comes
+    out with a few pixels anti-aliased differently from one frame to the next) is the browser's, not the board's."""
+    from PIL import Image, ImageChops
+
+    def shoot(case, extra, cut, offset):
+        r = firefox(case, board.url, '/__frame', artifact_right(w) + w, system, 'artifact', 14000, extra, (), cut)
+        if r is None or 'crashed' in r:
+            return r, None
+        rows = min(cut, r['height'] - offset)
+        shot = Image.open(SHOTS / f'{case}.png').convert('RGB')
+        diff = ImageChops.difference(shot.crop((0, 0, w, rows)), shot.crop((artifact_right(w), 0, artifact_right(w) + w, rows)))
+        return r, diff
+
+    label = f'{name} at {w}px, the system {system}' + (f', the board passing {forced}' if forced else '')
+    offset, height, differ, own, slices = 0, None, [], [], 0
+    while height is None or offset < height:
+        cut = ARTIFACT_SLICE if height is None else min(ARTIFACT_SLICE, height - offset)
+        case = re.sub(r'[^A-Za-z0-9-]', '', f'art-{name[:24]}-{w}-{system}-{forced or "sys"}-{offset}')
+        extra = (f'&__ref={quote(name)}&__rid={rid}&__rport={board.rport}&__w={w}&__offset={offset}&__slice={cut}'
+                 + (f'&__forced={forced}' if forced else ''))
+        r, diff = shoot(case, extra, cut, offset)
+        if not got(f'{label}: rows from {offset}', r):
+            return
+        height = r['height']
+        box = diff.getbbox()
+        if box:
+            pixels = diff.convert('L').point(lambda v: 255 if v else 0).histogram()[255]
+            _, control = shoot(case + '-self', extra + '&__self=1', cut, offset)
+            cbox = control.getbbox() if control is not None else None
+            found = {'rows': [offset + box[1], offset + box[3]], 'cols': [box[0], box[2]], 'pixels': pixels,
+                     'browser_alone': None if not cbox else {'rows': [offset + cbox[1], offset + cbox[3]], 'cols': [cbox[0], cbox[2]]}}
+            inside = cbox and box[0] >= cbox[0] - 4 and box[1] >= cbox[1] - 4 and box[2] <= cbox[2] + 4 and box[3] <= cbox[3] + 4
+            (own if inside else differ).append(found)
+            keep = os.environ.get('UI_SHOTS_DIR')
+            if keep:
+                Path(keep).mkdir(parents=True, exist_ok=True)
+                diff.point(lambda v: 255 if v else 0).save(Path(keep) / f'{case}-diff.png')
+        if offset == 0:
+            check(f'{label}: the reference loaded its fonts and pictures, no JS errors on the test page', r['errors'] == []
+                  and all(iw > 0 and ih > 0 for iw, ih in r['images']), r)
+        offset += cut
+        slices += 1
+    note = f'; {sum(d["pixels"] for d in own)} pixels where the browser differs from itself too' if own else ''
+    check(f'{label}: the board\'s page is the artifact pixel for pixel ({height}px tall, {slices} slice{"s" if slices > 1 else ""}{note})',
+          not differ, differ)
 def one_request(base: str, title: str, n: int, start: bool = True):
     code, r, _ = api(base, 'POST', '/api/requests', {'title': title, 'tasks': [f'step {chr(97 + i)}' for i in range(n)]},
                      headers={'Content-Type': 'application/json'})
@@ -1849,11 +1975,11 @@ def assert_streamplay(r, up, name='streamplay'):
 
 
 if __name__ == '__main__':
-    # python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages] [reports]: only those groups of cases (every one without arguments)
-    every = {'base', 'v2', 'stream', 'theme', 'clock', 'order', 'pages', 'reports'}
+    # python3 tests/test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages] [reports] [artifacts]: only those groups of cases (every one without arguments)
+    every = {'base', 'v2', 'stream', 'theme', 'clock', 'order', 'pages', 'reports', 'artifacts'}
     groups = set(sys.argv[1:]) or every
     if groups - every:
-        sys.exit(f'usage: test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages] [reports]   (no argument: all); not a group: {sorted(groups - every)}')
+        sys.exit(f'usage: test_ui.py [base] [v2] [stream] [theme] [clock] [order] [pages] [reports] [artifacts]   (no argument: all); not a group: {sorted(groups - every)}')
     env = clean_env(UI_RESULTS_DIR=RESULTS)
     board = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', str(STALE_AFTER), script=UI / 'harness.py',
                           name='ui', env=env).start()
@@ -1877,6 +2003,8 @@ if __name__ == '__main__':
             pages_cases(env)
         if 'reports' in groups:
             report_cases(env)
+        if 'artifacts' in groups:
+            artifact_cases(env)
         if 'v2' in groups:
             v2_cases(env)
         if 'stream' in groups:

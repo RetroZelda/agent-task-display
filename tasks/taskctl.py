@@ -93,7 +93,8 @@ API_PATH_RE = re.compile(r'/api/[^\s\x00-\x1f\x7f]*')
 REPORT_EXTENSIONS = {'.html': 'html', '.htm': 'html', '.xhtml': 'html', '.md': 'markdown', '.markdown': 'markdown',
                      '.mdown': 'markdown', '.mkd': 'markdown'}
 REPORT_FORMATS = {'html': 'html', 'markdown': 'markdown', 'md': 'markdown'}
-REPORT_BODY_MAX = 8 * 1024 * 1024
+REPORT_CONTENT_MAX = 16 * 1024 * 1024  # an artifact page's own limit
+REPORT_BODY_MAX = 32 * 1024 * 1024
 REPORT_TIMEOUT = 30.0  # seconds for a report's upload (other calls keep --timeout)
 WRITE_PATH_RE = re.compile(r'/api/(tasks|requests)/([^/?#]+)/(progress|complete|attention|report)')
 # connect() failed: the call certainly never reached the board, so it is safe to queue and replay.
@@ -1260,8 +1261,8 @@ def cmd_report(board: Board, args) -> int:
         body['title'] = args.title
     if args.artifact:
         body['artifact_url'] = args.artifact.strip()
-    if len(json.dumps(body).encode('utf-8')) > REPORT_BODY_MAX:
-        raise UsageError('%s is too large: the board takes reports of up to 8 MiB (as JSON)' % name)
+    if len(content.encode('utf-8')) > REPORT_CONTENT_MAX or len(json.dumps(body).encode('utf-8')) > REPORT_BODY_MAX:
+        raise UsageError('%s is too large: the board takes reports of up to 16 MiB, as claude.ai takes artifacts' % name)
     if skip_offline(v):
         return 0
     board.timeout = max(board.timeout, REPORT_TIMEOUT)  # megabytes, over a slow link

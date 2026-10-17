@@ -35,6 +35,10 @@ usage: $0 [--bg | --stop | --status | --install-skill] [--host HOST] [--port POR
   --tls-key FILE    its PEM private key (default: \$TASKS_TLS_KEY)
                     The three TLS options go together: give all of them or none.
 
+Report pages (a request's report, shown as claude.ai shows the artifact) are served from a port of their
+own, so each keeps an origin of its own: \$TASKS_REPORT_PORT, else the http port + 1 (0: none, then they
+are served from the board's own port); with HTTPS, \$TASKS_REPORT_TLS_PORT, else the HTTPS port + 1.
+
 Values can also be given as --port=8765.
 EOF
 }
@@ -576,6 +580,38 @@ hostname_line() {
 # the LAN can reach that port (open | blocked | unknown; empty when there is no LAN address to ask about).
 TLS_SHOWN=""
 TLS_LAN_STATE=""
+REPORT_SHOWN=""
+REPORT_LAN_STATE=""
+# The report port the banner shows: the running board's (from its health), else the one it will take.
+set_report_state() {
+    REPORT_SHOWN="$1"
+    REPORT_LAN_STATE=""
+    if [ -n "$REPORT_SHOWN" ] && [ -n "$LAN_IP" ]; then
+        case "$LAN_STATE" in
+            open|blocked|unknown) REPORT_LAN_STATE="$(firewall_state "" "$REPORT_SHOWN")" ;;
+        esac
+    fi
+}
+
+# The report port as the board will take it: TASKS_REPORT_PORT (0: none), else the http port + 1.
+expected_report_port() {
+    if [ -n "${TASKS_REPORT_PORT:-}" ]; then
+        [ "$TASKS_REPORT_PORT" = 0 ] || echo "$TASKS_REPORT_PORT"
+    elif [ "$PORT" -lt 65535 ]; then
+        echo $((PORT + 1))
+    fi
+}
+
+report_line() {
+    local what="report pages, each in an origin of its own"
+    case "$REPORT_LAN_STATE" in
+        open) echo "http://$LAN_IP:$REPORT_SHOWN/  ($what)" ;;
+        blocked) echo "http://$LAN_IP:$REPORT_SHOWN/  ($what; blocked by ufw, see below)" ;;
+        unknown) echo "http://$LAN_IP:$REPORT_SHOWN/  ($what; may be blocked: cannot read /etc/ufw/user.rules)" ;;
+        *) echo "port $REPORT_SHOWN ($what)" ;;
+    esac
+}
+
 set_tls_state() {
     TLS_SHOWN="$1"
     TLS_LAN_STATE=""
@@ -640,6 +676,20 @@ lan_warning() {
         lines+=("For https (browser notifications) from other machines, run this yourself:"
                 ""
                 "  sudo ufw allow from $LAN_NET to any port $TLS_SHOWN proto tcp")
+    fi
+    if [ "$REPORT_LAN_STATE" = blocked ] || [ "$REPORT_LAN_STATE" = unknown ]; then
+        if [ ${#lines[@]} -gt 0 ] && [ -n "${lines[-1]}" ]; then
+            lines+=("")
+        fi
+        if [ "$REPORT_LAN_STATE" = blocked ]; then
+            lines+=("ufw is active and has no rule letting the LAN reach the report port $REPORT_SHOWN.")
+        else
+            lines+=("ufw is active but /etc/ufw/user.rules is unreadable, so the report port $REPORT_SHOWN"
+                    "may be closed to other machines.")
+        fi
+        lines+=("For reports on other machines' dashboards, run this yourself:"
+                ""
+                "  sudo ufw allow from $LAN_NET to any port $REPORT_SHOWN proto tcp")
     fi
     if [ ${#lines[@]} -eq 0 ]; then
         return 0
@@ -732,7 +782,7 @@ PY
 # own /api/health has the last word on the settings file and the HTTPS port.
 banner() {
     local headline="$1" pid="$2" mode="$3" host="$4" db="$5" public="$6" config="${7:-}" tls="${8:-}"
-    local agent_base="" health="" settings="" value
+    local agent_base="" health="" settings="" value report="" report_known=""
     if [ "$mode" != fg ]; then
         if ! health="$(health_json)" || ! is_tasks_health "$health"; then
             health=""
@@ -743,12 +793,16 @@ banner() {
         if [ -n "$value" ]; then tls="$value"; fi
         value="$(json_field "$health" config_path)"
         if [ -n "$value" ]; then config="$value"; fi
+        report="$(json_field "$health" report_port)"
+        report_known=1
         settings="$("${CURL[@]}" -fsS --connect-timeout 1 --max-time 2 "$LOCAL_URL/api/settings" 2>/dev/null)" || settings=""
     fi
     if [ -z "$config" ]; then
         config="$(dirname -- "$db")/settings.json"
     fi
     set_tls_state "$tls"
+    if [ -z "$report_known" ]; then report="$(expected_report_port)"; fi
+    set_report_state "$report"
     echo
     echo "tasks board: $headline (pid $pid, port $PORT)"
     echo "  dashboard   $LOCAL_URL/"
@@ -761,6 +815,9 @@ banner() {
     elif [ "$LAN_STATE" != loopback ]; then
         # A browser on this machine (localhost) can notify without it; one on another machine cannot.
         echo "  https       off (browsers on other machines need it to show notifications; see --help)"
+    fi
+    if [ -n "$REPORT_SHOWN" ]; then
+        echo "  reports     $(report_line)"
     fi
     if [ "$mode" != fg ]; then
         echo "  health      $(health_summary "$health")"

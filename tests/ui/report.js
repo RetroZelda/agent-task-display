@@ -22,7 +22,7 @@ __t.run(async () => {
             artifact: $('report-artifact').hidden ? null : { href: $('report-artifact').getAttribute('href'), target: $('report-artifact').target, rel: $('report-artifact').rel },
             own: $('report-own').hidden ? null : { href: $('report-own').getAttribute('href'), target: $('report-own').target },
             none: $('report-none').hidden ? null : $('report-none').textContent,
-            frame: rf.hidden ? null : { src: rf.getAttribute('src'), sandbox: rf.getAttribute('sandbox'), referrer: rf.getAttribute('referrerpolicy'),
+            frame: rf.hidden ? null : { src: rf.getAttribute('src'), sandbox: rf.getAttribute('sandbox'), allow: rf.getAttribute('allow'), referrer: rf.getAttribute('referrerpolicy'),
                                         rect: __t.rect(rf) },
             vh: w.innerHeight, scroll: [d.documentElement.scrollWidth, d.documentElement.clientWidth, d.documentElement.scrollHeight],
             doc: d.title, notFound: !$('view-notfound').hidden ? $('nf-title').textContent : null,
@@ -55,7 +55,7 @@ __t.run(async () => {
     await sleep(300);
     const theme = async (value) => {
         f.contentDocument.querySelector(`input[name=dev-theme][value=${value}]`).click();
-        await until(() => probe(f) && probe(f).src === frameSrc(f), 6000);
+        await until(() => probe(f) && (frameSrc(f) || '').endsWith(probe(f).src), 6000);
         await sleep(300);
         return { src: frameSrc(f), probe: probe(f) };
     };

@@ -150,6 +150,10 @@ def clean_env(**extra) -> dict:
            if not k.startswith('TASKS_') and k not in ('CDPATH', 'XDG_CACHE_HOME')}
     env['PYTHONDONTWRITEBYTECODE'] = '1'
     env['TASKS_SPOOL_DIR'] = str(spool_dir())
+    # No report port unless a test asks for one (--report-port): its default, the board's port + 1, could take the
+    # port another scratch board running at the same time was given.
+    env['TASKS_REPORT_PORT'] = '0'
+    env['TASKS_REPORT_TLS_PORT'] = '0'
     for key, value in extra.items():
         if value is None:
             env.pop(key, None)

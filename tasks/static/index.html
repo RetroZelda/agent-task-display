@@ -45,8 +45,9 @@
   Settings > This device > Appearance > Task order, picks this device's own. The request list keeps its own order.
 
   Report: a request may have one (an agent's HTML, the very file it published as a Claude artifact, or Markdown the
-  board renders). /r/<rid>/report shows it in a sandboxed frame of the board's page route (an opaque origin: its
-  scripts run, but never reach the board), filling the window under a slim header; the request's polls bring a new
+  board renders). /r/<rid>/report shows it in a sandboxed frame of the board's page route, which wraps and confines it
+  as claude.ai does an artifact (an opaque origin: its scripts run, but never reach the board; the frame allows what
+  the artifact viewer allows: forms, popups, pointer lock, fullscreen and clipboard writes, but no dialogs or downloads), filling the window under a slim header; the request's polls bring a new
   version, which reloads the frame, as does this device's theme (passed as ?theme=). The request's page has a
   Report button, and list rows say "report".
 
@@ -535,7 +536,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             <div class="meta"><span id="report-format"></span><span id="report-updated"></span><span id="report-version"></span><span id="report-size"></span></div>
         </div>
         <p id="report-none" class="none" hidden>This request has no report. An agent sends one with <code id="report-none-cmd"></code></p>
-        <iframe id="report-frame" title="Report" hidden sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads" referrerpolicy="no-referrer"></iframe>
+        <iframe id="report-frame" title="Report" hidden sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-pointer-lock" allow="fullscreen; clipboard-write" allowfullscreen referrerpolicy="no-referrer"></iframe>
     </section>
 
     <section id="view-notfound" class="empty" hidden>
@@ -671,6 +672,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     const BANNER_AFTER_FAILS = 2;
     const TICK_MS = 500;
     const REPORT_GAP = 12;              // px under a report's frame
+    const REPORT_SANDBOX = 'allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-pointer-lock';  // the artifact viewer's
     const STRIPED ='[data-status=running] > .bar > .fill, .bar.indeterminate > .fill';   // the bars with stripes (the CSS's)
     const ALERT_TICK_MS = 1500;         // the tab title alternates and the reminder is checked at this pace
     const CHIME_GAP_MS = 2000;          // sounds never start closer together than this
@@ -1514,9 +1516,15 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     // its CSP, and here by the frame's own sandbox); it reloads when the version or this device's theme changes.
     let reportShown = '';       // the page the frame shows; '' none
 
+    // The report's page: on the board's report port when it has one (the report's page URL, on the host this page was
+    // opened on: the board may know itself by another name), so the report keeps an origin of its own, as an artifact
+    // does; else on the board's own port, in an opaque origin.
     function reportPage(d) {
+        const u = new URL(d.report.page || '/api/requests/' + encodeURIComponent(d.id) + '/report/page', location.href);
+        if (u.origin !== location.origin) u.hostname = location.hostname;
         const theme = local.theme === 'light' || local.theme === 'dark' ? '&theme=' + local.theme : '';
-        return '/api/requests/' + encodeURIComponent(d.id) + '/report/page?v=' + d.report.version + theme;
+        u.search = '?v=' + d.report.version + theme;
+        return u.href;
     }
 
     function renderReport(d) {
@@ -1538,8 +1546,13 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         if (page) setAttr($('report-own'), 'href', page);
         if (page !== reportShown) {
             reportShown = page;
-            if (page) frame.src = page;
-            else frame.removeAttribute('src');
+            if (page) {
+                // its own origin only on another origin than the board's (never the board's own: its API lives there)
+                frame.setAttribute('sandbox', REPORT_SANDBOX + (new URL(page).origin !== location.origin ? ' allow-same-origin' : ''));
+                frame.src = page;
+            } else {
+                frame.removeAttribute('src');
+            }
         }
         if (!loaded) showView('report');
         baseTitle = 'Report · ' + ((rep && rep.title) || d.title) + ' — Task Status';

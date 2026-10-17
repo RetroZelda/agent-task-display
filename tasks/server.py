@@ -2,11 +2,13 @@
 """Task-status board: a small HTTP service that agents push request and task progress to.
 
     python3 tasks/server.py [--host 0.0.0.0] [--port 8765] [--db tasks/data/tasks.db] [--public-url URL]
-        [--config PATH] [--tls-port P --tls-cert FILE --tls-key FILE]
+        [--config PATH] [--tls-port P --tls-cert FILE --tls-key FILE] [--report-port P] [--report-tls-port P]
         [--stale-after 600] [--expire-after 86400] [--retention-days 30] [--pidfile PATH] [--verbose]
 
 Env fallbacks: TASKS_HOST, TASKS_PORT, TASKS_DB, TASKS_PUBLIC_URL, TASKS_CONFIG, TASKS_TLS_PORT,
-TASKS_TLS_CERT, TASKS_TLS_KEY. The pidfile defaults to <db dir>/server-<port>.pid and the settings file
+TASKS_TLS_CERT, TASKS_TLS_KEY, TASKS_REPORT_PORT, TASKS_REPORT_TLS_PORT. The report port serves report pages and
+nothing else (see Reports): --port + 1 unless given (0: none); with --tls-port, its https twin on --tls-port + 1 (0:
+none); a default one that is taken is left out with a warning, a given one that is taken is an error. The pidfile defaults to <db dir>/server-<port>.pid and the settings file
 to <db dir>/settings.json. Standard library only; needs Python >= 3.10 and SQLite >= 3.37 (and ffmpeg, only
 for live streams).
 A wildcard --host (0.0.0.0, ::, * or empty) listens dual-stack, IPv4 and IPv6 on one socket, so a
@@ -37,7 +39,8 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
   GET    /api/skill/taskctl.py     taskctl.py, rendered, text/plain
   GET    /favicon.ico              204
   GET    /api/health               {ok, service: "tasks", version: "3", pid, now, started_at, requests_running,
-                                   docs_version, tls_port (int | null), config_path}
+                                   docs_version, tls_port (int | null), config_path, report_port (int | null),
+                                   report_tls_port (int | null)}
   POST   /api/requests             {title, origin?, tasks?: [str], id?} -> 201 Request + tasks + now + existing
                                    (false). id is a client-made request id (else the server makes one; not an
                                    id -> 400): if it exists with the same title -> 200 that request + tasks +
@@ -58,7 +61,7 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
                                    {error, status, hint: "the request is closed"}
   DELETE /api/requests/{rid}/attention  -> Request + tasks + now (idempotent; the request's own only)
   PUT    /api/requests/{rid}/report  {format: html|markdown, content, title?, artifact_url?} -> 201 (new) or 200
-                                   (replaced) Report + request_id + now; the body may be up to 8 MiB (see Reports)
+                                   (replaced) Report + request_id + now; content up to 16 MiB, the body 32 MiB (see Reports)
   GET    /api/requests/{rid}/report  Report + request_id + content + now; 404 when the request has none
   DELETE /api/requests/{rid}/report  {deleted: bool, request_id, now} (idempotent)
   GET    /api/requests/{rid}/report/page  the report as a page, text/html, sandboxed (see Reports); ?theme=light|dark;
@@ -103,8 +106,8 @@ Shapes (every key always present, null when absent; times are float epoch second
   it), page <public>/api/requests/<rid>/report/page; size is its content's UTF-8 bytes; version counts its writes.
 
 Errors are {error, field?, hint?}: 400 validation, 403 cross-origin write, 404 unknown id/route, 405
-(+Allow), 409 state conflict, 410 a stream that was replaced or closed, 411 chunked, 413 body > 64 KiB (8 MiB
-for PUT .../report), 500,
+(+Allow), 409 state conflict, 410 a stream that was replaced or closed, 411 chunked, 413 body > 64 KiB (32 MiB
+for PUT .../report, whose content is at most 16 MiB), 500,
 503 database busy (+Retry-After: 1), or a stream not connected yet, full or shutting down (+Retry-After).
 http.server's own rejections (malformed request line 400, 414, 431, unknown method 501) are JSON too.
 Success bodies gain "warnings": [str] only when something was truncated, clamped or ignored.
@@ -196,12 +199,26 @@ Reports: a request's optional document, one at most: format html (the very file 
   text). PUT replaces the whole report (version + 1, created_at kept); it is allowed whatever the request's status,
   never reopens it and bumps its updated_at like any write; the report goes with its request. content: a non-empty
   string, NULs dropped; title: up to 200 characters, else the HTML's <title> or the Markdown's first heading, else
-  null; artifact_url: an http(s) URL of up to 2048 characters (the Claude artifact it replicates), or null. The page
-  route serves HTML as sent (a fragment, with no doctype or <html>, gets a skeleton: doctype, charset, viewport),
-  and Markdown in a page of the board's styles, each with a small script first in its head (data-theme on <html>
-  from ?theme=, links that leave the page open in a new tab), Cache-Control: no-store and Content-Security-Policy:
-  sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads: an
-  opaque origin, so its scripts run but its writes to the board carry Origin: null (refused) and it can read nothing.
+  null; artifact_url: an http(s) URL of up to 2048 characters (the Claude artifact it replicates), or null. content
+  is at most 16 MiB (UTF-8), an artifact page's limit. The page route serves a report as claude.ai serves an artifact,
+  so the two render alike: HTML wrapped in claude.ai's artifact skeleton, byte for byte (its doctype, a charset and a
+  viewport meta with viewport-fit=cover, and its reset: light color-scheme, :root padded by the safe-area insets, no
+  body margin, a 14px system font, img{max-width:100%}, [hidden]), every page as claude.ai wraps every page; one sent
+  as claude.ai serves it, skeleton and all, is unwrapped first, so it comes out the same. Markdown is rendered in a
+  page of the board's styles (a ```mermaid fence becomes <pre class="mermaid">). Each page has a small script last in
+  its head (data-theme on <html> from ?theme=, links that leave the page open in a new tab, <pre class="mermaid">
+  diagrams drawn with mermaid 10.9.1 from jsDelivr), Cache-Control: no-store and the artifact viewer's sandbox and
+  content policy: Content-Security-Policy: sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox
+  allow-forms allow-pointer-lock (no dialogs, no print, no downloads), plus allow-same-origin on the report port: there
+  the page keeps that port's origin, as an artifact keeps one of its own (browser storage works, and Firefox draws
+  text in web fonts it already has cached, which it leaves invisible in an opaque origin), and the board serves
+  nothing but report pages on it (any other route is a 404 naming the board's port); on the board's own port the page
+  gets an opaque origin, whose writes to the board carry Origin: null and are refused. A Report's page URL is on the
+  report port (https for a request that came over https, on the public URL's host) when there is one. Scripts only
+  inline or from
+  cdnjs.cloudflare.com, cdn.jsdelivr.net/npm/, unpkg.com, cdn.tailwindcss.com and code.jquery.com; stylesheets only
+  inline or from fonts.googleapis.com, fonts from fonts.gstatic.com or data:; images and media from data: and blob:
+  only; no fetch, frames, objects or form targets.
 
 Writes (POST, PUT, DELETE) carrying an Origin header are refused unless Origin equals Host and Host names
 this machine (IP literal, [IPv6] included, localhost, its hostname, the --public-url host). No auth.
@@ -469,16 +486,47 @@ def docs_version():
 # Reports
 
 # A request's optional report: an HTML document (the same file an agent publishes as a Claude artifact) or Markdown,
-# rendered here. GET /api/requests/<rid>/report/page serves it as a document of its own, sandboxed by its CSP: an
-# opaque origin, so its scripts run but can never reach the board (its writes carry Origin: null and are refused,
-# and no reply is readable without CORS).
+# rendered here. GET /api/requests/<rid>/report/page serves it as a document of its own, as claude.ai serves an
+# artifact: wrapped in the same skeleton, under the same content policy and sandbox, so the page renders and behaves
+# the same in both. The sandbox gives it an opaque origin: its scripts run but can never reach the board (its writes
+# carry Origin: null and are refused, and no reply is readable without CORS).
 REPORT_FORMATS = ('html', 'markdown')
-REPORT_BODY_MAX = 8 * 1024 * 1024
+REPORT_CONTENT_MAX = 16 * 1024 * 1024       # an artifact page's own limit (UTF-8 bytes)
+REPORT_BODY_MAX = 32 * 1024 * 1024          # and the JSON around it: escaped quotes, \u escapes
 ARTIFACT_URL_MAX = 2048
-REPORT_CSP = 'sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads'
-# Put first in every report's <head>: the dashboard's theme as data-theme on <html> (the artifact pages' own
-# contract: :root[data-theme=dark|light] wins over the system's), and links that leave the page open in a new tab
-# (an in-page #link stays put).
+# What an artifact page may do in claude.ai's viewer, and so in the board's: scripts, forms (as page UI: submissions go
+# nowhere), links and popups, pointer lock; no dialogs (alert, confirm, prompt, print), no downloads, no storage of its
+# own (an opaque origin, where claude.ai gives each artifact one). The content policy is the artifact one: scripts from
+# five CDNs, stylesheets from Google Fonts and fonts from its font host, images and media as data: or blob: only, no
+# network access, no frames, no form targets.
+REPORT_SANDBOX = 'allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-pointer-lock'
+REPORT_POLICY = '; '.join((
+    "default-src 'none'",
+    "script-src 'unsafe-inline' 'unsafe-eval' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net/npm/ https://unpkg.com"
+    ' https://cdn.tailwindcss.com https://code.jquery.com',
+    "style-src 'unsafe-inline' https://fonts.googleapis.com", 'font-src data: https://fonts.gstatic.com',
+    'img-src data: blob:', 'media-src data: blob:', 'connect-src data: blob:', 'worker-src blob:',
+    "frame-src 'none'", "object-src 'none'", "form-action 'none'", "base-uri 'none'"))
+# On the report port (--report-port) a page keeps that port's origin, as an artifact keeps its own: an origin the board
+# serves nothing else on, so the page cannot reach the board, and it gets what a real origin has (browser storage;
+# Firefox also redraws text in cached web fonts there, which it leaves invisible in an opaque origin). On the main port
+# (when there is no report port) it gets an opaque origin, since the board's own pages and API live there.
+REPORT_CSP = f'sandbox {REPORT_SANDBOX}; {REPORT_POLICY}'
+REPORT_CSP_OWN_ORIGIN = f'sandbox allow-same-origin {REPORT_SANDBOX}; {REPORT_POLICY}'
+# The skeleton claude.ai wraps every artifact page in, byte for byte as it serves them (a charset and a viewport meta,
+# and a small reset: light color-scheme, :root padded by the safe-area insets, no body margin, a 14px system font,
+# img{max-width:100%}, [hidden]). The board wraps an HTML report in it too, the shim last in its <head>.
+ARTIFACT_HEAD = ('<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,'
+                 'viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);'
+                 'padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;'
+                 'padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}'
+                 '[hidden]:not([hidden=until-found i]){display:none!important}</style>')
+ARTIFACT_BODY = '</head><body>\n'
+ARTIFACT_END = '</body></html>'
+MERMAID_JS = 'https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js'
+# Last in every report's <head>: the dashboard's theme as data-theme on <html> (the artifact contract:
+# :root[data-theme=dark|light] wins over the system's), links that leave the page open in a new tab (an in-page #link
+# stays put), and <pre class="mermaid"> diagrams drawn, as the artifact viewer draws them.
 REPORT_SHIM = """<script>(function () {
 var t = %s; if (t) document.documentElement.setAttribute('data-theme', t);
 document.addEventListener('click', function (e) {
@@ -488,6 +536,17 @@ document.addEventListener('click', function (e) {
   if (h.charAt(0) === '#' || /^\\s*javascript:/i.test(h)) return;
   a.target = '_blank'; a.rel = 'noopener';
 }, true);
+document.addEventListener('DOMContentLoaded', function () {
+  if (!document.querySelector('pre.mermaid')) return;
+  var s = document.createElement('script');
+  s.src = '""" + MERMAID_JS + """';
+  s.onload = function () {
+    var d = document.documentElement.getAttribute('data-theme');
+    var dark = d === 'dark' || (d !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+    try { mermaid.initialize({ startOnLoad: false, theme: dark ? 'dark' : 'default' }); mermaid.run({ querySelector: 'pre.mermaid' }); } catch (e) {}
+  };
+  document.head.appendChild(s);
+});
 })();</script>"""
 REPORT_MISSING = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, '
                   'initial-scale=1"><title>No report</title><style>:root{color-scheme:light dark}body{margin:0;display:grid;'
@@ -655,6 +714,9 @@ def _md_blocks(lines, used, tight=False):
                 body.append(lines[i][min(indent, len(lines[i]) - len(lines[i].lstrip(' '))):])
                 i += 1
             i += 1
+            if lang.lower() == 'mermaid':     # a diagram, drawn by the page's shim as the artifact viewer draws one
+                out.append('<pre class="mermaid">' + _md_escape('\n'.join(body)) + '</pre>')
+                continue
             cls = f' class="language-{_md_escape(lang)}"' if lang else ''
             out.append(f'<pre><code{cls}>' + _md_escape('\n'.join(body)) + ('\n' if body else '') + '</code></pre>')
             continue
@@ -784,11 +846,6 @@ def render_markdown(text):
     return '\n'.join(_md_blocks(lines, set()))
 
 
-_HTML_DOC_START = re.compile(r'\s*(?:<!--.*?-->\s*)*(?:<!doctype\b|<html\b)', re.I | re.S)
-_HTML_HEAD = re.compile(r'<head\b[^>]*>', re.I)
-_HTML_OPEN = re.compile(r'<!doctype\b[^>]*>|<html\b[^>]*>', re.I)
-
-
 def report_title(fmt, content):
     """A report's title when none is given: an HTML report's <title>, a Markdown report's first heading; or None."""
     if fmt == 'html':
@@ -802,24 +859,22 @@ def report_title(fmt, content):
 
 
 def report_document(fmt, content, title, theme):
-    """The page a report is shown as. HTML: the document as sent, the shim first in its <head> (a fragment, with no
-    doctype or <html>, gets the skeleton an artifact gets: doctype, charset, viewport). Markdown: rendered here, in a
-    page of its own styles. theme: 'light', 'dark' or None (the system's)."""
+    """The page a report is shown as. HTML: wrapped in the artifact skeleton, as claude.ai wraps every artifact page
+    (an agent writes the page content directly; a page sent as claude.ai serves it, skeleton and all, is unwrapped
+    first, so it comes out the same), the shim last in the skeleton's <head>. Markdown: rendered here, in a page of its
+    own styles. theme: 'light', 'dark' or None (the system's)."""
     shim = REPORT_SHIM % json.dumps(theme)
     if fmt == 'markdown':
         return ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
                 '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
                 f'<title>{_md_escape(title or "Report")}</title>\n{shim}\n<style>{MARKDOWN_CSS}</style>\n</head>\n'
                 f'<body>\n<article class="md">\n{render_markdown(content)}\n</article>\n</body>\n</html>\n')
-    if not _HTML_DOC_START.match(content):
-        return ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
-                f'<meta name="viewport" content="width=device-width, initial-scale=1">\n{shim}\n</head>\n<body>\n'
-                f'{content}\n</body>\n</html>\n')
-    m = _HTML_HEAD.search(content)
-    if not m:  # a doctype or <html> but no <head>: right after the last of them, in the head the parser implies
-        for m in _HTML_OPEN.finditer(content[:4096]):
-            pass
-    return content[:m.end()] + shim + content[m.end():] if m else shim + content
+    body = content.lstrip('﻿')
+    if body.startswith(ARTIFACT_HEAD + ARTIFACT_BODY):
+        body = body[len(ARTIFACT_HEAD + ARTIFACT_BODY):]
+        if body.rstrip().endswith(ARTIFACT_END):
+            body = body.rstrip()[:-len(ARTIFACT_END)]
+    return ARTIFACT_HEAD + shim + ARTIFACT_BODY + body + ARTIFACT_END
 
 
 def clean_artifact_url(value):
@@ -2717,7 +2772,7 @@ def task_json(row, now, public, stale_after):
     }
 
 
-def request_json(row, now, public, stale_after):
+def request_json(row, now, public, stale_after, report_base=None):
     percent = row['avg_percent']
     if percent is None:
         percent = 100.0 if row['status'] == 'done' else 0.0
@@ -2739,19 +2794,20 @@ def request_json(row, now, public, stale_after):
         'stale': running and not waiting and is_stale(row['updated_at'], row['eta_at'], now, stale_after),
         'url': f"{public}/r/{row['id']}",
         'attention': attention, 'waiting': waiting, 'tasks_waiting': row['tasks_waiting'],
-        'report': report_json(row, public, 'report_'),
+        'report': report_json(row, public, 'report_', report_base),
     }
 
 
-def report_json(row, public, prefix=''):
-    """A report's shape (no content), from a reports row (prefix '') or a request row's report_ columns; None if none."""
+def report_json(row, public, prefix='', page_base=None):
+    """A report's shape (no content), from a reports row (prefix '') or a request row's report_ columns; None if none.
+    page_base: the report port's origin, which serves the page (else the board's own)."""
     if row[prefix + 'format'] is None:
         return None
     rid = row['id'] if prefix else row['request_id']
     return {'format': row[prefix + 'format'], 'title': row[prefix + 'title'], 'artifact_url': row[prefix + 'artifact_url'],
             'size': row[prefix + 'size'], 'version': row[prefix + 'version'], 'created_at': row[prefix + 'created_at'],
             'updated_at': row[prefix + 'updated_at'], 'url': f'{public}/r/{rid}/report',
-            'page': f'{public}/api/requests/{rid}/report/page'}
+            'page': f'{page_base or public}/api/requests/{rid}/report/page'}
 
 
 def event_json(row):
@@ -2832,6 +2888,7 @@ class TasksServer(ThreadingHTTPServer):
     request_queue_size = 64
     allow_reuse_port = False  # never let a second server silently share the port
     tls = False
+    reports_only = False      # the report port: report pages and nothing else
 
     def __init__(self, host, port, handler, dual_stack=False):
         # dual_stack: one IPv6 socket on '::' that also takes IPv4 clients, so a hostname that resolves
@@ -2868,6 +2925,16 @@ class TLSTasksServer(TasksServer):
         except OSError:
             sock.close()
             raise
+
+
+class ReportServer(TasksServer):
+    """The report port (--report-port): report pages only, each in an origin the board serves nothing else on."""
+    reports_only = True
+
+
+class TLSReportServer(TLSTasksServer):
+    """The report port's HTTPS twin (--report-tls-port), for dashboards opened over https."""
+    reports_only = True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2930,10 +2997,15 @@ class Handler(BaseHTTPRequestHandler):
             if route_method != method:
                 allowed.append(route_method)
                 continue
+            if self.server.reports_only and handler not in ('report_page', 'favicon'):
+                break
             params = dict(fixed)
             for key, raw in match.groupdict().items():
                 params[key] = self._check_id(key, raw.lower(), path[match.end(key):], method)
             return handler, params
+        if self.server.reports_only:
+            raise ApiError(404, f'this port serves report pages only: no {method} {path}',
+                           hint='the board is on port ' + str(self.server.tls_port if self.server.tls else self.server.http_port))
         if allowed:
             raise ApiError(405, f'{method} is not allowed on {path}', {'Allow': ', '.join(allowed)})
         raise ApiError(404, f'no route for {method} {path}', hint=f'GET {self.base_url()}/api/usage')
@@ -3053,6 +3125,15 @@ class Handler(BaseHTTPRequestHandler):
     def public_url(self):
         return self.server.public_url or self.base_url()
 
+    def report_base(self):
+        """The report port's origin for this request (its scheme's report port, on the public URL's host), or None."""
+        port = self.server.report_tls_port if self.server.tls else self.server.report_port
+        if not port:
+            return None
+        host = urlsplit(self.public_url()).hostname or '127.0.0.1'
+        host = f'[{host}]' if ':' in host else host
+        return f'{"https" if self.server.tls else "http"}://{host}:{port}'
+
     def _send(self, code, body, content_type, cache, headers=None):
         try:
             self.send_response(code)
@@ -3103,7 +3184,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _detail(self, row, tasks, now):
         public, stale_after = self.public_url(), self.server.stale_after
-        return {**request_json(row, now, public, stale_after),
+        return {**request_json(row, now, public, stale_after, self.report_base()),
                 'tasks': [task_json(task, now, public, stale_after) for task in tasks], 'now': now}
 
     def h_index(self):
@@ -3133,7 +3214,8 @@ class Handler(BaseHTTPRequestHandler):
                           'started_at': self.server.started_at,
                           'requests_running': self.server.store.running_count(),
                           'docs_version': docs_version(), 'tls_port': self.server.tls_port,
-                          'config_path': str(self.server.settings.path)})
+                          'config_path': str(self.server.settings.path), 'report_port': self.server.report_port,
+                          'report_tls_port': self.server.report_tls_port})
 
     def _query(self, name):
         values = self.query.get(name)
@@ -3160,7 +3242,7 @@ class Handler(BaseHTTPRequestHandler):
         now, stale_after, public = ts(), self.server.stale_after, self.public_url()
         rows, counts = self.server.store.list_requests(status, limit, now, stale_after, offset)
         self._reply(200, {'now': now, 'stale_after': stale_after, 'counts': counts,
-                          'requests': [request_json(row, now, public, stale_after) for row in rows]})
+                          'requests': [request_json(row, now, public, stale_after, self.report_base()) for row in rows]})
 
     def h_create_request(self):
         body, w = self._write_body({'title', 'origin', 'tasks', 'id'}), self.warnings
@@ -3258,17 +3340,22 @@ class Handler(BaseHTTPRequestHandler):
         content = content.encode('utf-8', 'replace').decode('utf-8').replace('\0', '')
         if not content.strip():
             raise ApiError(400, 'content must not be empty', field='content')
+        if len(content.encode('utf-8')) > REPORT_CONTENT_MAX:
+            raise ApiError(413, f"content is larger than {REPORT_CONTENT_MAX // 1048576} MiB (an artifact page's limit)",
+                           field='content')
         title = clean_text(body.get('title'), 'title', TITLE_MAX, w) or report_title(fmt, content)
         artifact_url = clean_artifact_url(body.get('artifact_url'))
         now = ts()
         row, created = self.server.store.put_report(rid, fmt, title, artifact_url, content, now, self._at(body, now))
         log.info('%s the report of request %s (%s, %d bytes, version %d)%s', 'added' if created else 'replaced', rid, fmt,
                  row['size'], row['version'], ' (replayed)' if self.replay else '')
-        self._reply(201 if created else 200, {**report_json(row, self.public_url()), 'request_id': rid, 'now': now})
+        self._reply(201 if created else 200, {**report_json(row, self.public_url(), page_base=self.report_base()), 'request_id': rid,
+                                              'now': now})
 
     def h_get_report(self, rid):
         row = self.server.store.get_report(rid)
-        self._reply(200, {**report_json(row, self.public_url()), 'request_id': rid, 'content': row['content'], 'now': ts()})
+        self._reply(200, {**report_json(row, self.public_url(), page_base=self.report_base()), 'request_id': rid,
+                          'content': row['content'], 'now': ts()})
 
     def h_delete_report(self, rid):
         body = self._write_body(set())
@@ -3280,7 +3367,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def h_report_page(self, rid):
         theme = self._query('theme')
-        headers = {'Content-Security-Policy': REPORT_CSP, 'Referrer-Policy': 'no-referrer'}
+        headers = {'Content-Security-Policy': REPORT_CSP_OWN_ORIGIN if self.server.reports_only else REPORT_CSP,
+                   'Referrer-Policy': 'no-referrer'}
         try:
             row = self.server.store.get_report(rid)
         except ApiError as exc:
@@ -3490,6 +3578,10 @@ def parse_args(argv):
                         help='PEM certificate (chain) for --tls-port')
     parser.add_argument('--tls-key', type=Path, default=env('TASKS_TLS_KEY') or None,
                         help='PEM private key (unencrypted) for --tls-port')
+    parser.add_argument('--report-port', type=int, default=env('TASKS_REPORT_PORT') or None,
+                        help='the port that serves report pages, each in an origin of its own (default: --port + 1; 0: none)')
+    parser.add_argument('--report-tls-port', type=int, default=env('TASKS_REPORT_TLS_PORT') or None,
+                        help="the report port's https twin (default with --tls-port: --tls-port + 1; 0: none)")
     parser.add_argument('--stale-after', type=_seconds, default=600,
                         help='seconds of silence before running work is stale')
     parser.add_argument('--expire-after', type=_seconds, default=86400,
@@ -3512,6 +3604,22 @@ def parse_args(argv):
             parser.error(f'--tls-port must be 1..65535, got {args.tls_port}')
         if args.tls_port == args.port:
             parser.error(f'--tls-port must differ from --port ({args.port})')
+    # The report ports: given, or the next free numbers after the board's own (a default one that is busy is left out).
+    args.report_port_given = args.report_port is not None
+    args.report_tls_port_given = args.report_tls_port is not None
+    if args.report_tls_port and args.tls_port is None:
+        parser.error('--report-tls-port needs --tls-port (and its certificate)')
+    taken = {args.port, args.tls_port}
+    for name, value, base in (('--report-port', args.report_port, args.port), ('--report-tls-port', args.report_tls_port, args.tls_port)):
+        if value is None and base is not None:
+            value = next((p for p in range(base + 1, base + 4) if p <= 65535 and p not in taken), 0)
+        if value:
+            if not 1 <= value <= 65535:
+                parser.error(f'{name} must be 1..65535 (or 0 for none), got {value}')
+            if value in taken:
+                parser.error(f'{name} must differ from the other ports ({value} is taken)')
+            taken.add(value)
+        setattr(args, name[2:].replace('-', '_'), value or None)
     if args.public_url:
         args.public_url = args.public_url.strip().rstrip('/')
         parts = urlsplit(args.public_url)
@@ -3605,6 +3713,22 @@ def main(argv=None):
             httpd.server_close()
             print(_listen_error(exc, args.host, args.tls_port, '--tls-port: '), file=sys.stderr)
             return 2
+    for flag, attr, server_class, extra in (('--report-port', 'report_port', ReportServer, {}),
+                                            ('--report-tls-port', 'report_tls_port', TLSReportServer, {'context': context})):
+        port = getattr(args, attr)
+        if not port:
+            continue
+        try:
+            servers.append(listen(args.host, port, server_class, **extra))
+        except OSError as exc:
+            if getattr(args, attr + '_given'):
+                for server in servers:
+                    server.server_close()
+                print(_listen_error(exc, args.host, port, flag + ': '), file=sys.stderr)
+                return 2
+            # a default port that is taken: the board goes on, its report pages on its own port (an opaque origin)
+            log.warning('report pages: %s; served on the board\'s own port instead', _listen_error(exc, args.host, port, flag + ': '))
+            setattr(args, attr, None)
     try:
         store = Store(args.db)
     except (sqlite3.Error, OSError, RuntimeError) as exc:
@@ -3635,14 +3759,20 @@ def main(argv=None):
         server.started_at = started_at
         server.local_names = local_names
         server.http_port, server.tls_port = args.port, args.tls_port
+        server.report_port, server.report_tls_port = args.report_port, args.report_tls_port
 
     stop = threading.Event()
     threading.Thread(target=maintenance_loop, name='maintenance', daemon=True,
                      args=(store, args.expire_after, args.retention_days, stop)).start()
     signal.signal(signal.SIGTERM, _interrupt)
     for server in servers[1:]:
-        threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.5}, name='https', daemon=True).start()
-        log.info('https listener on %s (certificate %s)', _shown(server, 'https'), args.tls_cert)
+        scheme = 'https' if server.tls else 'http'
+        threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.5},
+                         name='reports' if server.reports_only else scheme, daemon=True).start()
+        if server.reports_only:
+            log.info('report pages on %s', _shown(server, scheme))
+        else:
+            log.info('https listener on %s (certificate %s)', _shown(server, 'https'), args.tls_cert)
     log.info('tasks server listening on %s (db %s, pid %d, public url %s, settings %s)', _shown(httpd, 'http'),
              args.db, os.getpid(), args.public_url or 'from Host header', settings.path)
     try:

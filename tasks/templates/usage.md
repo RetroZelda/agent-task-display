@@ -223,13 +223,16 @@ artifact for work tracked here, send the very same file to its request, and agai
 so both always show the same: `taskctl report RID report.html --artifact URL` (or `findings.md`, or
 `-` with `--format html|markdown` for stdin); it prints the report's page. Over HTTP: `PUT
 /api/requests/<rid>/report` with `{"format": "html" | "markdown", "content": "<the whole document>",
-"title": "...", "artifact_url": "https://claude.ai/..."}` (title and artifact_url optional; the body may
-be up to 8 MiB). HTML is shown as sent, its scripts running in a sandbox that cannot reach the board;
+"title": "...", "artifact_url": "https://claude.ai/..."}` (title and artifact_url optional; content up
+to 16 MiB). HTML renders as on claude.ai: the board wraps it in claude.ai's own artifact skeleton and
+applies the artifact viewer's sandbox and content policy (the same CDNs, Google Fonts, images as data:
+URIs, no dialogs or downloads), so send the page you published, not a copy edited for the board;
 Markdown (a GitHub-flavoured subset; raw HTML is shown as text) is rendered by the board. Each PUT
 replaces the whole report (its `version` counts them); it works on a closed request and never reopens
 it. The title defaults to the HTML's `<title>` or the first Markdown heading. Every request carries
 `report`: null, or `{format, title, artifact_url, size, version, created_at, updated_at, url, page}`
-(no content: GET the report route for that). `DELETE` removes it; it also goes with its request.
+(no content: GET the report route for that); `page` is served from the board's report port (its port + 1
+by default), where each report page keeps an origin of its own, as an artifact does. `DELETE` removes it; it also goes with its request.
 
 Live stream. The dashboard can show one network video or audio stream beside the board on every open
 page (below it on a portrait screen, to its right on a landscape one). Do this only when your user asks.

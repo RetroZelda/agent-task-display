@@ -386,6 +386,30 @@ else
     skip "the HTTPS listener cases (openssl not installed or it cannot make a certificate)"
 fi
 
+section "the report port (TASKS_REPORT_PORT): report pages in an origin of their own"
+RP="$(free_port)"
+fake_ufw "-A ufw-user-input -p tcp --dport $P -j ACCEPT" "$V6_OTHER"
+run env TASKS_REPORT_PORT="$RP" "$T" --port "$P" --db "$DB" --bg
+check "the banner: the reports line on the LAN address, blocked by ufw" grep -qxF "  reports     http://$FAKE_LAN_IP:$RP/  (report pages, each in an origin of its own; blocked by ufw, see below)" <<< "$OUT"
+check "the ufw box has a rule for the report port" has "$OUT" "sudo ufw allow from $FAKE_LAN_NET to any port $RP proto tcp"
+H="$(curl -fsS --noproxy '*' --max-time 5 "http://127.0.0.1:$P/api/health")"
+check "health says report_port $RP" has "$H" "\"report_port\": $RP"
+check "the report port serves report pages only (its health is a 404)" bash -c '[ "$(curl -s --noproxy "*" --max-time 5 -o /dev/null -w "%{http_code}" "http://127.0.0.1:$1/api/health")" = 404 ]' _ "$RP"
+run "$T" --port "$P" --status
+check "--status: the reports line, from the running board" grep -qF "  reports     http://$FAKE_LAN_IP:$RP/" <<< "$OUT"
+"$T" --port "$P" --stop >/dev/null
+check "--stop closes the report port too" port_free "$RP"
+fake_ufw "-A ufw-user-input -p tcp --dport $P -j ACCEPT
+-A ufw-user-input -p tcp --dport $RP -j ACCEPT" "$V6_OTHER"
+run env TASKS_REPORT_PORT="$RP" "$T" --port "$P" --db "$DB" --bg
+check "ufw open for both ports: a plain reports line, no rule for it" grep -qxF "  reports     http://$FAKE_LAN_IP:$RP/  (report pages, each in an origin of its own)" <<< "$OUT"
+check "...and no ufw rule for the report port" hasnt "$OUT" "to any port $RP proto tcp"
+"$T" --port "$P" --stop >/dev/null
+run "$T" --port "$P" --db "$DB" --bg
+check "TASKS_REPORT_PORT=0: no report port, no reports line" hasnt "$OUT" "  reports"
+"$T" --port "$P" --stop >/dev/null
+fake_ufw "$V4_OTHER" "$V6_OTHER"
+
 section "SIGKILL path (a fake server that ignores SIGTERM)"
 F="$TMP/fake_root"
 mkdir -p "$F/tasks"

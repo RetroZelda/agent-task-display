@@ -157,12 +157,13 @@ ${CLAUDE_SKILL_DIR}/taskctl report k3m9qa findings.md --title 'Migration finding
 ```
 
 - FILE is the `.html` page you published, or Markdown (`.md`); `-` reads stdin, with `--format html`
-  or `--format markdown`. The board shows HTML as sent (scripts and all, sandboxed) and renders Markdown.
+  or `--format markdown`. The board renders HTML as claude.ai renders the artifact (the same skeleton
+  and limits), and renders Markdown itself.
 - `--artifact URL` links the board's report page to the artifact. The title defaults to the page's
   `<title>` or the first Markdown heading; `--title` sets another.
 - stdout is the report's page on the board, `http://HOST:8765/r/k3m9qa/report`: give it to the user
   along with the artifact's link.
-- A request has one report: each send replaces it (up to 8 MiB), and `--delete` removes it. It works on
+- A request has one report: each send replaces it (up to 16 MiB), and `--delete` removes it. It works on
   a closed request too, and is queued like the other writes while the board is unreachable.
 
 ## 8. Status questions

@@ -63,10 +63,108 @@ def kinds(events, *fields):
     return [tuple(e[f] for f in fields) for e in events]
 
 
+def phase_report_port():
+    S.section('the report port: report pages in an origin of their own, and nothing else')
+    rport = free_port()
+    srv = ScratchServer(TMP, '--report-port', str(rport), name='rport').start()
+    try:
+        call = srv.call
+        rid = call('POST', '/api/requests', {'title': 'On the report port'})[2]['id']
+        s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': '<title>T</title><p>x</p>\n'})
+        page = f'http://127.0.0.1:{rport}/api/requests/{rid}/report/page'
+        check('a report\'s page is on the report port, on the host the board was reached by', s == 201 and b['page'] == page, b)
+        check('the request (detail and list) and GET report say the same page', call('GET', f'/api/requests/{rid}')[2]['report']['page'] == page
+              and [r for r in call('GET', '/api/requests')[2]['requests'] if r['id'] == rid][0]['report']['page'] == page
+              and call('GET', f'/api/requests/{rid}/report')[2]['page'] == page)
+        b = call('GET', '/api/health')[2]
+        check('health: the report port, no https twin', b['report_port'] == rport and b['report_tls_port'] is None, b)
+        s, h, body = http_call(rport, 'GET', f'/api/requests/{rid}/report/page')
+        check('on the report port: the page, sandboxed with an origin of its own (allow-same-origin) and the artifact policy',
+              s == 200 and h['content-security-policy'] == REPORT_CSP_OWN and body.startswith(ARTIFACT_HEAD) and h['cache-control'] == 'no-store', h)
+        s, h, body = http_call(rport, 'HEAD', f'/api/requests/{rid}/report/page')
+        check('HEAD on the report port: the headers', s == 200 and not body and h['content-security-policy'] == REPORT_CSP_OWN, (s, h))
+        for method, path in (('GET', '/api/requests'), ('GET', '/api/health'), ('GET', '/'), ('GET', f'/r/{rid}'), ('GET', f'/api/requests/{rid}'),
+                             ('GET', f'/api/requests/{rid}/report'), ('POST', '/api/requests'), ('DELETE', f'/api/requests/{rid}'),
+                             ('PUT', f'/api/requests/{rid}/report'), ('GET', '/api/events'), ('GET', '/api/skill/taskctl.py')):
+            s, h, b = http_call(rport, method, path, {} if method in ('POST', 'PUT') else None)
+            check(f'on the report port, {method} {path}: 404, report pages only (naming the board\'s port)', s == 404
+                  and b['error'] == f'this port serves report pages only: no {method} {path}' and b['hint'] == f'the board is on port {srv.port}', b)
+        check('the request is untouched by those', call('GET', f'/api/requests/{rid}')[0] == 200 and call('GET', f'/api/requests/{rid}/report')[0] == 200)
+        s, h, body = http_call(rport, 'GET', '/favicon.ico')
+        check('the report port\'s favicon: 204', s == 204, s)
+        s, h, body = call('GET', f'/api/requests/{rid}/report/page')
+        check('the board\'s own port still serves the page, in an opaque origin', s == 200 and h['content-security-policy'] == REPORT_CSP, h)
+    finally:
+        srv.stop()
+    check('the log names the report port', f'report pages on http://0.0.0.0:{rport}' in srv.log_text() or f':{rport}' in srv.log_text(),
+          srv.log_text()[-600:])
+    srv = ScratchServer(TMP, '--report-port', '0', name='rport0').start()
+    try:
+        rid = srv.call('POST', '/api/requests', {'title': 'No report port'})[2]['id']
+        b = srv.call('PUT', f'/api/requests/{rid}/report', {'format': 'markdown', 'content': '# x'})[2]
+        check('--report-port 0: no report port, the page on the board\'s own port', b['page'] == f'{srv.url}/api/requests/{rid}/report/page'
+              and srv.call('GET', '/api/health')[2]['report_port'] is None, b)
+    finally:
+        srv.stop()
+    # the default: --port + 1; when that is taken, the board starts anyway, its pages on its own port, with a warning
+    port = free_port()
+    blocker = socket.socket()
+    try:
+        blocker.bind(('0.0.0.0', port + 1))
+        blocker.listen(1)
+    except OSError:
+        blocker.close()
+        blocker = None
+    if blocker is None:
+        S.skip('report port default', f'port {port + 1} is not free here')
+    else:
+        try:
+            srv = ScratchServer(TMP, port=port, name='rportbusy', env=clean_env(TASKS_REPORT_PORT=None)).start()
+            try:
+                check('the default report port (--port + 1) taken: the board starts, with no report port, and says why',
+                      srv.call('GET', '/api/health')[2]['report_port'] is None and 'report pages: error: --report-port: port' in srv.log_text()
+                      and "served on the board's own port instead" in srv.log_text(), srv.log_text()[-600:])
+            finally:
+                srv.stop()
+            res = subprocess.run([sys.executable, str(SERVER), '--port', str(free_port()), '--report-port', str(port + 1), '--db', str(TMP / 'busy.db'),
+                                  '--pidfile', str(TMP / 'busy.pid'), '--config', str(TMP / 'busy.json')], capture_output=True, text=True, timeout=15, env=clean_env())
+            check('a --report-port that is taken: exit 2, a clear error', res.returncode == 2
+                  and f'error: --report-port: port {port + 1} already in use' in res.stderr, (res.returncode, res.stderr[-300:]))
+        finally:
+            blocker.close()
+    free = free_port()
+    srv = ScratchServer(TMP, port=free, name='rportdef', env=clean_env(TASKS_REPORT_PORT=None))
+    try:
+        srv.start()
+        b = srv.call('GET', '/api/health')[2]
+        check('no --report-port and no TASKS_REPORT_PORT: the report port is --port + 1 (or the next free one)',
+              b['report_port'] in (free + 1, free + 2, free + 3, None), b)
+    finally:
+        srv.stop()
+    for extra, msg in ((['--report-tls-port', '9999'], '--report-tls-port needs --tls-port'), (['--report-port', '70000'], '--report-port must be 1..65535'),
+                       (['--report-port', 'x'], 'invalid int value')):
+        res = subprocess.run([sys.executable, str(SERVER), '--port', '18765', *extra], capture_output=True, text=True, timeout=15, env=clean_env())
+        check(f'{" ".join(extra)}: exit 2, {msg}', res.returncode == 2 and msg in res.stderr, res.stderr[-200:])
+    res = subprocess.run([sys.executable, str(SERVER), '--port', '18765', '--report-port', '18765'], capture_output=True, text=True, timeout=15, env=clean_env())
+    check('--report-port the same as --port: exit 2', res.returncode == 2 and 'must differ from the other ports' in res.stderr, res.stderr[-200:])
+
+
 # ---------------------------------------------------------------- reports
 
 REPORT_KEYS = ['format', 'title', 'artifact_url', 'size', 'version', 'created_at', 'updated_at', 'url', 'page']
-REPORT_CSP = 'sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads'
+# The artifact viewer's sandbox and content policy, which the board's report page takes on (see server.py, Reports).
+REPORT_POLICY = ("default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net/npm/ "
+              "https://unpkg.com https://cdn.tailwindcss.com https://code.jquery.com; style-src 'unsafe-inline' https://fonts.googleapis.com; "
+              "font-src data: https://fonts.gstatic.com; img-src data: blob:; media-src data: blob:; connect-src data: blob:; worker-src blob:; "
+              "frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'")
+REPORT_CSP = 'sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-pointer-lock; ' + REPORT_POLICY
+REPORT_CSP_OWN = 'sandbox allow-same-origin allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-pointer-lock; ' + REPORT_POLICY
+# The skeleton claude.ai serves every artifact page in (copied from the pages it serves), up to the end of its <head>.
+ARTIFACT_HEAD = ('<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,'
+                 'viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);'
+                 'padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;'
+                 'padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}'
+                 '[hidden]:not([hidden=until-found i]){display:none!important}</style>')
 
 
 def phase_reports():
@@ -124,15 +222,18 @@ def phase_reports():
         check('a long title truncated, an unknown field ignored (warnings); NULs dropped from the content', s == 200 and len(b['title']) == 200
               and b['warnings'] == ["unknown field 'extra' ignored", 'title truncated to 200 characters']
               and call('GET', f'/api/requests/{rid}/report')[2]['content'] == 'xy', b)
-        big = '<p>' + 'x' * (6 * 1024 * 1024) + '</p>'
+        big = '<p>' + 'x' * (16 * 1024 * 1024 - 7) + '</p>'
         s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': big}, timeout=60)
-        check('a 6 MiB report: accepted (the route takes up to 8 MiB)', s == 200 and b['size'] == len(big), (s, b.get('error')))
+        check('a report of exactly 16 MiB, an artifact page\'s limit: accepted', s == 200 and b['size'] == 16 * 1024 * 1024, (s, b.get('error')))
+        s, h, b = call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': big + 'x'}, timeout=60)
+        check('a byte more: 413 naming the content', s == 413 and b.get('field') == 'content'
+              and b['error'] == "content is larger than 16 MiB (an artifact page's limit)", b)
         def claim(method, path, length):     # only the headers: the board answers 413 before it reads a body that large
             s, h, raw = raw_request(srv.port, f'{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{srv.port}\r\nContent-Type: application/json\r\n'
                                               f'Content-Length: {length}\r\nConnection: close\r\n\r\n'.encode())
             return s, json.loads(raw)
-        s, b = claim('PUT', f'/api/requests/{rid}/report', 8 * 1024 * 1024 + 1)
-        check('a body over 8 MiB: 413', s == 413 and b['error'] == 'request body is larger than 8192 KiB', b)
+        s, b = claim('PUT', f'/api/requests/{rid}/report', 32 * 1024 * 1024 + 1)
+        check('a body over 32 MiB: 413', s == 413 and b['error'] == 'request body is larger than 32768 KiB', b)
         s, b = claim('POST', f'/api/requests/{rid}/attention', 64 * 1024 + 1)
         check('other routes keep their 64 KiB limit', s == 413 and b['error'] == 'request body is larger than 64 KiB', b)
         s, h, b = call('PUT', '/api/requests/zzzzzz/report', {'format': 'html', 'content': 'x'})
@@ -157,21 +258,25 @@ def phase_reports():
               and h['cache-control'] == 'no-store' and h['x-content-type-options'] == 'nosniff' and h['referrer-policy'] == 'no-referrer'
               and 'access-control-allow-origin' not in h, h)
         shim = board.REPORT_SHIM % 'null'
-        check('an HTML document: as sent, the shim right after <head> (and nothing else changed)',
-              page == doc.replace('<head>\n', '<head>\n' + shim, 1) if False else page == doc.replace('<head>', '<head>' + shim, 1), page[:300])
+        check('the server\'s skeleton is the one claude.ai serves', board.ARTIFACT_HEAD == ARTIFACT_HEAD)
+        check('an HTML document of its own: wrapped all the same, as claude.ai wraps every page, the shim last in the skeleton\'s head',
+              page == ARTIFACT_HEAD + shim + '</head><body>\n' + doc + '</body></html>', page[:300])
         s, h, page = call('GET', f'/api/requests/{rid}/report/page?theme=dark')
         check('?theme=dark: the shim sets data-theme "dark"', board.REPORT_SHIM % '"dark"' in page, page[:300])
         s, h, page = call('GET', f'/api/requests/{rid}/report/page?theme=sepia')
         check('an unknown theme: none (the system\'s)', shim in page)
         s, h, body = call('HEAD', f'/api/requests/{rid}/report/page')
         check('HEAD: the headers only', s == 200 and h['content-security-policy'] == REPORT_CSP and not body, (s, body))
-        call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': '<h1>Fragment</h1><p>no doctype</p>'})
+        source = '<title>T</title>\n<style>p { color: red }</style>\n<p>An artifact\'s source, as an agent writes it.</p>\n'
+        call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': source})
         page = call('GET', f'/api/requests/{rid}/report/page')[2]
-        check('a fragment: the artifact skeleton (doctype, charset, viewport, the shim) around it', page.startswith('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">')
-              and 'name="viewport"' in page and shim in page and '<body>\n<h1>Fragment</h1><p>no doctype</p>\n</body>' in page, page)
-        call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': '<!DOCTYPE html><title>T</title><p>x'})
-        page = call('GET', f'/api/requests/{rid}/report/page')[2]
-        check('a doctype and no <head>: the shim right after the doctype', page == '<!DOCTYPE html>' + shim + '<title>T</title><p>x', page)
+        served = ARTIFACT_HEAD + '</head><body>\n' + source + '</body></html>'
+        check('an artifact\'s source: the page claude.ai serves for it, byte for byte, plus the shim', page == served.replace('</head>', shim + '</head>', 1), page)
+        call('PUT', f'/api/requests/{rid}/report', {'format': 'html', 'content': '\ufeff' + served})
+        check('the page as claude.ai serves it (a BOM, the skeleton and all): the same page, not wrapped twice',
+              call('GET', f'/api/requests/{rid}/report/page')[2] == page)
+        check('mermaid diagrams: the shim loads the renderer only when the page has one', board.MERMAID_JS in shim
+              and "querySelector('pre.mermaid')" in shim)
         call('PUT', f'/api/requests/{rid}/report', {'format': 'markdown', 'content': '# A <b>bold</b> & title\n\nText', 'title': 'x < y'})
         page = call('GET', f'/api/requests/{rid}/report/page?theme=light')[2]
         check('a Markdown page: the board\'s page around the rendering, the title escaped, the theme set, the styles in',
@@ -233,6 +338,7 @@ def phase_reports():
          '<strong>2</strong></td></tr><tr><td style="text-align:left">x | y</td><td style="text-align:right"></td></tr></tbody></table></div>'),
         ('a | b\n---', '<h2 id="a--b">a | b</h2>'),
         ('para\n# head\n- item', '<p>para</p>\n<h1 id="head">head</h1>\n<ul>\n<li>item</li>\n</ul>'),
+        ('```mermaid\ngraph TD; A-->B\n```', '<pre class="mermaid">graph TD; A--&gt;B</pre>'),
         ('', ''),
     )
     for src, want in cases:
@@ -251,7 +357,8 @@ def phase_headers():
         check('the repo tree and its copy have the same docs version', docs == docs_version())
         s, h, b = call('GET', '/api/health')
         check('health: v2 fields, in order', s == 200 and b['version'] == '3' and b['docs_version'] == docs and b['tls_port'] is None
-              and b['config_path'] == str(srv.config) and list(b)[-3:] == ['docs_version', 'tls_port', 'config_path'], b)
+              and b['config_path'] == str(srv.config) and b['report_port'] is None and b['report_tls_port'] is None
+              and list(b)[-5:] == ['docs_version', 'tls_port', 'config_path', 'report_port', 'report_tls_port'], b)
         check('health headers', h.get('x-tasks-version') == '3' and h.get('x-tasks-docs') == docs, h)
         routes = [('GET', '/'), ('GET', '/r/k3m9qa'), ('GET', '/api/usage'), ('GET', '/api/rule'), ('GET', '/api/changelog'),
                   ('GET', '/api/skill/SKILL.md'), ('GET', '/api/skill/taskctl'), ('GET', '/api/skill/taskctl.py'),
@@ -1061,4 +1168,5 @@ if __name__ == '__main__':
     phase_clock()
     phase_migration()
     phase_reports()
+    phase_report_port()
     sys.exit(S.finish())

@@ -140,10 +140,12 @@ Launcher options:
 | `--tls-port PORT` | `TASKS_TLS_PORT` | off | Also serve [HTTPS](#https-for-notifications) on this port |
 | `--tls-cert FILE` | `TASKS_TLS_CERT` | | Its PEM certificate (chain) |
 | `--tls-key FILE` | `TASKS_TLS_KEY` | | Its PEM private key |
+| (server only) `--report-port PORT` | `TASKS_REPORT_PORT` | `--port` + 1 | The [report pages](#reports)' own port (`0`: none) |
+| (server only) `--report-tls-port PORT` | `TASKS_REPORT_TLS_PORT` | `--tls-port` + 1 | Its HTTPS twin (`0`: none) |
 
 The three TLS options go together: all of them or none. Relative paths are taken from the directory
 you run `tasks.sh` in. The server itself (`python3 tasks/server.py`) takes the same flags and
-variables. See `./tasks.sh -h`.
+variables; `tasks.sh` passes the report ports' variables through. See `./tasks.sh -h`.
 
 ## Agents on other machines
 
@@ -397,10 +399,16 @@ some-generator | taskctl report k3m9qa - --format markdown
 taskctl report k3m9qa --delete
 ```
 
-- **HTML** is shown exactly as sent, like the artifact: its own styles, scripts and charts, in a frame
-  that fills the window under a slim header. A page without a doctype gets the same skeleton an artifact
-  gets (charset and viewport). Its scripts run in a sandbox with an origin of its own, so they cannot
-  read or change anything on the board. Links that leave the report open in a new tab.
+- **HTML** renders as it does on claude.ai, pixel for pixel: the board wraps the page in claude.ai's own
+  artifact skeleton (the same bytes: charset, viewport and the small reset every artifact gets), and
+  gives it the artifact viewer's rules. Like an artifact, it is served from an origin of its own: the
+  board's **report port** (`--port` + 1, so 8766 by default; set `TASKS_REPORT_PORT`, or `0` for none),
+  which serves report pages and nothing else. Scripts load from the same five CDNs, fonts from Google Fonts,
+  images such as screenshots as `data:` URIs, and nothing else; there are no dialogs, print or downloads,
+  and links that leave the report open in a new tab. `<pre class="mermaid">` diagrams are drawn as the
+  artifact viewer draws them. Its scripts run in a sandbox with an origin of its own, so they cannot read
+  or change anything on the board (nor keep anything in browser storage). It fills the window under a
+  slim header. Sending the page as claude.ai serves it (skeleton and all) gives the same result.
 - **Markdown** (a GitHub-flavoured subset: headings, lists and task lists, tables, code, quotes, links
   and images) is rendered by the board, in a reading column that follows the theme. Raw HTML in it is
   shown as text.
@@ -410,7 +418,7 @@ taskctl report k3m9qa --delete
 - **Live**: a new version reloads the page on every open dashboard within a couple of seconds, and the
   report follows each device's theme (*Settings > This device > Theme*): artifact pages that use the
   usual `data-theme` attribute turn light or dark with it.
-- **Limits**: one report per request, up to 8 MiB; each send replaces it. It can be sent to a finished
+- **Limits**: one report per request, up to 16 MiB (an artifact's own limit); each send replaces it. It can be sent to a finished
   request too (that does not reopen it), and it is deleted with its request. While the board is
   unreachable, `taskctl report` queues it like any other write, and only the newest queued version is
   sent.
@@ -591,7 +599,7 @@ shapes, validation, errors and state rules, is the module docstring of
 | DELETE | `/api/requests/<rid>` | Delete a request and its tasks |
 | POST | `/api/requests/<rid>/complete` | Close it: `{status?: done\|failed, message?}` (cascades) |
 | POST, DELETE | `/api/requests/<rid>/attention` | Flag the request as waiting for input: `{message}`; clear it |
-| PUT, GET, DELETE | `/api/requests/<rid>/report` | The request's [report](#reports): `{format: html\|markdown, content, title?, artifact_url?}` (up to 8 MiB); read it with its content; delete it |
+| PUT, GET, DELETE | `/api/requests/<rid>/report` | The request's [report](#reports): `{format: html\|markdown, content, title?, artifact_url?}` (content up to 16 MiB); read it with its content; delete it |
 | GET | `/api/requests/<rid>/report/page` | The report as a page (sandboxed by its Content-Security-Policy), `?theme=light\|dark` |
 | POST | `/api/requests/<rid>/tasks` | Add tasks: `{title, start?}` or `{titles: [...]}` |
 | GET | `/api/tasks/<tid>` | One task |
@@ -619,6 +627,12 @@ curl -sS --noproxy '*' -X POST http://<board-host>:8765/api/tasks/k3m9qa-2/progr
 - **It listens on every interface.** By default it binds `0.0.0.0`. The socket is dual-stack, so it
   accepts IPv4 and IPv6 on one port, and falls back to IPv4 only when the host has no IPv6. Use
   `--host 127.0.0.1` to keep it on the local machine. The HTTPS listener, when on, binds the same way.
+- **Report pages have a port of their own**, `--port` + 1 (8766) by default, and its HTTPS twin on
+  `--tls-port` + 1 when HTTPS is on (`--report-port`, `--report-tls-port`, `TASKS_REPORT_PORT`,
+  `TASKS_REPORT_TLS_PORT`; `0` turns one off). It serves report pages and nothing else, so a report's
+  scripts get an origin where the board's API is not; a firewall must let the LAN reach it for reports to
+  show on other machines (`./tasks.sh` says so). If the default port is taken, the board starts anyway
+  and serves report pages from its own port, in an opaque origin.
 - **There is no authentication.** Anyone who can reach the port can read every request, create or
   close requests, delete them, and change the board-wide settings. Run it only on a trusted LAN.
   Never expose it to the internet. Never put secrets in titles or hints. HTTPS encrypts the traffic

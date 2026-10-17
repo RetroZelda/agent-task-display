@@ -29,6 +29,8 @@ unset TASKS_URL TASKS_HOST TASKS_PORT TASKS_DB TASKS_PUBLIC_URL TASKS_STRICT TAS
     TASKS_CONFIG TASKS_TLS_PORT TASKS_TLS_CERT TASKS_TLS_KEY TASKS_NO_UPDATE XDG_CACHE_HOME
 while read -r name; do unset "$name"; done < <(compgen -e | grep '^TASKS_')
 export TASKS_SPOOL_DIR="$TMP/spool"
+# No report port unless a check asks for one: its default (--port + 1) could take another scratch board's port.
+export TASKS_REPORT_PORT=0 TASKS_REPORT_TLS_PORT=0
 export PYTHONDONTWRITEBYTECODE=1
 
 PASS=0

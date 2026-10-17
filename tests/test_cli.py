@@ -581,9 +581,10 @@ def main_flow():
         rc, out, err = tc(*argv)
         check(f'report: {label}: a usage error (exit 2), nothing sent', rc == 2 and msg in err and out == '', (rc, err))
     big = WORK / 'big.html'
-    big.write_text('x' * (8 * 1024 * 1024 + 1))
+    big.write_text('x' * (16 * 1024 * 1024 + 1))
     rc, out, err = tc('report', rrid, str(big))
-    check('report: a file over the board\'s 8 MiB: a usage error before sending', rc == 2 and 'too large' in err, (rc, err))
+    check('report: a file over 16 MiB (an artifact page\'s limit): a usage error before sending', rc == 2
+          and 'too large: the board takes reports of up to 16 MiB' in err, (rc, err))
     big.unlink()
     check('the usage errors left the report as it was', api(URL, 'GET', f'/api/requests/{rrid}/report')[1]['version'] == 3)
     rc, out, err = tc('report', 'zzzzzz', str(html_file))

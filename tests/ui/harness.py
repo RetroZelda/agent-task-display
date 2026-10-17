@@ -15,6 +15,8 @@ Hooks:
   GET  /__backdate?rid=R&secs=N   moves request R's and its tasks' updated_at N seconds back (and drops
                            their ETAs), so it goes stale on the next poll
   POST /__settings_file    writes the posted bytes into the board's settings file, as a hand edit would
+  GET  /__fixture/NAME     $UI_FIXTURE_DIR/NAME (a base name) as text/html, unsandboxed: a page as claude.ai serves
+                           an artifact, to set the board's report page beside (tests/ui/artifact.js)
   GET  /__test/NAME.js     serves tests/ui/NAME.js
   A page URL with ?__test=NAME[&__wait=MS] is served with, injected: a shim at the top of <head>
   that records alert/confirm calls (confirm answers yes) and JS errors (and, as window.__themeFirst, when <html>
@@ -88,6 +90,7 @@ except ImportError:
     fake_ffmpeg = None
 
 RESULTS = Path(os.environ.get('UI_RESULTS_DIR') or Path(tempfile.gettempdir()) / 'tasks-ui-results')
+FIXTURES = Path(os.environ['UI_FIXTURE_DIR']) if os.environ.get('UI_FIXTURE_DIR') else None
 # The shim runs before the page's own script, which may rewrite the URL (a task id in the path is
 # replaced by its request's), so it keeps the test's query string for _lib.js.
 SHIM = r"""<script>
@@ -286,6 +289,12 @@ class Handler(server.Handler):
         if split.path == '/__slow':
             time.sleep(int(q.get('ms', ['4000'])[0]) / 1000)
             return self._raw(404, b'', 'text/plain')
+        if split.path.startswith('/__fixture/'):
+            name = os.path.basename(split.path[len('/__fixture/'):])
+            path = FIXTURES / name if FIXTURES and name else None
+            if not path or not path.is_file():
+                return self._raw(404, b'no such fixture', 'text/plain')
+            return self._raw(200, path.read_bytes(), 'text/html; charset=utf-8')
         if split.path == '/__result' and self.command == 'POST':
             data = self.rfile.read(int(self.headers.get('Content-Length', 0)))
             RESULTS.mkdir(parents=True, exist_ok=True)
