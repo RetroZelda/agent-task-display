@@ -1387,7 +1387,7 @@ def assert_panel(r, srv):
 
 STREAM_JSON = {'Content-Type': 'application/json'}
 STREAM_NAMES = ('layout', 'audio', 'held', 'swap', 'retry', 'multi', 'panel', 'hevc', 'player', 'fault', 'life', 'nav', 'offline', 'odd', 'check',
-                'layoutold', 'audioold', 'full')
+                'layoutold', 'audioold', 'full', 'pick')
 RESULTS_STREAM: dict = {}
 
 
@@ -1454,6 +1454,8 @@ def _stream_cases(boards, play):
     check_board = boards['check'].url
     ids = seed_v2(check_board)
     api(check_board, 'POST', '/api/stream', {'url': 'http://fake.invalid/hang'}, headers=STREAM_JSON)
+    # a request's page plays only its own stream: the detail check's request has one
+    api(check_board, 'PUT', f"/api/requests/{ids['task_wait']}/stream", {'url': 'http://fake.invalid/hang?for=detail'}, headers=STREAM_JSON)
     n_requests = len(api(check_board, 'GET', '/api/requests?limit=10')[1]['requests'])
     wait_rows = len(api(check_board, 'GET', f"/api/requests/{ids['task_wait']}")[1]['tasks'])
 
@@ -1463,7 +1465,7 @@ def _stream_cases(boards, play):
     cases = [frame_case('fault', 75000), frame_case('retry', 40000), frame_case('player', 40000), frame_case('offline', 40000),
              frame_case('layout', 36000), frame_case('nav', 30000), frame_case('life', 24000), frame_case('held', 30000),
              frame_case('swap', 22000), frame_case('hevc', 20000), frame_case('odd', 32000), frame_case('audio', 14000),
-             frame_case('multi', 14000), frame_case('panel', 30000), frame_case('full', 70000),
+             frame_case('multi', 14000), frame_case('panel', 30000), frame_case('full', 70000), frame_case('pick', 40000),
              # the same two scripts on boards read as a browser without dvh units reads them (Chrome before 108)
              ('streamlayoutold', boards['layoutold'].url, '/__frame', 1280, 'light', 'streamlayout', 36000, keep + '&__nodvh=1', (), 900),
              ('streamaudioold', boards['audioold'].url, '/__frame', 1280, 'light', 'streamaudio', 14000, keep + '&__nodvh=1', (), 900),
@@ -1496,6 +1498,7 @@ def _stream_cases(boards, play):
     assert_streamoffline(res['streamoffline'])
     assert_streamodd(res['streamodd'])
     assert_streamfull(res['streamfull'])
+    assert_streampick(res['streampick'])
     S.section('stream: the list and detail checks, repeated with a stream open')
     for name, theme, width, height, rows in (('stream_check_390', 'light', 390, 900, n_requests), ('stream_check_1280_dark', 'dark', 1280, 900, n_requests),
                                              ('stream_check_844x390', 'light', 844, 390, n_requests), ('stream_check_detail_390', 'light', 390, 900, wait_rows)):
@@ -1894,22 +1897,73 @@ def assert_streamnav(r):
     S.section('stream: reading position, deep links, Back, the deleted view')
     if not got('streamnav', r):
         return
-    check('nav: opening a stream keeps the reading position (the document at 300: the board at 300, the document at 0); closing it moves it back',
-          r['before'] == {'doc': 300, 'board': 0} and r['streaming']['doc'] == 0 and r['streaming']['board'] == 300 and r['streaming']['boardScrollH'] > r['streaming']['boardH']
+    check('nav: opening a stream keeps the reading position (the document at 300: the board at 300, plus the board stream\'s checkbox bar above the '
+          'rows, the document at 0); closing it moves it back',
+          r['before'] == {'doc': 300, 'board': 0} and r['streaming']['doc'] == 0 and r['streaming']['bar'] > 0
+          and abs(r['streaming']['board'] - 300 - r['streaming']['bar']) <= 1 and r['streaming']['boardScrollH'] > r['streaming']['boardH']
           and r['closed'] == {'doc': 300, 'board': 0}, (r['before'], r['streaming'], r['closed']))
     h = r['hash']
     check('nav: a #task deep link scrolls the task into view inside the board (not the document) and marks it', h['streaming'] and h['doc'] == 0 and h['board'] > 0 and h['target']
           and h['row']['y'] >= h['boardRect']['y'] - 1 and h['row']['y'] + h['row']['h'] <= h['boardRect']['y'] + h['boardRect']['h'] + 1, h)
-    check('nav: to a request and Back: the board\'s scroll position is back (400), the stream still on', r['listScroll'] == 400 and r['detail']['path'].startswith('/r/')
-          and r['detail']['streaming'] and r['back']['path'] == '/' and r['back']['board'] == 400 and r['back']['streaming'] and r['back']['doc'] == 0, (r['listScroll'], r['back']))
+    check('nav: to a request with no stream of its own: its page has no pane (the list\'s stream is not its own)', r['detail']['path'].startswith('/r/')
+          and r['detail']['streaming'] is False and r['detail']['hidden'] is True, r['detail'])
+    check('nav: ...and Back: the list\'s stream again, and the board\'s scroll position is back (400)', r['listScroll'] == 400
+          and r['back']['path'] == '/' and r['back']['board'] == 400 and r['back']['streaming'] and r['back']['doc'] == 0, (r['listScroll'], r['back']))
+    o = r['own']
+    check('nav: a request\'s own stream on its page: the timer counts on the board\'s clock (the browser\'s is an hour fast)',
+          o['streaming'] and o['line'] == 'connecting to http://fake.invalid/hang?for=small...' and secs(o['later']) is not None
+          and secs(o['later']) - secs(o['first']) >= 1 and secs(o['later']) < 60, o)
     d = r['deleted']
-    check('nav: a request deleted behind the page: the deleted view keeps the pane, and its timer counts on the board\'s clock (the browser\'s is an hour fast)',
-          d['title'] == 'This request was deleted.' and d['streaming'] and d['line'] == 'connecting to http://fake.invalid/hang...' and secs(d['later']) is not None
-          and secs(d['later']) - secs(d['first']) >= 1 and secs(d['later']) < 60, d)
+    check('nav: that request deleted behind the page: its stream goes with it, and so does the pane', d['title'] == 'This request was deleted.'
+          and d['streaming'] is False and d['hidden'] is True and None in d['left'] and r['ids']['small'] not in d['left'], d)
     u = r['unknown']
-    check('nav: a request that never existed: the same, and the timer is right with that clock too', u['title'] == 'Request not found' and u['streaming'] and secs(u['timer']) is not None
-          and secs(u['timer']) < 60, u)
+    check('nav: a request that never existed: no pane, though the board\'s own stream is open', u['title'] == 'Request not found' and u['streaming'] is False, u)
     check('nav: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+def assert_streampick(r):
+    S.section("stream: the requests' streams, and the one the list plays")
+    if not got('streampick', r):
+        return
+    ids, sids = r['ids'], r['sids']
+    check('pick: a request stream opens with PUT (201 for A and B), the board\'s own with POST', (r['putA'], r['putB'], r['own']) == (201, 201, 201)
+          and set(sids) == {ids['a'], ids['b'], 'own'}, (r['putA'], r['putB'], r['own'], sids))
+    a = r['auto']
+    check('pick: the list marks A and B (live) with a checkbox, C with none, and the board\'s own above the rows',
+          a['picks']['c'] is None and a['picks']['a']['text'] == 'Stream: live' and a['picks']['a']['state'] == 'live' and a['picks']['b']['text'] == 'Stream: live'
+          and a['picks']['own'] is not None and a['picks']['own']['text'] == 'Board stream: live', a['picks'])
+    check('pick: none picked yet: the board\'s own plays (fragments marked O), and only its box is checked',
+          a['stored'] is None and a['pane']['state'] == 'video' and a['marker'] == 'O' and a['picks']['own']['on'] and not a['picks']['a']['on'] and not a['picks']['b']['on'], a)
+    c, pa = r['clickedA'], r['pickedA']
+    check("pick: A's checkbox: checked at once (the board's own unchecked), kept in this browser, and the row's link not followed",
+          c['path'] == '/' and c['picks']['a']['on'] and not c['picks']['own']['on'] and c['stored'] == ids['a'] and pa['path'] == '/', (c, pa['path']))
+    check("pick: ...A plays (fragments marked A); the board counts A's viewer and none for the others", pa['pane']['state'] == 'video' and pa['marker'] == 'A'
+          and pa['picks']['a']['on'] and not pa['picks']['b']['on'] and r['viewersA'] == {ids['a']: 1, ids['b']: 0, 'own': 0}, (pa['marker'], pa['picks'], r['viewersA']))
+    n = r['none']
+    check("pick: A's label clicked again: unchecked, and no stream plays (no pane, the board takes the window)", n['path'] == '/' and n['stored'] == 'none'
+          and n['pane']['streaming'] is False and n['pane']['hidden'] is True and n['pane']['videos'] == 0
+          and not any(n['picks'][k]['on'] for k in ('a', 'b', 'own')), n)
+    b = r['pickedB']
+    check("pick: B's checkbox: B plays", b['marker'] == 'B' and b['pane']['state'] == 'video' and b['picks']['b']['on'] and b['stored'] == ids['b'], (b['marker'], b['picks']))
+    o, fo = r['otherB'], r['followed']
+    check('pick: another tab of this browser plays the same pick, and a pick made there is followed here', o['marker'] == 'B' and o['picks']['b']['on']
+          and fo['g']['stored'] == 'board' and fo['f']['marker'] == 'O' and fo['f']['picks']['own']['on'] and not fo['f']['picks']['b']['on'], (o['marker'], fo))
+    pg = r['pageA']
+    check("pick: A's page plays A's own stream (the list's pick is B)", pg['path'] == f"/r/{ids['a']}" and pg['streaming']
+          and pg['fetch'] and set(pg['fetch']) == {sids[ids['a']]} and pg['line'] in ('', 'connecting to http://fake.invalid/live?marker=A...'), pg)
+    bk = r['backB']
+    check('pick: Back to the list: the pick (B) plays again', bk['path'] == '/' and bk['marker'] == 'B' and bk['picks']['b']['on'] and bk['stored'] == ids['b'],
+          (bk['path'], bk['marker'], bk['picks']))
+    pc = r['pageC']
+    check("pick: C's page: no stream at all (C has none of its own)", pc['path'] == f"/r/{ids['c']}" and pc['streaming'] is False and pc['hidden'] is True
+          and pc['fetch'] == [], pc)
+    fb = r['fallback']
+    check("pick: B's stream closed: its checkbox goes and the board's own plays, checked; the pick of B is kept for when it is back", r['closeB'] is True
+          and fb['picks']['b'] is None and fb['marker'] == 'O' and fb['picks']['own']['on'] and fb['stored'] == ids['b'], (fb['picks'], fb['marker'], fb['stored']))
+    fa = r['finishedA']
+    check("pick: A completed: its stream ends with it (none in its reply, only the board's own left) and its finished row has no checkbox",
+          r['doneA'] is None and r['streamsLeft'] == [None] and fa['picks']['a'] is None and fa['marker'] == 'O', (r['doneA'], r['streamsLeft'], fa['picks']))
+    check('pick: no JS errors', r['errors'] == [[]], r['errors'])
 
 
 def assert_streamoffline(r):

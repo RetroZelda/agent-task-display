@@ -21,9 +21,10 @@ one `curl` line.
   override them. Browsers on other machines need the optional [HTTPS listener](#https-for-notifications).
 - **Reports**: a request can carry a report, the same HTML page an agent publishes as a Claude
   artifact (or Markdown), shown on a page of its own on every device. See [Reports](#reports).
-- **Live stream**: one API call shows a network video or audio stream (a camera, an encoder) beside the
-  dashboard on every open page, below it on a portrait screen and to its right on a landscape one. See
-  [Live stream](#live-stream).
+- **Live streams**: an agent can attach a network video or audio stream (a camera, an encoder) to its request,
+  and the board can have one of its own. A request's page plays its stream; the request list marks the
+  requests that have one and lets each device pick the one that plays beside it. The stream sits below the
+  dashboard on a portrait screen and to its right on a landscape one. See [Live stream](#live-stream).
 - **Works offline**: when the board is unreachable, `taskctl` queues the reports on the agent's machine
   and replays them, with their original times, once the board is back.
 - **Keeps agents current**: when the board's agent instructions change, every installed `taskctl`
@@ -273,7 +274,8 @@ The full wording, including the template for agents that register themselves, is
   row of its own under the rest). It runs on the board's clock as the page last heard it, so a device whose
   clock is wrong still shows the right time. Hover it for the zone. **Settings > This device > Clock** can
   switch a device to its own clock and zone. A board too old to report its zone shows no board clock.
-- While a [live stream](#live-stream) is open, the dashboard shares the window with it and scrolls on its own.
+- While a [live stream](#live-stream) plays, the dashboard shares the window with it and scrolls on its own. A
+  request that has one shows a *Stream* checkbox on its row; the checked one plays beside the list.
 
 ## Notifications and settings
 
@@ -428,23 +430,37 @@ agent sends the file it published.
 
 ## Live stream
 
-The board can play one network stream, video and audio, beside the dashboard on every open page, for
-a camera, an encoder or a screen capture on your network that you want to watch next to the agents'
-work. Open it with one call from any machine (`taskctl api POST /api/stream '{"url": "..."}'` does the
-same):
+The board can play network streams, video and audio, beside the dashboard, for a camera, an encoder or a
+screen capture on your network that you want to watch next to the agents' work: one for each running
+request, attached by the agent working on it, and one of the board's own. An agent attaches one to its
+request with `taskctl stream`, the board's own is one call from any machine:
 
 ```sh
+taskctl stream k3m9qa 'rtsp://printer-cam:8554/live'     # this request's stream (prints its page)
+taskctl stream k3m9qa                                    # what it is, and its state
+taskctl stream k3m9qa --close                            # close it (it also ends with the request)
+
 curl -sS --noproxy '*' -X POST http://<board-host>:8765/api/stream \
-  -H 'Content-Type: application/json' -d '{"url": "http://dell-cachyos:8554/"}'
-curl -sS --noproxy '*' http://<board-host>:8765/api/stream                  # what is open, and its state
+  -H 'Content-Type: application/json' -d '{"url": "http://dell-cachyos:8554/"}'     # the board's own
+curl -sS --noproxy '*' http://<board-host>:8765/api/stream                  # it, and every open stream
 curl -sS --noproxy '*' -X DELETE http://<board-host>:8765/api/stream        # close it
 ```
 
-A newer URL replaces the open one; posting the open URL again keeps it and retries at once. The URL is
+- **Which one plays**: a request's page plays that request's stream, and no stream when it has none. The
+  request list marks each request that has one with a *Stream: live* (or *connecting*) checkbox, and the
+  board's own with a *Board stream* checkbox above the rows: the checked one plays beside the list, one at a
+  time, and unchecking it plays none. Until a device picks one, the board's own plays (else the newest), and
+  while the picked one is closed the same fallback applies. The pick is per device, kept in the browser, and
+  other tabs of that browser follow it. Going to a request and back to the list plays the pick again.
+- **A request's stream** needs a running request (a closed one is refused) and ends when the request is
+  completed, by its agent, the dashboard or expiry, or deleted; reopening the request does not bring it back.
+  One per request: a newer URL replaces it. At most 8 streams are open at once, the board's own included.
+
+A newer URL replaces the open one; sending the open URL again keeps it and retries at once. The URL is
 http, https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp, and it is the *board host* that connects to it,
 so the name must resolve and be reachable from there.
 
-- **How it plays**: the board host runs one `ffmpeg` for the open stream. The video is copied as it is,
+- **How it plays**: the board host runs one `ffmpeg` for each open stream. The video is copied as it is,
   the audio becomes AAC stereo, and the result goes to every page as fragmented MP4, which browsers play
   with Media Source Extensions. No library and no transcoding of the picture, so it costs the board host
   a few percent of one core, and the network the stream's bitrate for each open page (the source itself
@@ -459,7 +475,7 @@ so the name must resolve and be reachable from there.
   window, in portrait or landscape, with the dashboard hidden behind it. The same button, or Escape, brings
   the split back. It is for that one page only: it is not saved, other pages and devices keep their
   split, and reloading the page starts in the split again. It also ends with the stream: when the stream
-  is closed or replaced, or its source drops and the board starts it again, the page goes back to the
+  is closed or replaced, another one is picked, or its source drops and the board starts it again, the page goes back to the
   split, so a stream that comes back appears at half the window. A hiccup on that one device, where the
   page reconnects while the board's stream runs on, keeps it full screen.
 - **Sound**: browsers keep sound off until you have clicked or tapped the page once, so a page that opened
@@ -485,9 +501,9 @@ so the name must resolve and be reachable from there.
 - **Trouble**: a run of `ffmpeg` that fails or ends starts again after 1, 2, 4, 8 and then every 10
   seconds, and the pane keeps showing *connecting* with its timer. The reason (`Connection refused`, `Server
   returned 404`, `ffmpeg is not installed on the board host`) is the `error` of `GET /api/stream`. A source that announces audio
-  but never sends it, or stops sending it, is played without audio. The open stream is saved in
-  `tasks/data/tasks.stream.json` and reopens when the board restarts; only `DELETE` closes it.
-- **Limits**: 16 pages at a time; a tab that has been in the background for a minute lets go of the stream
+  but never sends it, or stops sending it, is played without audio. The open streams are saved in
+  `tasks/data/tasks.stream.json` and reopen when the board restarts (a request's only while the request runs).
+- **Limits**: 16 pages at a time for each stream; a tab that has been in the background for a minute lets go of the stream
   and reconnects when you come back. `ffprobe http://<board-host>:8765/api/stream/media` shows what the pages
   receive.
 
@@ -511,6 +527,7 @@ The installed CLI is `~/.claude/skills/task-status/taskctl`. From a clone, it is
 | `flush` | Replay the [offline queue](#offline-queue) now. |
 | `run TID [--every SEC] [--percent-regex RE] -- CMD...` | Run a command and report its output as it goes (below). |
 | `report RID FILE [--title T] [--artifact URL] [--format F]` | Send the request's [report](#reports): HTML or Markdown (`-` reads stdin, with `--format html` or `markdown`). Prints its page. `--delete` removes it. |
+| `stream RID [URL] [--close]` | Attach a network stream to the request (its page plays it; a newer URL replaces it). Prints its page. Alone: shows it. `--close` closes it. |
 | `usage` | Print the board's instructions for agents (`/api/usage`). |
 | `api METHOD PATH [JSON]` | Call any board route (`PATH` starts with `/api/`) and print the response body. |
 | `changelog` | Print what each board version added (`/api/changelog`). |
@@ -601,18 +618,19 @@ shapes, validation, errors and state rules, is the module docstring of
 | POST, DELETE | `/api/requests/<rid>/attention` | Flag the request as waiting for input: `{message}`; clear it |
 | PUT, GET, DELETE | `/api/requests/<rid>/report` | The request's [report](#reports): `{format: html\|markdown, content, title?, artifact_url?}` (content up to 16 MiB); read it with its content; delete it |
 | GET | `/api/requests/<rid>/report/page` | The report as a page (sandboxed by its Content-Security-Policy), `?theme=light\|dark` |
+| PUT, GET, DELETE | `/api/requests/<rid>/stream` | The request's [live stream](#live-stream): open it (`{url}`, replacing its old one; a running request only), read it, close it |
 | POST | `/api/requests/<rid>/tasks` | Add tasks: `{title, start?}` or `{titles: [...]}` |
 | GET | `/api/tasks/<tid>` | One task |
 | POST | `/api/tasks/<tid>/progress` | `{message, percent?, eta_seconds?}` |
 | POST | `/api/tasks/<tid>/complete` | `{status?: done\|failed, message?}` |
 | POST, DELETE | `/api/tasks/<tid>/attention` | Flag one task as waiting for input: `{message}`; clear it |
-| GET | `/api/events` | The event log since a cursor, plus what is waiting, what is stale, the open stream and the board host's time zone (`clock`: `utc_offset` in seconds and `tz`; `?since=`, `?limit=`) |
+| GET | `/api/events` | The event log since a cursor, plus what is waiting, what is stale, the open streams (`stream`, the board's own, and `streams`, all of them) and the board host's time zone (`clock`: `utc_offset` in seconds and `tz`; `?since=`, `?limit=`) |
 | GET, PUT, DELETE | `/api/settings` | The board-wide notification settings and task order: read, change (`{settings: {...}}`), reset |
-| GET, POST, DELETE | `/api/stream` | The [live stream](#live-stream): read it, open one (`{url}`, replacing any open one), close it |
-| GET | `/api/stream/media` | The open stream as fragmented MP4, an endless response (`?id=`), which the dashboard plays; `&quality=light` or `stills` for a lighter copy |
+| GET, POST, DELETE | `/api/stream` | The board's own [live stream](#live-stream): read it (with every open stream), open it (`{url}`, replacing the open one), close it |
+| GET | `/api/stream/media` | An open stream as fragmented MP4, an endless response (`?id=`), which the dashboard plays; `&quality=light` or `stills` for a lighter copy |
 
 Requests and tasks have an `attention` field (`{message, since}` or null); a request also has
-`waiting` and `tasks_waiting`, and the list's counts have `waiting`. A write sent with the header
+`waiting`, `tasks_waiting` and `stream` (its open stream, or null), and the list's counts have `waiting`. A write sent with the header
 `X-Tasks-Replay: 1` and a body field `at` is recorded at that time (within the last 24 hours), which
 is how the offline queue keeps the original times.
 
@@ -645,7 +663,7 @@ curl -sS --noproxy '*' -X POST http://<board-host>:8765/api/tasks/k3m9qa-2/progr
 - **Agent text is shown as text.** Titles, hints, questions and messages are rendered as plain text,
   never as HTML, so a report cannot inject script. A Host header is built into the served files only
   if it is a plain `host[:port]`.
-- **A live stream makes the board connect out.** `POST /api/stream` makes the board host open the URL
+- **A live stream makes the board connect out.** `POST /api/stream` and `PUT /api/requests/<rid>/stream` make the board host open the URL
   it is given, and anyone who can reach the board can ask for that, so it can be pointed at other
   machines on the board host's network and its error text shows whether a port answered. Only
   http(s), rtsp(s), rtmp(s), srt, udp and tcp URLs are accepted, `ffmpeg` is started with file, pipe and
@@ -674,7 +692,7 @@ curl -sS --noproxy '*' -X POST http://<board-host>:8765/api/tasks/k3m9qa-2/progr
 ## Data and retention
 
 State lives in SQLite at `tasks/data/tasks.db`, next to the pidfiles, the settings file and, while a
-live stream is open, `tasks.stream.json`. The directory is gitignored. A database from an earlier version is upgraded in place on start.
+live stream is open, `tasks.stream.json` (every open stream). The directory is gitignored. A database from an earlier version is upgraded in place on start.
 `tasks.sh --bg` logs to `.logs/tasks_server.log`, which is also gitignored. These server flags
 control aging:
 

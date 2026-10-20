@@ -32,7 +32,8 @@ __t.run(async () => {
 
     // blocked (the media says hev1), then the same stream with codecs this browser plays: the block lifts
     await raw(JSON.stringify({ id: 'abc126', url: 'http://odd.invalid/h', state: 'live', video: 'hev1', audio: null, width: 320, height: 180 }));
-    await until(() => pane(f).title, 8000);
+    // (the old stream's media ends first, so the tooltip may say so for a moment, until the poll that brings the new one)
+    await until(() => /cannot play/.test(pane(f).title || ''), 8000);
     out.blocked = pane(f);
     await raw(JSON.stringify({ id: 'abc126', url: 'http://odd.invalid/h', state: 'live', video: 'avc1.42C01F', audio: 'mp4a.40.2', width: 320, height: 180 }));
     await until(() => pane(f).state === 'video', 12000);

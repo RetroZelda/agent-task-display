@@ -21,7 +21,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True  # no __pycache__ in the checkout, even when run without run_all.sh
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
 from harness import (TASKCTL_PY, TASKS, WRAPPER, ScratchServer, Suite, api, clean_env, docs_version,  # noqa: E402
-                     scratch_home, tasks_copy, tempdir, wait_until)
+                     fake_ffmpeg_dir, scratch_home, tasks_copy, tempdir, wait_until)
 
 S = Suite('cli')
 check = S.check
@@ -41,7 +41,7 @@ TASK_KEYS = {'id', 'request_id', 'seq', 'title', 'status', 'percent', 'message',
 REQUEST_KEYS = {'id', 'title', 'origin', 'status', 'message', 'created_at', 'updated_at', 'completed_at',
                 'elapsed', 'percent', 'tasks_total', 'tasks_done', 'tasks_failed', 'tasks_running',
                 'tasks_pending', 'tasks_cancelled', 'current', 'eta_at', 'stale', 'url', 'attention', 'waiting',
-                'tasks_waiting', 'report'}
+                'tasks_waiting', 'report', 'stream'}
 NUDGE = ('taskctl: task was never started; its running time is approximate - run `taskctl start TID` '
          'when you begin a task')
 
@@ -599,6 +599,47 @@ def main_flow():
     rc, out, err = tc('report', rrid, str(html_file), url='http://127.0.0.1:9', strict=False)
     check('report to an unreachable board: queued for replay (exit 0)', rc == 0 and 'queued for replay' in err and out == '', (rc, err))
 
+    S.section("stream: a request's live stream (the board's ffmpeg is the fake)")
+    rc, out, _ = tc('new', 'Stream via the CLI', '-t', 'watch')
+    srid = out.split()[0]
+    rc, out, err = tc('stream', srid)
+    check('stream RID, none open: says so on stderr, nothing on stdout', rc == 0 and out == '' and err == f'taskctl: {srid} has no stream\n', (rc, out, err))
+    rc, out, err = tc('stream', srid, 'http://fake.invalid/live')
+    check("stream RID URL: the request's page on stdout, a note that it opened (connecting)", rc == 0 and out == f'{URL}/r/{srid}\n'
+          and err == f'taskctl: stream of {srid} opened: http://fake.invalid/live, connecting\n', (rc, out, err))
+    live = wait_until(lambda: (api(URL, 'GET', f'/api/requests/{srid}/stream')[1]['stream'] or {}).get('state') == 'live', 8)
+    rc, out, err = tc('stream', srid)
+    check('stream RID: one line, its URL, live and its codecs', live and rc == 0 and out == 'http://fake.invalid/live, live (avc1.42C01F, mp4a.40.2)\n'
+          and err == '', (rc, out, err))
+    rc, out, err = tc('show', srid)
+    check('show: a stream line', rc == 0 and 'stream: http://fake.invalid/live, live (avc1.42C01F, mp4a.40.2)' in lines(out), out)
+    rc, out, err = tc('stream', srid, 'http://fake.invalid/live')
+    check('the same URL again: kept, and retried', rc == 0 and out == f'{URL}/r/{srid}\n' and 'kept, and retried' in err, (rc, err))
+    rc, out, err = tc('stream', srid, 'http://fake.invalid/hang')
+    sid = api(URL, 'GET', f'/api/requests/{srid}/stream')[1]['stream']
+    check('a newer URL replaces it', rc == 0 and 'opened: http://fake.invalid/hang, connecting' in err and sid['url'] == 'http://fake.invalid/hang', (rc, err, sid))
+    for label, args, msg in (('--close with a URL', ('stream', srid, 'http://fake.invalid/live', '--close'), 'stream RID --close takes no URL'),
+                             ('a task id', ('stream', f'{srid}-1', 'http://fake.invalid/live'), f'this command needs its request id {srid}')):
+        rc, out, err = tc(*args)
+        check(f'stream: {label}: a usage error (exit 2), nothing sent', rc == 2 and msg in err and out == '', (rc, err))
+    rc, out, err = tc('stream', srid, 'file:///etc/passwd')
+    check("stream: a URL the board does not open: rejected (exit 1 strict), the board's reason", rc == 1 and 'url scheme must be one of' in err, (rc, err))
+    rc, out, err = tc('stream', 'offline', 'http://fake.invalid/live')
+    check("stream: the 'offline' id: nothing sent, exit 0", rc == 0 and out == '' and 'nothing to report' in err, (rc, err))
+    rc, out, err = tc('stream', srid, '--close')
+    check('stream --close: closed', rc == 0 and err == f'taskctl: the stream of {srid} closed\n' and get_req(srid)['stream'] is None, (rc, err))
+    rc, out, err = tc('stream', srid, '--close')
+    check('stream --close again: says there was none', rc == 0 and err == f'taskctl: {srid} had no stream\n', (rc, err))
+    tc('stream', srid, 'http://fake.invalid/hang')
+    tc('done', srid)
+    check('done RID: the request\'s stream ends with it', get_req(srid)['stream'] is None
+          and all(x['request_id'] != srid for x in api(URL, 'GET', '/api/stream')[1]['streams']))
+    rc, out, err = tc('stream', srid, 'http://fake.invalid/hang')
+    check('stream on a closed request: rejected (exit 1 strict), the request is closed', rc == 1 and '409' in err and 'already done' in err, (rc, err))
+    rc, out, err = tc('stream', srid, 'http://fake.invalid/hang', url='http://127.0.0.1:9', strict=False)
+    check('stream to an unreachable board: a warning, exit 0, nothing queued (it is not one of the queued writes)', rc == 0
+          and 'unreachable' in err and 'queued' not in err and out == '', (rc, err))
+
 
 def run_signals():
     S.section('run: signals and a request closed mid-run')
@@ -842,8 +883,9 @@ def served_files():
 
 
 if __name__ == '__main__':
+    fakebin = fake_ffmpeg_dir(TMP)    # the stream checks: the board's ffmpeg is the fake, which reaches no host
     server = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', str(STALE_AFTER), '--expire-after', str(EXPIRE_AFTER),
-                           name='cli').start()
+                           name='cli', env=clean_env(PATH=f'{fakebin}{os.pathsep}{os.environ["PATH"]}')).start()
     URL = server.url
     try:
         main_flow()

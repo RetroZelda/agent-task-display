@@ -18,6 +18,7 @@ allowed-tools:
   - Bash(${CLAUDE_SKILL_DIR}/taskctl changelog *)
   - Bash(${CLAUDE_SKILL_DIR}/taskctl api *)
   - Bash(${CLAUDE_SKILL_DIR}/taskctl report *)
+  - Bash(${CLAUDE_SKILL_DIR}/taskctl stream *)
 ---
 
 # Task status board
@@ -125,7 +126,25 @@ ${CLAUDE_SKILL_DIR}/taskctl ask k3m9qa-3 'Waiting for your OK to deploy to stagi
 - A waiting request is never marked stale or expired, so it can wait as long as the user needs.
 - Only for the user. Waiting for a build, a download or a subagent is progress, not `ask`.
 
-## 6. Close everything, including on failure
+## 6. Show a live stream on the request's page
+
+Only when your user asks for it (a camera on a printer, a test rig's screen), attach a network video
+or audio stream to your request. The board relays it, its page shows it beside the tasks, and the
+request list marks it so the user can pick it to watch there.
+
+```
+${CLAUDE_SKILL_DIR}/taskctl stream k3m9qa 'rtsp://camera.lan:8554/live'
+${CLAUDE_SKILL_DIR}/taskctl stream k3m9qa --close
+```
+
+- The URL is http, https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp, and the board connects to it from
+  its own host, so it must be reachable from there. stdout is the request's page; stderr says whether
+  the stream is live. `stream k3m9qa` alone shows it, and `show` has a line for it.
+- One stream per request: a newer URL replaces it. It ends when the request is closed or deleted, so
+  close the stream yourself only when the user no longer wants it during the work.
+- It needs a running request (a closed one is refused) and is not queued while the board is unreachable.
+
+## 7. Close everything, including on failure
 
 ```
 ${CLAUDE_SKILL_DIR}/taskctl done k3m9qa-1 'Synced 3 repos'
@@ -145,7 +164,7 @@ ${CLAUDE_SKILL_DIR}/taskctl fail k3m9qa 'Built fine, the staging upload was reje
 - Closing twice is harmless. Progress on a closed task is refused (a warning, nothing else). If the
   user asks for more work after you closed the request, `add` tasks to it: that reopens it.
 
-## 7. Send your report to its request
+## 8. Send your report to its request
 
 When you write a report for work tracked on the board and publish it as a Claude artifact (or hand it
 to the user as a document), also send the very same file to its request, so the board shows exactly
@@ -166,14 +185,14 @@ ${CLAUDE_SKILL_DIR}/taskctl report k3m9qa findings.md --title 'Migration finding
 - A request has one report: each send replaces it (up to 16 MiB), and `--delete` removes it. It works on
   a closed request too, and is queued like the other writes while the board is unreachable.
 
-## 8. Status questions
+## 9. Status questions
 
 When the user asks for a status report, progress or how it is going, run
 `${CLAUDE_SKILL_DIR}/taskctl show k3m9qa` (or `show k3m9qa-2` for one task), summarize it and include
 the page link. If you lost the id, `${CLAUDE_SKILL_DIR}/taskctl list` shows every running request
 (`list --all` adds the 20 most recently finished ones). Answer from the board, not from memory.
 
-## 9. Staying current
+## 10. Staying current
 
 The board gains features over time, and taskctl keeps this skill in step with it. When the board's
 agent instructions change, the next taskctl command that talks to this skill's own board updates this
@@ -200,7 +219,7 @@ taskctl: re-read DIR/SKILL.md before continuing; the copy loaded in your context
   `TASKS_URL` never changes the skill (taskctl says so in a note), and `update` refuses another board
   unless the user wants the skill moved there (`--force`).
 
-## 10. If the board is unreachable
+## 11. If the board is unreachable
 
 If taskctl prints `taskctl: warning: board unreachable at URL (REASON); queued for replay (N queued)`,
 keep working. Do not retry, debug or restart the board; mention it once in your final reply.
@@ -217,7 +236,7 @@ keep working. Do not retry, debug or restart the board; mention it once in your 
 - `${CLAUDE_SKILL_DIR}/taskctl ping` checks the board and says how many reports are queued;
   `${CLAUDE_SKILL_DIR}/taskctl flush` replays them now. The queue outlives your session.
 
-## 11. Workflows and subagents
+## 12. Workflows and subagents
 
 Workflow scripts have no network access, and a subagent may not have this skill loaded. So you, the
 orchestrator, create the request and one task per planned agent before launching them, and each agent
@@ -292,6 +311,7 @@ you ran `new`, pass its ids on anyway; the agents' reports queue on this machine
 | `flush` | replay the reports queued while the board was unreachable |
 | `run TID [--every SEC] [--percent-regex RE] -- CMD...` | run a command and report its output |
 | `report RID FILE [--title T] [--artifact URL]` | send the request's report (HTML or Markdown, `-` for stdin); prints its page; `--delete` removes it |
+| `stream RID [URL] [--close]` | show a network video stream on the request's page (only when your user asks); prints the page; alone: shows it |
 | `usage` | the board's full HTTP API reference |
 | `api METHOD PATH ['JSON']` | call any board route; prints the response body |
 | `changelog` | what each board version added |

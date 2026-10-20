@@ -1199,10 +1199,11 @@ def cmd_show(board: Board, args) -> int:
         emit([task_line(t, t.get('now'))] + waiting_lines(t, ''))
         return 0
     r = board.call('GET', '/api/requests/%s' % v)
-    report = r.get('report')
+    report, stream = r.get('report'), r.get('stream')
     emit([request_line(r)] + waiting_lines(r, '') + ['page: %s' % r.get('url')]
          + (['report: %s (%s, %s, version %s)' % (report.get('url'), report.get('format'), size_text(report.get('size')),
-                                                  report.get('version'))] if isinstance(report, dict) else []))
+                                                  report.get('version'))] if isinstance(report, dict) else [])
+         + (['stream: %s' % stream_text(stream)] if isinstance(stream, dict) else []))
     for t in r.get('tasks') or []:
         emit(['  ' + task_line(t, r.get('now'))] + waiting_lines(t, '    '))
     return 0
@@ -1274,6 +1275,49 @@ def cmd_report(board: Board, args) -> int:
         raise
     emit([r.get('url') or '%s/r/%s/report' % (board.base, v)])
     note('report of %s saved (%s, %s, version %s)' % (v, r.get('format'), size_text(r.get('size')), r.get('version')))
+    return 0
+
+
+def stream_text(s: dict) -> str:
+    """A stream object as one line: its URL, its state and why it is not live (when the board knows)."""
+    state = s.get('state') or '?'
+    if state == 'live':
+        tracks = ', '.join(str(c) for c in (s.get('video'), s.get('audio')) if c)
+        state += ' (%s)' % tracks if tracks else ''
+    elif s.get('error'):
+        state += ': %s' % s.get('error')
+    return '%s, %s' % (s.get('url'), state)
+
+
+def cmd_stream(board: Board, args) -> int:
+    v = need_id(args.rid, 'request')
+    path = '/api/requests/%s/stream' % v
+    if args.close and args.url:
+        raise UsageError('stream RID --close takes no URL')
+    if skip_offline(v):
+        return 0
+    try:
+        if args.close:
+            r = board.call('DELETE', path)
+        elif args.url:
+            r = board.call('PUT', path, {'url': args.url.strip()})
+        else:
+            r = board.call('GET', path)
+    except BoardError as e:
+        if e.status == 404 and 'no route' in str(e):
+            raise BoardError('this board shows no request streams (it runs an older version): %s' % e, False, status=404)
+        raise
+    s = r.get('stream')
+    if args.close:
+        note('the stream of %s closed' % v if r.get('closed') else '%s had no stream' % v)
+    elif args.url:
+        emit(['%s/r/%s' % (board.base, v)])
+        note('stream of %s %s: %s' % (v, 'kept, and retried' if r.get('existing') else 'opened',
+                                     stream_text(s) if isinstance(s, dict) else '?'))
+    elif isinstance(s, dict):
+        emit([stream_text(s)])
+    else:
+        note('%s has no stream' % v)
     return 0
 
 
@@ -1651,6 +1695,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--artifact', metavar='URL', help='the Claude artifact it replicates, linked from its page')
     p.add_argument('--format', choices=sorted(REPORT_FORMATS), help='when FILE has no .html or .md extension')
     p.add_argument('--delete', action='store_true', help="delete the request's report")
+    p = command('stream', cmd_stream, "show a network video stream on a request's page: stream RID URL; prints the page")
+    p.add_argument('rid')
+    p.add_argument('url', nargs='?', metavar='URL', help='http, https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp; '
+                                                         'without it: show the stream')
+    p.add_argument('--close', action='store_true', help="close the request's stream")
     p = command('run', cmd_run, 'run CMD and report its latest output line: run TID -- CMD...')
     p.usage = '%(prog)s [-h] [--every SEC] [--percent-regex RE] TID -- CMD...'
     p.add_argument('tid')

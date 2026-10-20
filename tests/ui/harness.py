@@ -60,11 +60,13 @@ The live stream (tests/ui/stream*.js, tests/lib/fake_ffmpeg.py as the board's ff
                            supports, srcs, loads, opens, inits; hold (the playhead stands still), refuseUnmute,
                            failNext = 'quota', fail(), resizeTo(w, h), endStreaming(), startStreaming(), snap()
   GET  /__stream?url=U[&state=live][&ago=S][&error=T][&id=ID][&shown=URL][&video=C][&audio=C][&viewers=N]
-                           makes /api/events carry this stream object, in place of the board's own (U is a
+                           makes /api/events carry this stream object as the board's own ("stream", and the one
+                           stream of "streams"), in place of every stream the board has open (U is a
                            tests/lib/fake_ffmpeg.py URL; live sets the codecs and the size from it), and serves
                            its media at /api/stream/media for as long as it is injected. /__stream?off=1 ends it.
-                           /__stream?raw=<json>[&src=U] injects that JSON itself as the "stream" (raw=missing:
-                           no such key, as an older board answers): what a page must cope with
+                           /__stream?raw=<json>[&src=U] injects that JSON itself as the "stream" and the one item
+                           of "streams" (raw=missing: neither key, as a board older than streams answers): what a
+                           page must cope with
   __shot=1                 (read by _lib.js) __t.cleanup() leaves the frames and the stream as they are, so the
                            screenshot shows them (test_ui.py passes it when UI_SHOTS_DIR is set)
 """
@@ -203,11 +205,13 @@ class Handler(server.Handler):
         injected = STREAM[0]
         split = urlsplit(self.path)
         if code == 200 and split.path.rstrip('/') == '/api/events':
-            if injected is not None:
+            if injected is not None:  # the board's own stream, as "stream" and the only one in "streams"
                 if injected['obj'] is MISSING:
                     payload.pop('stream', None)
+                    payload.pop('streams', None)
                 else:
                     payload['stream'] = injected['obj']
+                    payload['streams'] = [] if injected['obj'] is None else [injected['obj']]
             if parse_qs(split.query).get('__noclock'):
                 payload.pop('clock', None)
         super()._reply(code, payload)
@@ -235,7 +239,7 @@ class Handler(server.Handler):
         video = one('video') or (('hev1' if mode == 'hevc' else 'avc1.' + p.str('codec', '42c01f').upper()) if has_video else None)
         audio = one('audio') or ('mp4a.40.2' if live and p.flag('audio', True) else None)
         sid = one('id') or secrets.token_hex(6)
-        obj = {'id': sid, 'url': one('shown') or url, 'opened_at': now, 'state': 'live' if live else 'connecting',
+        obj = {'id': sid, 'request_id': None, 'url': one('shown') or url, 'opened_at': now, 'state': 'live' if live else 'connecting',
                'since': now - float(one('ago', 0)), 'error': one('error'), 'video': video, 'audio': audio,
                'width': p.int('w', 320) if video else None, 'height': p.int('h', 180) if video else None,
                'viewers': int(one('viewers', 0)), 'media': f'/api/stream/media?id={sid}'}

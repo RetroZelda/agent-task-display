@@ -616,7 +616,7 @@ def phase_api():
         S.section('/api/events: baseline, limit, truncated, pruned')
         s, h, b = call('GET', '/api/events')
         check('baseline: events [], cursor = the last id, keys in order', s == 200 and b['events'] == [] and b['truncated'] is False
-              and b['cursor'] > 0 and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'clock'], b)
+              and b['cursor'] > 0 and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'streams', 'clock'], b)
         top = b['cursor']
         s, h, b = call('GET', f'/api/events?since={top - 5}&limit=2')
         check('limit 2: two events, truncated, cursor = the last returned', [x['id'] for x in b['events']] == [top - 4, top - 3]

@@ -28,6 +28,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -53,7 +54,7 @@ scratch_home(TMP)
 PATH = os.environ.get('PATH', '')
 EVIL = {'Origin': 'http://evil.example'}
 ID_RE = re.compile(r'[0-9a-f]{12}')
-STREAM_KEYS = ['id', 'url', 'opened_at', 'state', 'since', 'error', 'video', 'audio', 'width', 'height', 'viewers', 'media']
+STREAM_KEYS = ['id', 'request_id', 'url', 'opened_at', 'state', 'since', 'error', 'video', 'audio', 'width', 'height', 'viewers', 'media']
 FAKE = 'http://fake.invalid'   # fake_ffmpeg.py reads its mode and parameters from such a URL (the host is never resolved)
 WHITELIST = 'http,https,tls,tcp,udp,rtp,rtsp,rtsps,rtmp,rtmps,srt,crypto'
 
@@ -893,26 +894,27 @@ def phase_api():
     call, docs = srv.call, docs_version()
     try:
         s, h, b = call('GET', '/api/stream')
-        check('GET /api/stream, nothing open: {now, stream: null, ffmpeg: the path of ffmpeg}', s == 200 and list(b) == ['now', 'stream', 'ffmpeg']
-              and b['stream'] is None
+        check('GET /api/stream, nothing open: {now, stream: null, streams: [], ffmpeg: the path of ffmpeg}', s == 200
+              and list(b) == ['now', 'stream', 'streams', 'ffmpeg'] and b['stream'] is None and b['streams'] == []
               and b['ffmpeg'] == str(srv.bin / 'ffmpeg') and abs(b['now'] - time.time()) < 5, b)
         check('...JSON, with both X-Tasks headers', h.get('content-type', '').startswith('application/json') and has_headers(h, docs), h)
         s, h, b = call('GET', '/api/events')
-        check('/api/events carries stream: null, then the clock', s == 200 and list(b)[-2:] == ['stream', 'clock'] and b['stream'] is None
-              and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'clock'], list(b))
+        check('/api/events carries stream: null and streams: [], then the clock', s == 200 and list(b)[-3:] == ['stream', 'streams', 'clock']
+              and b['stream'] is None and b['streams'] == []
+              and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'streams', 'clock'], list(b))
         s, h, b = call('GET', '/api/events?since=0')
-        check('...with a cursor too', s == 200 and list(b)[-2:] == ['stream', 'clock'], list(b))
+        check('...with a cursor too', s == 200 and list(b)[-3:] == ['stream', 'streams', 'clock'], list(b))
 
         t0, t = time.time(), time.monotonic()
         s, h, b = srv.post(f'{FAKE}/hang')
         took = time.monotonic() - t
         st = b.get('stream') or {}
         check('POST /api/stream: 201 at once, whatever the source does', s == 201 and took < 0.5, (s, took))
-        check('...the reply is {now, stream, ffmpeg, existing: false}; the stream has the twelve keys in order',
-              list(b) == ['now', 'stream', 'ffmpeg', 'existing']
+        check('...the reply is {now, stream, streams, ffmpeg, existing: false}; the stream has the thirteen keys in order',
+              list(b) == ['now', 'stream', 'streams', 'ffmpeg', 'existing'] and b['streams'] == [st]
               and b['existing'] is False and list(st) == STREAM_KEYS, (list(b), list(st)))
-        check('...12 hex digits of id, the URL, connecting, the timer base, nothing known yet, no viewers, the media path',
-              bool(ID_RE.fullmatch(st.get('id', ''))) and st['url'] == f'{FAKE}/hang' and st['state'] == 'connecting'
+        check('...12 hex digits of id, no request (the board\'s own), the URL, connecting, the timer base, nothing known yet, no viewers, the media path',
+              bool(ID_RE.fullmatch(st.get('id', ''))) and st['request_id'] is None and st['url'] == f'{FAKE}/hang' and st['state'] == 'connecting'
               and t0 - 1 <= st['opened_at'] <= time.time() + 1
               and abs(st['since'] - st['opened_at']) < 1 and st['error'] is None and st['video'] is None and st['audio'] is None
               and st['width'] is None
@@ -921,7 +923,8 @@ def phase_api():
         s, h, b = call('GET', '/api/stream')
         check('GET /api/stream shows the same object', s == 200 and b['stream'] == st, b)
         s, h, b = call('GET', '/api/events')
-        check('/api/events carries it, just before the clock', s == 200 and list(b)[-2] == 'stream' and b['stream'] == st, b.get('stream'))
+        check('/api/events carries it, and as the one stream of streams', s == 200 and list(b)[-3] == 'stream' and b['stream'] == st
+              and b['streams'] == [st], b.get('stream'))
         check('...and a hand-written spelling of the same URL is the same stream',
               srv.post('HTTP://fake.invalid/hang')[2]['stream']['id'] == st['id'])
 
@@ -930,7 +933,7 @@ def phase_api():
         time.sleep(0.3)
         check('the same URL again: 200, existing true, the same stream, nothing restarted', s == 200 and b['existing'] is True
               and b['stream']['id'] == st['id']
-              and list(b) == ['now', 'stream', 'ffmpeg', 'existing'] and len(srv.spawns()) == 1 and srv.kids() == [srv.spawns()[0]['pid']],
+              and list(b) == ['now', 'stream', 'streams', 'ffmpeg', 'existing'] and len(srv.spawns()) == 1 and srv.kids() == [srv.spawns()[0]['pid']],
               (s, b.get('existing'), srv.spawns()))
         s, h, b = srv.post(f'{FAKE}/hang?other=1')
         new = b.get('stream') or {}
@@ -943,7 +946,8 @@ def phase_api():
               (srv.kids(), srv.spawns()))
 
         s, h, b = call('DELETE', '/api/stream')
-        check('DELETE: 200 {now, stream: null, ffmpeg, closed: true}', s == 200 and list(b) == ['now', 'stream', 'ffmpeg', 'closed']
+        check('DELETE: 200 {now, stream: null, streams: [], ffmpeg, closed: true}', s == 200
+              and list(b) == ['now', 'stream', 'streams', 'ffmpeg', 'closed'] and b['streams'] == []
               and b['stream'] is None and b['closed'] is True and has_headers(h, docs), b)
         s, h, b = call('DELETE', '/api/stream')
         check('DELETE again: 200, closed false (idempotent)', s == 200 and b['closed'] is False and b['stream'] is None, b)
@@ -1018,7 +1022,7 @@ def phase_api():
             replies += [json.dumps(call('GET', '/api/stream')[2]), json.dumps(call('GET', '/api/events')[2]), json.dumps(srv.post(secret_url)[2])]
             check('...the state file holds the real URL (it must reopen the stream), readable by its owner only',
                   srv.stream_file.exists() and oct(srv.stream_file.stat().st_mode & 0o777) == '0o600'
-                  and json.loads(srv.stream_file.read_text())['url'] == secret_url,
+                  and [x['url'] for x in json.loads(srv.stream_file.read_text())['streams']] == [secret_url],
                   srv.stream_file.read_text() if srv.stream_file.exists() else 'no file')
             replies.append(json.dumps(call('DELETE', '/api/stream')[2]))
             check(f'...nowhere else: not in {len(replies)} replies, and not in the board log', all(secret not in text for text in replies)
@@ -1972,6 +1976,162 @@ def sc_rend_slow():
 
 # ---------------------------------------------------------------- fake: restarts, shutdown, load, HTTPS
 
+def phase_requests():
+    S.section("a request's stream: PUT, GET and DELETE /api/requests/<rid>/stream, and its end with the request")
+    srv = Board('requests', '--expire-after', '3').start()
+    call, docs = srv.call, docs_version()
+    J = {'Content-Type': 'application/json'}
+    new = lambda title: call('POST', '/api/requests', {'title': title, 'tasks': ['one']}, headers=J)[2]['id']  # noqa: E731
+    put = lambda rid, url, **kw: call('PUT', f'/api/requests/{rid}/stream', {'url': url}, **kw)  # noqa: E731
+    try:
+        rid = new('watch the printer')
+        s, h, b = call('GET', f'/api/requests/{rid}/stream')
+        check('GET, none open: {now, request_id, stream: null, ffmpeg}', s == 200 and list(b) == ['now', 'request_id', 'stream', 'ffmpeg']
+              and b['request_id'] == rid and b['stream'] is None and b['ffmpeg'] == str(srv.bin / 'ffmpeg') and has_headers(h, docs), b)
+        check('the request carries stream: null', call('GET', f'/api/requests/{rid}')[2]['stream'] is None)
+        t = time.monotonic()
+        s, h, b = put(rid, f'{FAKE}/live?marker=R')
+        st = b.get('stream') or {}
+        check('PUT: 201 at once {now, request_id, stream, ffmpeg, existing: false}; the stream names its request', s == 201
+              and time.monotonic() - t < 0.5 and list(b) == ['now', 'request_id', 'stream', 'ffmpeg', 'existing'] and b['existing'] is False
+              and list(st) == STREAM_KEYS and st['request_id'] == rid and st['url'] == f'{FAKE}/live?marker=R' and st['state'] == 'connecting', b)
+        live = wait_until(lambda: (call('GET', f'/api/requests/{rid}/stream')[2]['stream'] or {}).get('state') == 'live', 8)
+        check('...it goes live with its own ffmpeg', live and len(srv.kids()) == 1, srv.kids())
+        detail, lst = call('GET', f'/api/requests/{rid}')[2], call('GET', '/api/requests')[2]['requests']
+        ev, board = call('GET', '/api/events')[2], call('GET', '/api/stream')[2]
+        check("the request (detail and list), /api/events' streams and GET /api/stream's streams carry it; it is not the board's own",
+              detail['stream']['id'] == st['id'] and [r for r in lst if r['id'] == rid][0]['stream']['id'] == st['id']
+              and [x['id'] for x in ev['streams']] == [st['id']] and ev['stream'] is None
+              and board['stream'] is None and [x['id'] for x in board['streams']] == [st['id']], (detail['stream'], ev['streams'], board))
+        s, h, b = put(rid, 'HTTP://fake.invalid/live?marker=R')
+        check('the same URL again: 200, existing true, the same stream, nothing restarted', s == 200 and b['existing'] is True
+              and b['stream']['id'] == st['id'] and len(srv.spawns()) == 1, (s, b, srv.spawns()))
+        reader = stream_get(srv.port, f'/api/stream/media?id={st["id"]}')
+        check('its media, by its id: 200, fragmented MP4', reader.wait_headers(5) and reader.status == 200 and reader.wait_bytes(2000, 5),
+              (reader.status, len(reader.body)))
+        s, h, b = call('GET', '/api/stream/media')
+        check("media without an id, and no stream of the board's own: 404 naming the board's own", s == 404 and 'of its own' in b['error'], (s, b))
+
+        s, h, b = srv.post(f'{FAKE}/live?marker=O')
+        own = b['stream']
+        check("the board's own beside it: 201, request_id null, a second ffmpeg; the request's untouched", s == 201 and own['request_id'] is None
+              and wait_until(lambda: len(srv.kids()) == 2, 5) and call('GET', f'/api/requests/{rid}/stream')[2]['stream']['id'] == st['id'],
+              (b, srv.kids()))
+        ev = call('GET', '/api/events')[2]
+        check('/api/events: stream is the board\'s own, streams both, the first opened first', ev['stream']['id'] == own['id']
+              and [x['id'] for x in ev['streams']] == [st['id'], own['id']], ev['streams'])
+        s, h, b = put(rid, f'{FAKE}/live?marker=S')
+        st2 = b['stream']
+        check("a newer URL replaces the request's stream: 201, a new id; the old one's media ends and is a 410 now",
+              s == 201 and st2['id'] != st['id'] and reader.wait_closed(5) and call('GET', f'/api/stream/media?id={st["id"]}')[0] == 410,
+              (s, st2, reader.closed))
+        check('...still two ffmpegs: the replaced one is gone', wait_until(lambda: len(srv.kids()) == 2, 5), srv.kids())
+
+        S.section("a request's stream: validation, ids, the Origin guard")
+        s, h, b = put(rid + '-1', f'{FAKE}/live')
+        check('a task id: 400 with a hint naming its request', s == 400 and rid in b.get('hint', ''), b)
+        s, h, b = put('zzzzzz', f'{FAKE}/live')
+        check('an unknown request: 404', s == 404 and 'zzzzzz' in b['error'], b)
+        check('...also for GET and DELETE', call('GET', '/api/requests/zzzzzz/stream')[0] == 404
+              and call('DELETE', '/api/requests/zzzzzz/stream')[0] == 404)
+        s, h, b = put(rid, 'file:///etc/passwd')
+        check('a URL the board does not open: 400 with field url, nothing changed', s == 400 and b.get('field') == 'url'
+              and call('GET', f'/api/requests/{rid}/stream')[2]['stream']['id'] == st2['id'], b)
+        s, h, b = call('PUT', f'/api/requests/{rid}/stream', {})
+        check('no url: 400 with field url', s == 400 and b.get('field') == 'url', b)
+        s, h, b = call('PUT', f'/api/requests/{rid}/stream', {'url': f'{FAKE}/live?marker=S', 'colour': 'red'})
+        check('an unknown field: a warning, the stream kept', s == 200 and b['existing'] is True and any('colour' in w for w in b.get('warnings', [])), b)
+        s, h, b = call('PUT', f'/api/requests/{rid}/stream', {'url': f'{FAKE}/live?other=1'}, headers={'Origin': 'http://evil.example'})
+        check('a foreign Origin: 403, nothing changed', s == 403 and call('GET', f'/api/requests/{rid}/stream')[2]['stream']['id'] == st2['id'], (s, b))
+        check('POST is not the method: 405 naming PUT, GET and DELETE', call('POST', f'/api/requests/{rid}/stream', {'url': f'{FAKE}/live'})[0] == 405)
+
+        S.section("a request's stream ends with the request")
+        s, h, b = call('DELETE', f'/api/requests/{rid}/stream')
+        check('DELETE: 200 {now, request_id, stream: null, ffmpeg, closed: true}; its ffmpeg goes, the board\'s own stays', s == 200
+              and list(b) == ['now', 'request_id', 'stream', 'ffmpeg', 'closed'] and b['closed'] is True and b['stream'] is None
+              and wait_until(lambda: len(srv.kids()) == 1, 5) and srv.stream()['id'] == own['id'], (b, srv.kids()))
+        check('DELETE again: closed false (idempotent)', call('DELETE', f'/api/requests/{rid}/stream')[2]['closed'] is False)
+        put(rid, f'{FAKE}/hang?a=1')
+        s, h, b = call('POST', f'/api/requests/{rid}/complete', {'status': 'done'}, headers=J)
+        check('the request completed: its reply has stream null, the stream is gone from every list, its ffmpeg ends', s == 200 and b['stream'] is None
+              and [x['request_id'] for x in call('GET', '/api/events')[2]['streams']] == [None] and wait_until(lambda: len(srv.kids()) == 1, 5),
+              (b.get('stream'), srv.kids()))
+        s, h, b = put(rid, f'{FAKE}/hang?a=1')
+        check('a closed request takes none: 409 {error, status, hint}', s == 409 and b['status'] == 'done' and 'running request' in b['hint'], b)
+        check('...GET still answers, with null', call('GET', f'/api/requests/{rid}/stream')[2]['stream'] is None)
+        call('POST', f'/api/requests/{rid}/tasks', {'title': 'again'}, headers=J)
+        check('reopening the request (a task added) brings no stream back', call('GET', f'/api/requests/{rid}')[2]['stream'] is None)
+        other = new('a second request')
+        put(other, f'{FAKE}/hang?b=1')
+        s, h, b = call('DELETE', f'/api/requests/{other}')
+        check('a request deleted: its stream goes with it', s == 200 and all(x['request_id'] != other for x in call('GET', '/api/events')[2]['streams'])
+              and wait_until(lambda: len(srv.kids()) == 1, 5), srv.kids())
+        quiet = new('a request that goes quiet')
+        put(quiet, f'{FAKE}/hang?c=1')
+        expired = wait_until(lambda: call('GET', f'/api/requests/{quiet}')[2]['status'] == 'failed', 12)
+        check('a request that expires (--expire-after 3): its stream ends with it', expired
+              and wait_until(lambda: all(x['request_id'] != quiet for x in call('GET', '/api/events')[2]['streams']), 5)
+              and wait_until(lambda: len(srv.kids()) == 1, 5) and f'closed with request {quiet}' in srv.log_text(), srv.log_text()[-600:])
+
+        S.section('at most 8 streams at once')
+        rids = [new(f'camera {i}') for i in range(8)]
+        codes = [put(r, f'{FAKE}/hang?n={i}')[0] for i, r in enumerate(rids[:7])]
+        s, h, b = put(rids[7], f'{FAKE}/hang?n=7')
+        check("the board's own and 7 requests' open (201 each); an 8th request's is a 409 naming the limit", codes == [201] * 7 and s == 409
+              and '8 streams' in b['error'] and 'DELETE' in b.get('hint', ''), (codes, s, b))
+        check("...replacing one at the limit still works, and so does the board's own", put(rids[0], f'{FAKE}/hang?n=0b')[0] == 201
+              and srv.post(f'{FAKE}/hang?own=2')[0] == 201)
+        call('DELETE', '/api/stream')
+        check("...one closed: the 8th request's opens", put(rids[7], f'{FAKE}/hang?n=7')[0] == 201)
+        check('eight ffmpegs for eight streams', wait_until(lambda: len(srv.kids()) == 8, 8), len(srv.kids()))
+        reader.close()
+        for r in rids:
+            call('DELETE', f'/api/requests/{r}/stream')
+        check('all closed: no ffmpeg left, and the file is gone', wait_until(lambda: srv.kids() == [], 5) and not srv.stream_file.exists(),
+              (srv.kids(), srv.stream_file.exists()))
+    finally:
+        srv.stop()
+    no_traceback(srv, 'requests')
+
+    S.section("persistence: a request's stream reopens after a restart only while its request runs")
+    srv = Board('reqpersist').start()
+    port = srv.port
+    try:
+        keep, done = new_on(srv, 'keeps running'), new_on(srv, 'finishes while the board is down')
+        a = srv.call('PUT', f'/api/requests/{keep}/stream', {'url': f'{FAKE}/hang?k=1'})[2]['stream']
+        b2 = srv.call('PUT', f'/api/requests/{done}/stream', {'url': f'{FAKE}/hang?d=1'})[2]['stream']
+        own = srv.post(f'{FAKE}/hang?own=1')[2]['stream']
+        saved = json.loads(srv.stream_file.read_text())['streams']
+        check('the file holds the three, the first opened first, each with its request_id', [(x['id'], x['request_id']) for x in saved]
+              == [(a['id'], keep), (b2['id'], done), (own['id'], None)], saved)
+        srv.stop()
+        db = sqlite3.connect(str(srv.db))   # the request finished while the board was not running
+        db.execute("UPDATE requests SET status = 'done', completed_at = updated_at WHERE id = ?", (done,))
+        db.commit()
+        db.close()
+        text = srv.stream_file.read_text()
+        srv.stream_file.write_text(text.replace(']}', ', {"id": "abcdefabcdef", "request_id": "zzzzzz", "url": "http://fake.invalid/hang?gone=1", '
+                                                      '"opened_at": 1.0}]}'))
+        again = Board('reqpersist', port=port, fresh_db=False).start()
+        try:
+            streams = again.call('GET', '/api/stream')[2]['streams']
+            check("the next run: the running request's stream and the board's own reopen with their ids; the finished request's and an unknown "
+                  "request's do not", [(x['id'], x['request_id']) for x in streams] == [(a['id'], keep), (own['id'], None)]
+                  and again.log_text().count('no longer running') == 2, (streams, again.log_text()[-600:]))
+            check('...and the file is rewritten without them', [x['request_id'] for x in json.loads(again.stream_file.read_text())['streams']]
+                  == [keep, None] and oct(again.stream_file.stat().st_mode & 0o777) == '0o600')
+            check('...the request carries its stream again', again.call('GET', f'/api/requests/{keep}')[2]['stream']['id'] == a['id'])
+        finally:
+            again.stop()
+        no_traceback(again, 'reqpersist (second run)')
+    finally:
+        srv.stop()
+
+
+def new_on(board, title):
+    return board.call('POST', '/api/requests', {'title': title, 'tasks': ['one']}, headers={'Content-Type': 'application/json'})[2]['id']
+
+
 def phase_persistence():
     S.section('persistence: the open stream is kept and reopened by the next run of the board')
     srv = Board('persist').start()
@@ -1981,27 +2141,29 @@ def phase_persistence():
         s, h, b = srv.post(url)
         first = b['stream']
         stray = lambda: sorted(p.name for p in TMP.iterdir() if p.name.startswith('.persist') or p.name.endswith('.tmp'))  # noqa: E731
-        check('a saved stream: <db>.stream.json holds {id, url (the real one), opened_at}, mode 0600, nothing else beside it',
-              srv.stream_file.exists()
-              and json.loads(srv.stream_file.read_text()) == {'id': first['id'], 'url': url, 'opened_at': first['opened_at']}
+        saved = lambda: json.loads(srv.stream_file.read_text())['streams']  # noqa: E731
+        check('a saved stream: <db>.stream.json holds {"streams": [{id, request_id: null, url (the real one), opened_at}]}, mode 0600, '
+              'nothing else beside it', srv.stream_file.exists()
+              and json.loads(srv.stream_file.read_text()) == {'streams': [{'id': first['id'], 'request_id': None, 'url': url,
+                                                                           'opened_at': first['opened_at']}]}
               and oct(srv.stream_file.stat().st_mode & 0o777) == '0o600' and stray() == [],
               (srv.stream_file.read_text() if srv.stream_file.exists() else None, stray()))
         check('...it is named after the database (server.db -> server.stream.json)', srv.stream_file.name == 'persist.stream.json'
               and srv.stream_file.parent == srv.db.parent, srv.stream_file)
         s, h, b = srv.post(url + '&second=1')
         second = b['stream']
-        check('a replacing stream rewrites it, still 0600', json.loads(srv.stream_file.read_text())['id'] == second['id']
+        check('a replacing stream rewrites it, still 0600', [x['id'] for x in saved()] == [second['id']]
               and oct(srv.stream_file.stat().st_mode & 0o777) == '0o600'
               and stray() == [], srv.stream_file.read_text())
         s, h, b = srv.post(url + '&second=1')
-        check('the same URL again: the file is as it was', json.loads(srv.stream_file.read_text())['id'] == second['id'])
+        check('the same URL again: the file is as it was', [x['id'] for x in saved()] == [second['id']])
         pid = wait_until(lambda: (srv.spawns() or [{}])[-1].get('pid'), 5)
         before_log = srv.log_text()
         code = srv.stop()
         check('SIGTERM: exit 0, no pidfile, no ffmpeg left', code == 0 and not srv.pidfile.exists() and pid and wait_until(lambda: not alive(pid), 3),
               (code, pid))
         check('...and the file is still there (only DELETE removes it)', srv.stream_file.exists()
-              and json.loads(srv.stream_file.read_text())['id'] == second['id'])
+              and [x['id'] for x in saved()] == [second['id']])
         check('...nothing in the log about a failure', 'Traceback' not in before_log)
 
         again = Board('persist', port=port, fresh_db=False).start()
@@ -2069,6 +2231,26 @@ def phase_persistence():
     finally:
         srv.stop()
     srv.stream_file.chmod(0o600)
+    srv.stream_file.write_text(json.dumps({'streams': [{'url': good_url, 'id': '0123456789ab', 'opened_at': 1.5, 'request_id': None},
+                                                       {'url': 5, 'request_id': None}, ['a list'], {'url': good_url, 'request_id': 'NOT-AN-ID'},
+                                                       {'url': good_url + '?2', 'id': '0123456789ab', 'request_id': None}]}))
+    before = srv.stream_file.read_text()
+    srv.start()
+    try:
+        st = srv.call('GET', '/api/stream')[2]
+        check('a file of streams with bad entries: the good one opens, each bad one (no usable url, not an object, an id that is not a request\'s, '
+              'a second one for the board) is a warning', st['stream'] is not None and st['stream']['id'] == '0123456789ab' and len(st['streams']) == 1
+              and srv.log_text().count('an entry ignored') == 4 and 'a second stream for the board' in srv.log_text(), (st, srv.log_text()[-900:]))
+        check('...and the file is left as it was (nothing ended: only the bad entries were skipped)', srv.stream_file.read_text() == before)
+    finally:
+        srv.stop()
+    srv.stream_file.write_text(json.dumps({'streams': 5}))
+    srv.start()
+    try:
+        check('streams that is not a list: ignored with a warning', srv.call('GET', '/api/stream')[2]['streams'] == []
+              and 'stream file' in srv.log_text() and 'Traceback' not in srv.log_text(), srv.log_text()[-300:])
+    finally:
+        srv.stop()
     nof = Board('nofile', ffmpeg='none', port=srv.port, fresh_db=False)
     nof.stream_file.write_text(json.dumps({'url': good_url, 'id': '0123456789ab', 'opened_at': 1234.5}))
     nof.start()
@@ -2824,6 +3006,7 @@ if __name__ == '__main__':
               sc_stubborn, sc_garbage, sc_probe, sc_silent, sc_dropaudio, sc_firstkey, sc_nofmpeg, sc_media503, sc_schemes)
     run_group('the lighter qualities: one transcoder per quality, idle stop, the run ending, failures, slowness', sc_rend_basic, sc_rend_run,
               sc_rend_fail, sc_rend_slow, limit=150)
+    phase_requests()
     phase_persistence()
     phase_shutdown()
     phase_https()

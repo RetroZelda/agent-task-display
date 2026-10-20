@@ -25,7 +25,7 @@ echo "  (running the examples under $SH)"
 section "SKILL.md itself"
 check "no \$ARGUMENTS / \$0..\$9 in the body (Claude Code would substitute them)" bash -c '! grep -qE "\\\$ARGUMENTS|\\\$[0-9]" "$1"' _ "$SKILL"
 check "the front matter names the skill task-status" grep -qx 'name: task-status' "$SKILL"
-for sub in new add start progress ask resume done fail show list ping flush usage changelog api report; do
+for sub in new add start progress ask resume done fail show list ping flush usage changelog api report stream; do
     check "allowed-tools pre-approves $sub" grep -qxF "  - Bash(\${CLAUDE_SKILL_DIR}/taskctl $sub *)" "$SKILL"
 done
 check "allowed-tools does not pre-approve run" bash -c '! grep -q "taskctl run \*)" "$1"' _ "$SKILL"
@@ -96,7 +96,7 @@ check "bare ping" $SH -c "$DIR/taskctl ping >/dev/null 2>&1"
 
 section "every subcommand the Commands table names exists"
 subs="$(grep '^| `' "$SKILL" | grep -o '`[a-z][a-z-]*' | tr -d '`' | sort -u | tr '\n' ' ')"
-check "the Commands table lists every subcommand ($subs)" bash -c 'for s in new add start progress ask resume done fail show list ping flush run report usage api changelog update; do [[ " $1" == *" $s "* ]] || exit 1; done' _ "$subs"
+check "the Commands table lists every subcommand ($subs)" bash -c 'for s in new add start progress ask resume done fail show list ping flush run report stream usage api changelog update; do [[ " $1" == *" $s "* ]] || exit 1; done' _ "$subs"
 for sub in $subs install-rule; do
     check "taskctl $sub -h" bash -c '"$1" "$2" -h >/dev/null 2>&1' _ "$DIR/taskctl" "$sub"
 done

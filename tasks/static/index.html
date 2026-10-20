@@ -17,8 +17,13 @@
   "This device") to four channels: a row highlight, the tab title and favicon, a synthesised chime and a
   browser notification. Events an agent queued while the board was unreachable (replayed) only highlight.
 
-  Live stream: when /api/events carries a "stream", the window splits into the board (then an inner scroller)
-  and a black pane: below the board in portrait, to its right in landscape. The pane reads "connecting to
+  Live stream: /api/events lists the open streams ("streams": the board's own, request_id null, and one per running
+  request; an older board sends only its own, as "stream"). The list marks each request that has one, with a checkbox:
+  the one checked plays beside the list. The pick is this device's (kept in this browser): one at a time, none when the
+  checked one is unchecked; until it picks one, or while the picked one is not open, the board's own plays, else the
+  one opened last. A request's page (and its report) always plays that request's own stream, and none when it has
+  none; Back to the list plays the pick again. While one plays, the window splits into the board (then an inner
+  scroller) and a black pane: below the board in portrait, to its right in landscape. The pane reads "connecting to
   <url>..." and a timer (on the server's clock, so every device and every reload agree) until the page has
   video, then plays the board's relay of the source (stream.media: fragmented MP4 over one open response)
   through Media Source Extensions. The <video> is made on attach and only after the window's load event, so
@@ -27,8 +32,9 @@
   been hidden and muted for a minute lets its media connection go, and takes it up again when shown. The
   unknown-path view never polls, so it shows no stream. A button in the pane's corner (while it shows video) makes the
   pane cover the whole window, in either orientation, and back (or Escape). It is this page's alone, never stored, so a
-  reload starts in the split, and it lasts only while the board's stream goes on: one closed, replaced, whose run
-  ended, or live again as a new run (another since) comes back in the split. This page's own reconnects keep it.
+  reload starts in the split, and it lasts only while the stream it plays goes on: one closed, replaced, another one
+  picked, whose run ended, or live again as a new run (another since) comes back in the split. This page's own
+  reconnects keep it.
 
   Theme: the colours follow the system's light or dark setting unless this device chose one (Settings > This
   device > Appearance: System, Light or Dark, kept in this browser). A choice is the data-theme attribute on
@@ -227,6 +233,20 @@ body.offline .fill { background-position: 0 0 !important; }
 .meta .warn { color: var(--warn); }
 .meta .bad { color: var(--failed); }
 .meta .ask-n { color: var(--waiting); font-weight: 600; }
+/* A stream to pick: on a request row that has one (inside the row's link, which a click on it never follows), and the
+   board's own above the list. The checked one plays beside the list; the dot says whether it is live. */
+.pick { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; margin: 5px 0 0; padding: 2px 9px 2px 5px;
+    border: 1px solid var(--border); border-radius: 999px; font: 12.5px/1.45 var(--sans); color: var(--muted); cursor: pointer;
+    background: var(--surface-2); }
+.pick:hover { border-color: var(--muted); color: var(--text); }
+.pick input { flex: none; width: 15px; height: 15px; margin: 0; accent-color: var(--running); cursor: pointer; }
+.pick-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--pending); }
+.pick[data-state=live] .pick-dot { background: var(--done); }
+.pick[data-shown] { color: var(--text); border-color: color-mix(in srgb, var(--running) 50%, var(--border)); }
+.pick-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.req .pick { display: flex; width: fit-content; }
+.pick-bar { margin: 8px 0 0; }
+.pick-bar .pick { margin: 0; }
 .row.target { box-shadow: 0 0 0 2px var(--running); animation: flash 1.8s ease-out 1; }
 @keyframes flash { from { background: color-mix(in srgb, var(--running) 22%, var(--surface)); } to { background: var(--surface); } }
 
@@ -481,6 +501,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
 
     <section id="view-list" hidden>
         <p id="summary" class="summary dots"><span data-status="waiting" data-ref="waiting" hidden></span><span data-status="running" data-ref="running"></span><span data-status="stale" data-ref="stale"></span><span data-status="done" data-ref="done"></span><span data-status="failed" data-ref="failed"></span></p>
+        <div id="board-pick" class="pick-bar" hidden><label class="pick" id="board-pick-label"><input type="checkbox" id="board-pick-box"><span class="pick-dot"></span><span class="pick-text" id="board-pick-text"></span></label></div>
         <div id="list-empty" class="empty" hidden>
             <p class="big">No requests yet.</p>
             <p>Agents create requests and report progress over HTTP. Try it:</p>
@@ -648,6 +669,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         <div class="ask" data-ref="ask" hidden><div class="ask-head dots"><span class="ask-label">Question</span><span data-ref="askWho"></span><span data-ref="askWhen"></span><span data-ref="askMore"></span></div><div class="ask-q" data-ref="askQ"></div></div>
         <div class="hint" data-ref="hint"><span class="ht" data-ref="ht"></span><span class="hm" data-ref="hm"></span></div>
         <div class="meta"><span data-ref="tasks"></span><span data-ref="failed" class="bad"></span><span data-ref="time"></span><span data-ref="eta"></span><span data-ref="updated"></span><span data-ref="report"></span><span data-ref="origin"></span><span data-ref="rid"></span></div>
+        <span class="pick" data-ref="pick" hidden><input type="checkbox" data-ref="pickBox"><span class="pick-dot"></span><span class="pick-text" data-ref="pickText"></span></span>
     </a>
 </template>
 <template id="tpl-task">
@@ -695,6 +717,8 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     const PROGRESS_RANK = { running: 1, pending: 2, done: 3, failed: 3, cancelled: 4 };   // a waiting task is 0
     // What this device asks the board for: the stream as the source sends it, or a lighter copy the board makes of it.
     const STREAM_QUALITIES = ['original', 'light', 'stills'];
+    // Which stream the list plays, this device's pick: null (none picked yet), 'none', 'board' (the board's own) or a request id.
+    const PICK_RID_RE = /^[a-z0-9]{6}$/;
     const CLAIMS_KEY = 'taskstatus.claims';
     // Live stream
     const STREAM_RETRY_MS = [1000, 2000, 4000, 8000, 10000]; // this page's reconnects, on the worker clock
@@ -807,7 +831,8 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     const flashTimers = new WeakMap();
 
     // Live stream state
-    let stream = null;          // the /api/events "stream" (checked), or null: nothing is open
+    let streamList = [];        // every open stream (checked), the first opened first: /api/events "streams"
+    let stream = null;          // the one this page plays (viewedStream), or null: none
     let splitLayout = false;    // html and body carry .streaming: the board is an inner scroller beside the pane
     let streamFull = null;      // full screen: the live run it began on (liveRun); null: the split. This page's alone, never stored
     let player = null;          // the attached media, see startPlayer; null: none
@@ -1246,7 +1271,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             console.error('alerts failed', e);
         }
         try {
-            if (events) applyStream(events.stream || null);     // an older board has no stream key
+            if (events) applyStreams(events);
         } catch (e) {
             console.error('stream failed', e);
         }
@@ -1433,6 +1458,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     function createReqRow(r) {
         const row = cloneTpl('tpl-req');
         row.el.setAttribute('href', '/r/' + encodeURIComponent(r.id));
+        row.refs.pick.dataset.rid = r.id;
         row.tick = tickReqRow;
         return row;
     }
@@ -1472,6 +1498,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         setAttr(refs.time, 'title', running ? 'started ' + fmtStamp(r.created_at)
                                             : fmtStamp(r.created_at) + ' → ' + fmtStamp(r.completed_at));
         setAttr(refs.updated, 'title', fmtStamp(running ? r.updated_at : r.completed_at ?? r.updated_at));
+        setRowPick(row, viewedStream());
     }
 
     // The question a waiting request row shows: its own (request-level), else its first waiting task's
@@ -1802,7 +1829,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     // This browser's overrides (localStorage); anything malformed falls back to "inherit" or the default.
     function loadLocal() {
         const out = { events: {}, sound_enabled: false, notify_enabled: false, volume: null, remind_every: 120, stream_audio: true, stream_volume: 1,
-                      stream_quality: 'original', theme: 'system', clock: 'board', task_order: null };
+                      stream_quality: 'original', stream_pick: null, theme: 'system', clock: 'board', task_order: null };
         let raw = null;
         try {
             raw = JSON.parse(localStorage.getItem(LOCAL_KEY) || 'null');
@@ -1829,6 +1856,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         if (typeof raw.stream_audio === 'boolean') out.stream_audio = raw.stream_audio;
         if (typeof raw.stream_volume === 'number' && raw.stream_volume >= 0 && raw.stream_volume <= 1) out.stream_volume = raw.stream_volume;
         if (STREAM_QUALITIES.includes(raw.stream_quality)) out.stream_quality = raw.stream_quality;
+        if (raw.stream_pick === 'none' || raw.stream_pick === 'board' || PICK_RID_RE.test(raw.stream_pick)) out.stream_pick = raw.stream_pick;
         return out;
     }
 
@@ -2682,7 +2710,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         // Another tab of this browser changed the device settings.
         addEventListener('storage', (e) => {
             if (e.key !== LOCAL_KEY) return;
-            const quality = local.stream_quality, order = taskOrder();
+            const quality = local.stream_quality, order = taskOrder(), pick = local.stream_pick;
             local = loadLocal();
             applyTheme();
             if (taskOrder() !== order) applyTaskOrder();
@@ -2691,6 +2719,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             updateAttention();
             applyStreamAudio(false);
             if (local.stream_quality !== quality) restartStream();
+            if (local.stream_pick !== pick) showPicked();
         });
         // Browsers keep audio locked until the page has had a gesture; any one unlocks it once sound is on.
         const unlock = () => {
@@ -2821,7 +2850,8 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         const num = (v) => typeof v === 'number' && Number.isFinite(v) ? v : null;
         const str = (v) => typeof v === 'string' && v ? v : null;
         const media = typeof s.media === 'string' && /^\/[^/]/.test(s.media) ? s.media : '/api/stream/media?id=' + encodeURIComponent(s.id);
-        return { id: s.id, url: s.url, state: s.state === 'live' ? 'live' : 'connecting', since: num(s.since), error: str(s.error) || '',
+        const owner = typeof s.request_id === 'string' && PICK_RID_RE.test(s.request_id) ? s.request_id : null;
+        return { id: s.id, owner, url: s.url, state: s.state === 'live' ? 'live' : 'connecting', since: num(s.since), error: str(s.error) || '',
                  video: str(s.video), audio: str(s.audio), width: num(s.width), height: num(s.height), media };
     }
 
@@ -2843,14 +2873,99 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         renderStream();
     }
 
-    // Every events answer: the stream is opened, replaced, closed, or just reported again.
-    function applyStream(raw) {
-        const s = cleanStream(raw);
+    // Every events answer: the open streams, and the one this view plays. An older board names only its own ("stream").
+    function applyStreams(events) {
+        const raw = Array.isArray(events.streams) ? events.streams : events.stream ? [events.stream] : [];
+        const seen = new Set();
+        streamList = [];
+        for (const item of raw) {
+            const s = cleanStream(item);
+            if (s && !seen.has(s.id)) {
+                seen.add(s.id);
+                streamList.push(s);
+            }
+        }
+        if (!Array.isArray(events.streams)) for (const s of streamList) s.owner = null;
+        showPicked();
+    }
+
+    // The open stream of a request (owner its id), or the board's own (owner null); null when it has none.
+    const streamOf = (owner) => streamList.find((s) => s.owner === owner) || null;
+
+    // The stream this view plays: a request's page (and its report) that request's own, or none; the list the one this
+    // device picked, else (none picked yet, or the picked one not open) the board's own, else the one opened last.
+    function viewedStream() {
+        if (view === 'detail' || view === 'report') return notFound ? null : streamOf(rid);
+        if (view !== 'list') return null;
+        const pick = local.stream_pick;
+        if (pick === 'none') return null;
+        return (pick ? streamOf(pick === 'board' ? null : pick) : null) || streamOf(null) || streamList[streamList.length - 1] || null;
+    }
+
+    function showPicked() {
+        applyStream(viewedStream());
+        renderPicks();
+    }
+
+    // This device's pick: a stream (the board's own, 'board', or a request's, its id), or 'none'.
+    function pickStream(key) {
+        local.stream_pick = key;
+        saveLocal();
+        showPicked();
+    }
+
+    // The list's checkboxes say which stream plays beside it: a row's for its request's stream, and the board's own
+    // above the rows.
+    function renderPicks() {
+        if (view !== 'list') return;
+        const shown = viewedStream();
+        for (const row of rows.values()) setRowPick(row, shown);
+        const own = streamOf(null), on = !!own && shown === own;
+        setHidden($('board-pick'), !own);
+        if (!own) return;
+        $('board-pick-box').checked = on;
+        setPickLabel($('board-pick-label'), $('board-pick-text'), own, on, 'Board stream', "the board's own stream");
+    }
+
+    function setRowPick(row, shown) {
+        const refs = row.refs, s = row.item ? streamOf(row.item.id) : null, on = !!s && shown === s;
+        setHidden(refs.pick, !s);
+        if (!s) return;
+        refs.pickBox.checked = on;
+        setPickLabel(refs.pick, refs.pickText, s, on, 'Stream', "this request's stream");
+    }
+
+    function setPickLabel(label, text, s, on, name, what) {
+        setAttr(label, 'data-state', s.state);
+        setAttr(label, 'data-shown', on ? 'yes' : null);
+        setText(text, name + ': ' + (s.state === 'live' ? 'live' : 'connecting'));
+        const box = label.querySelector('input');
+        setAttr(box, 'aria-label', (on ? 'Playing ' : 'Play ') + what + ' beside the list');
+        setAttr(label, 'title', (on ? 'Playing beside the list; uncheck to hide it' : 'Play it beside the list') + ' (' + s.url
+                                + (s.state === 'connecting' && s.error ? ': ' + s.error : '') + ')');
+    }
+
+    // A click on a row's stream checkbox, or on its label. The row is a link, so the click is never left to the browser
+    // (it would follow the link, or toggle the box before the page knows): the page makes the choice, and sets the box
+    // again once the click is over (a cancelled click puts it back as it was).
+    function onRowPick(e) {
+        const pick = e.target instanceof Element ? e.target.closest('.pick') : null;
+        if (!pick) return;
+        e.preventDefault();
+        const row = rows.get(pick.dataset.rid || '');
+        const s = row ? streamOf(row.item.id) : null;
+        if (!s) return;
+        pickStream(viewedStream() === s ? 'none' : s.owner);
+        setTimeout(renderPicks, 0);
+    }
+
+    // The stream this page plays: opened, replaced, closed, or just reported again.
+    function applyStream(s) {
         if ((s ? s.id : '') !== (stream ? stream.id : '')) resetStream();
         const was = stream !== null;
         stream = s;
-        // Full screen ends with its run: the stream closed, replaced, its run ended (connecting), or live again as a
-        // new run (a restart between two polls), so a stream that comes back opens in the split.
+        // Full screen ends with its run: the stream closed, replaced, another one picked, its run ended (connecting), or
+        // live again as a new run (a restart between two polls), so a stream that comes back opens in the split.
         if (streamFull && liveRun(s) !== streamFull) setStreamFull(false);
         if (was !== (s !== null)) switchLayout(s !== null);
         if (!s) {
@@ -3459,6 +3574,9 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             } catch (e) { /* ignore */ }
         });
         $('clear').addEventListener('click', clearFinished);
+        $('list-active').addEventListener('click', onRowPick);
+        $('list-finished').addEventListener('click', onRowPick);
+        $('board-pick-box').addEventListener('change', (e) => pickStream(e.target.checked ? 'board' : 'none'));
         initPager();
         addEventListener('resize', sizeReport);
 

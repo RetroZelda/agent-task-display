@@ -82,6 +82,7 @@ your user), `resume ID` (they answered), `done ID [MSG]`, `fail ID MSG`, `show I
 (every running request; `--all` adds the 20 most recently finished), `ping` (also shows queued
 reports), `flush`, `run TID [--every SEC] [--percent-regex RE] -- CMD...`, `usage` (this text),
 `report RID FILE [--title T] [--artifact URL]` (the request's report; `--delete` removes it),
+`stream RID [URL] [--close]` (a live stream on the request's page, only when your user asks; alone: shows it),
 `api METHOD PATH [JSON]` (any route below), `changelog`, `update [--force]`,
 `install-rule [--file PATH]`. If the board is unreachable (the connection is refused, has no route,
 the name does not resolve, a local firewall blocks it, or it is not made in time), taskctl queues
@@ -97,8 +98,8 @@ response has `now`, so compute ages from it rather than from your own clock. A r
 characters from `23456789abcdefghjkmnpqrstuvwxyz` (`k3m9qa`); a task id is the request id plus a
 sequence number (`k3m9qa-3`). Titles are capped at 200 characters and messages at 500 (longer ones
 are truncated). Errors are `{"error": "...", "field": "...", "hint": "..."}` (field and hint
-optional): 400 invalid input, 404 unknown id or route, 405 wrong method, 409 state conflict, 410
-a live stream that was replaced or closed, 411 chunked body (send Content-Length), 413 body over 64 KiB, 503
+optional): 400 invalid input, 404 unknown id or route, 405 wrong method, 409 state conflict (a stream
+for a closed request, or 8 streams open already), 410 a live stream that was replaced or closed, 411 chunked body (send Content-Length), 413 body over 64 KiB, 503
 database busy (retry after a second) or a live stream that is not connected yet.
 Browser-style writes (POST, PUT, DELETE) with a foreign `Origin` header get 403. A success body has
 `"warnings": [...]` when something was truncated, clamped or ignored, such as a misspelled field.
@@ -136,6 +137,9 @@ have changed: read {{BASE_URL}}/api/changelog and this page again.
     GET    /api/requests/<rid>/report     the report with its content; 404 when there is none
     DELETE /api/requests/<rid>/report     {deleted, request_id, now}
     GET    /api/requests/<rid>/report/page  the report as a web page (what the dashboard shows)
+    PUT    /api/requests/<rid>/stream     {url} -> 201 the request's live stream (below), replacing its old one
+    GET    /api/requests/<rid>/stream     {now, request_id, stream, ffmpeg}
+    DELETE /api/requests/<rid>/stream     close it
     POST   /api/requests/<rid>/tasks      {title, start?: true} -> 201 one task, running unless start is false
                                           {titles: [title, ...]} -> 201 {tasks[]}, all pending
     GET    /api/tasks/<tid>               one task
@@ -147,16 +151,16 @@ have changed: read {{BASE_URL}}/api/changelog and this page again.
     GET    /api/settings                  the board-wide notification settings (below)
     PUT    /api/settings                  {settings: {...}} change some of them
     DELETE /api/settings                  back to the defaults
-    GET    /api/stream                    the live stream (below): {now, stream, ffmpeg}
-    POST   /api/stream                    {url} -> 201 open a stream, replacing any open one
+    GET    /api/stream                    the board's own live stream (below): {now, stream, streams, ffmpeg}
+    POST   /api/stream                    {url} -> 201 open it, replacing the one open
     DELETE /api/stream                    close it
-    GET    /api/stream/media?id=<id>      the stream itself as fragmented MP4, for the dashboard
+    GET    /api/stream/media?id=<id>      a stream itself as fragmented MP4, for the dashboard
 
 Fields worth knowing. A request has `id`, `title`, `status` (running, done or failed), `percent`,
 `tasks_done` and `tasks_total` (X/Y; cancelled tasks are not counted), `current` (the latest running
 task), `stale`, `url`, `attention` (its own flag: `{"message", "since"}` or null), `waiting` (true
 while it is running and it or one of its running tasks has a flag) and `tasks_waiting` (how many
-running tasks have one). A task has `id`, `title`, `status` (pending, running, done, failed or
+running tasks have one) and `stream` (its live stream, below, or null). A task has `id`, `title`, `status` (pending, running, done, failed or
 cancelled), `percent`, `message`, `eta_remaining`, `elapsed`, `stale`, `url` and `attention`. The
 list's `counts` has `running`, `stale`, `done`, `failed` and `waiting`.
 
@@ -191,7 +195,8 @@ then records the write at that time (clamped to the last 24 hours and never befo
 update) and marks its events as replayed. Without the header, `at` is ignored with a warning.
 
 Events. `GET /api/events` returns `{now, cursor, events[], truncated, waiting[], stale[],
-settings_version, stream}` (`stream` is the open live stream, or null). Without `since`, `events` is empty and `cursor` is the newest event id (0 when
+settings_version, stream, streams}` (`stream` is the board's own live stream, or null; `streams` is every
+open one, the requests' too). Without `since`, `events` is empty and `cursor` is the newest event id (0 when
 there are none): keep it and pass it as `since` next time. With `since`, `events` holds up to `limit`
 events with a larger id, oldest first; `truncated` is true when more remain (then `cursor` is the
 last one returned) or when events after `since` were already pruned (events are kept 7 days, at most
@@ -234,23 +239,30 @@ it. The title defaults to the HTML's `<title>` or the first Markdown heading. Ev
 (no content: GET the report route for that); `page` is served from the board's report port (its port + 1
 by default), where each report page keeps an origin of its own, as an artifact does. `DELETE` removes it; it also goes with its request.
 
-Live stream. The dashboard can show one network video or audio stream beside the board on every open
-page (below it on a portrait screen, to its right on a landscape one). Do this only when your user asks.
-`taskctl api POST /api/stream '{"url": "http://camera.lan:8554/"}'` opens a stream (201; a newer url
-replaces the open one, and the url that is already open is kept: 200 with `"existing": true`, retried
-at once), `taskctl api DELETE /api/stream` closes it (idempotent) and `taskctl api GET /api/stream`
-shows it as `{now, stream, ffmpeg}`, with `ffmpeg` the program the board runs for it or null when the
-board host does not have it (`apt install ffmpeg` there; the reply to POST warns). The url is http,
-https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp, up to 2048 characters with no spaces, else a 400 with
-`field: "url"`. The board connects to it from its own host, so the name must resolve and be reachable
-from there, and it is a stream source (a camera, an encoder), not a web page. `stream` is null or
-`{id, url, opened_at, state, since, error, video, audio, width, height, viewers, media}`: `state` is
+Live stream. The dashboard can show network video or audio streams beside the board (below it on a
+portrait screen, to its right on a landscape one): one per running request, on that request's page,
+and one of the board's own; the request list marks the requests that have one and lets each viewer
+pick which stream plays there. Do this only when your user asks. `taskctl stream k3m9qa
+'rtsp://camera.lan:8554/live'` (or `PUT /api/requests/<rid>/stream` with `{"url": "..."}`) opens your
+request's stream: 201, with `{now, request_id, stream, ffmpeg}`; a newer url replaces the request's
+old one, and the url that is already open is kept (200 with `"existing": true`) and retried at once.
+`taskctl stream k3m9qa --close` (DELETE) closes it (idempotent) and `taskctl stream k3m9qa` (GET)
+shows it. It needs a running request (a closed one is a 409), and it ends by itself when the request
+is completed or deleted. The board's own stream, not tied to any request, is `taskctl api POST
+/api/stream '{"url": "http://camera.lan:8554/"}'`, `taskctl api DELETE /api/stream` and `taskctl api
+GET /api/stream`. At most 8 streams are open at once (one more is a 409). `ffmpeg` in the replies is the
+program the board runs for them, or null when the board host does not have it (`apt install ffmpeg`
+there; the reply to an open warns). The url is http, https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp,
+up to 2048 characters with no spaces, else a 400 with `field: "url"`. The board connects to it from
+its own host, so the name must resolve and be reachable from there, and it is a stream source (a
+camera, an encoder), not a web page. A stream is `{id, request_id, url, opened_at, state, since, error,
+video, audio, width, height, viewers, media}`: `request_id` is null for the board's own; `state` is
 "connecting" until a keyframe has gone out and "live" after that; `error` says why the last attempt
 failed (the board retries after 1, 2, 4, 8 and then every 10 seconds); `video` and `audio` are codec
 strings such as avc1.42C028 and mp4a.40.2, null until known or when there is no such track; `url`
-shows a `user:password@` as `***@`. The same object is `stream` in /api/events. The stream is saved on
-the board host and reopens when the board restarts. `media` is the path of the stream itself, which
-only the dashboard needs.
+shows a `user:password@` as `***@`. The same object is a request's `stream`, and in /api/events. The
+streams are saved on the board host and reopen when the board restarts (a request's only while it
+runs). `media` is the path of the stream itself, which only the dashboard needs.
 
 Examples: create a request with its tasks, report on one of the returned task ids, flag a question
 and clear it, close the task, then the request, and read it back:
@@ -286,7 +298,7 @@ Keep the JSON in single quotes, and keep apostrophes, backticks and `$` out of t
 - Give your user the request's page link once.
 - When you publish a report as a Claude artifact for a request, also send the same file to it
   (`taskctl report`), and again after each update; give your user the report's page with the artifact.
-- Open or close the board's live stream only when your user asks for it.
+- Open or close a live stream (your request's or the board's own) only when your user asks for it.
 - Titles and hints: in single quotes, with no backticks, `$` or quote characters. No secrets: the
   board is visible on the LAN.
 - Reporting is best effort. If the board is unreachable, carry on with the real work and mention it once.

@@ -66,20 +66,24 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
   DELETE /api/requests/{rid}/report  {deleted: bool, request_id, now} (idempotent)
   GET    /api/requests/{rid}/report/page  the report as a page, text/html, sandboxed (see Reports); ?theme=light|dark;
                                    404 with a small page when there is none
+  PUT    /api/requests/{rid}/stream  {url} -> 201 {now, request_id, stream, ffmpeg} + existing: false; the url already
+                                   open: 200, existing: true; a closed request is a 409 {error, status, hint} (see Stream)
+  GET    /api/requests/{rid}/stream  {now, request_id, stream (null: none), ffmpeg}
+  DELETE /api/requests/{rid}/stream  -> the GET shape + closed: bool (idempotent)
   GET    /api/tasks/{tid}          Task + now
   POST   /api/tasks/{tid}/progress {message, percent?, eta_seconds?} -> Task + now
   POST   /api/tasks/{tid}/complete {status?: done|failed, message?} -> Task + now
   POST   /api/tasks/{tid}/attention  {message} -> Task + now; a closed task is a 409 {error, status}
   DELETE /api/tasks/{tid}/attention  -> Task + now (idempotent)
   GET    /api/events               ?since=N&limit=1..1000 (500) -> {now, cursor, events, truncated, waiting,
-                                   stale, settings_version, stream, clock} (see Events and Stream)
+                                   stale, settings_version, stream, streams, clock} (see Events and Stream)
   GET    /api/settings             {now, path, version, exists, error, settings, defaults} (see Settings)
   PUT    /api/settings             {settings: {...}, partial} -> the GET shape
   DELETE /api/settings             removes the file (the defaults again) -> the GET shape
-  GET    /api/stream               {now, stream, ffmpeg} (see Stream)
+  GET    /api/stream               {now, stream, streams, ffmpeg} (see Stream)
   POST   /api/stream               {url} -> 201 the GET shape + existing: false; the url already open: 200, existing: true
   DELETE /api/stream               -> the GET shape + closed: bool (idempotent)
-  GET    /api/stream/media?id=<id> the open stream as fragmented MP4, an endless body; &quality=light|stills: a
+  GET    /api/stream/media?id=<id> an open stream as fragmented MP4, an endless body; &quality=light|stills: a
                                    lighter copy of it (see Stream)
 Rendering literally replaces {{BASE_URL}}, {{PUBLIC_URL}}, {{VERSION}} and {{DOCS_VERSION}}. Files are
 re-read per request; a missing one is a 500 {"error": "template missing: <path>"}. On the HTTPS listener
@@ -91,7 +95,7 @@ Shapes (every key always present, null when absent; times are float epoch second
            start_inferred updated_at completed_at elapsed stale url attention
   Request  id title origin status message created_at updated_at completed_at elapsed percent tasks_total
            tasks_done tasks_failed tasks_running tasks_pending tasks_cancelled current eta_at stale url
-           attention waiting tasks_waiting report
+           attention waiting tasks_waiting report stream
   Report   format title artifact_url size version created_at updated_at url page (a Request's report: this, or null)
   Event    id ts type request_id task_id request_title task_title status percent message replayed
   Task status: pending|running|done|failed|cancelled. Request status: running|done|failed.
@@ -102,11 +106,12 @@ Shapes (every key always present, null when absent; times are float epoch second
   user (a Request's is its own, not its tasks'). waiting = running and (the request's attention or a
   running task's); tasks_waiting = running tasks with attention. stale = running, silent > --stale-after,
   not within 60s past a running eta_at, and never while it has attention (task) or is waiting (request).
+  stream = the request's open stream (see Stream), or null.
   url = <public>/r/<rid>, plus #<tid> for a task. A Report's url is <public>/r/<rid>/report (the dashboard's view of
   it), page <public>/api/requests/<rid>/report/page; size is its content's UTF-8 bytes; version counts its writes.
 
 Errors are {error, field?, hint?}: 400 validation, 403 cross-origin write, 404 unknown id/route, 405
-(+Allow), 409 state conflict, 410 a stream that was replaced or closed, 411 chunked, 413 body > 64 KiB (32 MiB
+(+Allow), 409 state conflict (a closed request's stream, STREAMS_MAX streams open), 410 a stream that was replaced or closed, 411 chunked, 413 body > 64 KiB (32 MiB
 for PUT .../report, whose content is at most 16 MiB), 500,
 503 database busy (+Retry-After: 1), or a stream not connected yet, full or shutting down (+Retry-After).
 http.server's own rejections (malformed request line 400, 414, 431, unknown method 501) are JSON too.
@@ -142,7 +147,8 @@ are the entity's after the change (the request's for request-level events), time
   last one returned) or events after since were pruned; otherwise cursor = the last event id. waiting =
   [{request_id, request_title, task_id | null, task_title | null, message, since}] for every attention
   open in a running request, oldest first; stale = [{request_id, request_title}] of running requests
-  stale now; settings_version = the settings' version; stream = the open stream's object, or null (see Stream);
+  stale now; settings_version = the settings' version; stream = the board's own stream's object, or null, and
+  streams = every open stream's, the board's own and the requests', the first opened first (see Stream);
   clock = {utc_offset, tz}, the board host's time zone now: seconds east of UTC, and its name (EDT, say), so the
   board's local date and time are now + utc_offset (the dashboard's header shows them).
 
@@ -165,23 +171,29 @@ mtime or size changes:
   current settings and writes the full result atomically. version = sha256 of the settings as compact
   JSON with sorted keys, hex[:12].
 
-Stream: one network stream can be open at a time, shown beside the board on every open page. POST /api/stream
-  {url} opens it: a newer url replaces the open one, the url already open is kept and retried at once. url:
+Stream: network streams the dashboard shows beside the board: the board's own and one per running request, 8 at
+  most in all (one more is a 409 naming the limit). POST /api/stream {url} opens the board's own, PUT
+  /api/requests/{rid}/stream {url} that request's (404 unknown, 409 closed): a newer url replaces the one open
+  there, the url already open is kept and retried at once. A request's stream ends when the request is completed
+  (done or failed, by an agent, the dashboard or expiry) or deleted; one opened while its request was closing ends
+  too (at the latest by the next maintenance pass), and reopening the request does not bring it back. url:
   http, https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp, up to 2048 characters, no spaces or controls (else
-  400 with field url). DELETE closes it. The board runs one ffmpeg for it (found on PATH at each start, so
+  400 with field url). DELETE closes it. The board runs one ffmpeg for each stream (found on PATH at each start, so
   installing it later needs no restart; until then error says so): video copied, audio made AAC stereo,
   written as fragmented MP4 in pieces of about 200 ms. Only network protocols are read (no file:, pipe:,
   concat:). A run that ends or fails starts again after 1, 2, 4, 8, then 10 s of waiting.
-  The object (in /api/events "stream", GET /api/stream and the replies): {id (12 hex, new for every
-  stream), url (a user:password@ is shown as ***@ everywhere), opened_at, state: "connecting" | "live",
+  The object (in /api/events "stream" and "streams", a Request's stream, GET /api/stream and the replies): {id (12
+  hex, new for every stream), request_id (null: the board's own), url (a user:password@ is shown as ***@
+  everywhere), opened_at, state: "connecting" | "live",
   since, error, video, audio, width, height, viewers, media}. live = a keyframe has gone out; since = when it
   went live, or while connecting when the trouble began (failed retries keep it); error = why the last run
   ended (null while live); video and audio = codec strings (avc1.42C028, mp4a.40.2), width and height those
   of the video; all null until ffmpeg has written its header, or when there is no such track. media = the
   path of GET /api/stream/media?id=<id>: 200, Content-Type video/mp4 (audio/mp4 without video) with the
   codecs, no Content-Length, fragmented MP4: the header, the fragments since the last keyframe, then live
-  ones. It ends whenever a run ends and when the stream is replaced or closed; a page then asks again. 404 no
-  stream, 410 another id, 503 (+Retry-After) not connected yet, 16 viewers or shutting down. A viewer more
+  ones. It ends whenever a run ends and when the stream is replaced or closed; a page then asks again. Without id
+  it is the board's own. 404 no stream open (or, without id, none of the board's own), 410 an id no open stream
+  has, 503 (+Retry-After) not connected yet, 16 viewers of that stream or shutting down. A viewer more
   than 64 fragments behind is dropped. HEAD sends the headers only.
   quality=light or stills (original, the default, is the stream as above; anything else is a 400 with field
   quality) is a lighter copy, for devices that cannot decode the original or keep up with it: a second ffmpeg
@@ -190,9 +202,11 @@ Stream: one network stream can be open at a time, shown beside the board on ever
   Content-Type is its own, and it ends with the run and 10 s after its last viewer left. One that failed
   (ffmpeg without libx264, say) is a 503 naming the cause for the next 10 s; one whose header has not come
   within the wait is a 503 too. Its viewers count toward the 16 and in viewers. A stream without video is
-  served as it is. HEAD starts nothing: a quality that is not running is a 503. The open stream is kept in
-  <db>.stream.json (mode 600; --db tasks/data/tasks.db gives tasks/data/tasks.stream.json) and reopened
-  after a restart; only DELETE removes it.
+  served as it is. HEAD starts nothing: a quality that is not running is a 503. The open streams are kept in
+  <db>.stream.json (mode 600; --db tasks/data/tasks.db gives tasks/data/tasks.stream.json) as {"streams": [{id,
+  request_id, url, opened_at}]}, the first opened first, the file removed with the last one, and reopened after a
+  restart (a request's only while it runs; an older board's file, a bare {id, url, opened_at}, is the board's own);
+  only closing them removes them.
 
 Reports: a request's optional document, one at most: format html (the very file an agent publishes as a Claude
   artifact, so both show the same) or markdown (rendered by the board: a GitHub-flavoured subset, raw HTML shown as
@@ -301,6 +315,7 @@ STREAM_BACKOFF = (1, 2, 4, 8, 10)  # s between failed runs in a row
 STREAM_HEALTHY = 10             # s live: the run counts as healthy and the backoff starts over
 STREAM_KILL_AFTER = 2           # s from SIGTERM to SIGKILL for ffmpeg
 STREAM_VIEWERS_MAX = 16
+STREAMS_MAX = 8                 # streams open at once: the board's own and the requests' (an ffmpeg each)
 STREAM_QUEUE_MAX = 64           # fragments a viewer may lag behind (about 13 s) before it is dropped
 STREAM_GOP_MAX = 8 << 20        # bytes of fragments kept for late joiners
 STREAM_BOX_MAX = 64 << 20       # a box claiming more than this is corrupt output
@@ -1581,11 +1596,13 @@ class StreamViewer:
 
 
 class StreamChannel:
-    """One open stream. A supervisor thread keeps an ffmpeg running for its URL, cuts the output into fragments and
-    hands them to the viewers (one per page). It lives until stop() and is never reused."""
+    """One open stream: the board's own (request_id None) or a request's. A supervisor thread keeps an ffmpeg running
+    for its URL, cuts the output into fragments and hands them to the viewers (one per page). It lives until stop()
+    and is never reused."""
 
-    def __init__(self, sid, url, opened_at):
+    def __init__(self, sid, url, opened_at, request_id=None):
         self.id, self.url, self.shown, self.opened_at = sid, url, redact_url(url), opened_at
+        self.request_id = request_id
         self.cond = threading.Condition()  # guards what follows, down to stopping
         self.state, self.since, self.error = 'connecting', ts(), None
         self.init = self.mime = self.gop = None  # gop: the fragments since the last keyframe fragment
@@ -1650,8 +1667,8 @@ class StreamChannel:
             tracks = self.tracks.values()
             video = next((track for track in tracks if track['kind'] == 'vide'), None)
             audio = next((track for track in tracks if track['kind'] == 'soun'), None)
-            return {'id': self.id, 'url': self.shown, 'opened_at': self.opened_at, 'state': self.state,
-                    'since': self.since, 'error': self.error, 'video': video and video['codec'],
+            return {'id': self.id, 'request_id': self.request_id, 'url': self.shown, 'opened_at': self.opened_at,
+                    'state': self.state, 'since': self.since, 'error': self.error, 'video': video and video['codec'],
                     'audio': audio and audio['codec'], 'width': video and video['width'],
                     'height': video and video['height'],
                     'viewers': len(self.viewers) + sum(len(r.viewers) for r in self.renditions.values()),
@@ -2103,63 +2120,96 @@ class StreamRendition:
 
 
 class StreamHub:
-    """The board's one open stream (or none), saved to a file so a restart reopens it."""
+    """The board's open streams: its own (key None, POST /api/stream) and at most one per running request (key: the
+    request id), STREAMS_MAX in all, saved to a file so a restart reopens them. Every change installs a new dict, so a
+    reader takes self._chans once and walks it without a lock."""
 
     def __init__(self, path):
         self.path = path
         self._lock = threading.Lock()  # guards the fields below; held only for quick, non-blocking work
-        self._chan = None
+        self._chans = {}  # key: StreamChannel, replaced whole on every change, never changed in place
         self._retired = []  # replaced or closed channels, until their threads are gone
         self._closing = False
 
-    def snapshot(self):
-        chan = self._chan  # no lock: a poll never waits behind a file write
+    def snapshot(self, rid=None):
+        """The board's own stream (rid None) or that request's, or None."""
+        chan = self._chans.get(rid)  # no lock: a poll never waits behind a file write
         return chan.snapshot() if chan else None
 
+    def snapshots(self):
+        """Every open stream, the first opened first."""
+        return [chan.snapshot() for chan in sorted(self._chans.values(), key=lambda c: (c.opened_at, c.id))]
+
+    def request_ids(self):
+        return [rid for rid in self._chans if rid is not None]
+
     def channel(self, sid):
-        chan = self._chan
-        if chan is None:
+        """The open stream with that id; without one, the board's own."""
+        chans = self._chans
+        if not chans:
             raise ApiError(404, 'no stream is open', hint='POST /api/stream {"url": "..."} opens one')
-        if sid and sid != chan.id:
+        if not sid:
+            if None not in chans:
+                raise ApiError(404, 'the board has no stream of its own open', hint='name one: ?id=<its id>')
+            return chans[None]
+        chan = next((c for c in chans.values() if c.id == sid), None)
+        if chan is None:
             raise ApiError(410, f'stream {sid} was replaced or closed')
         return chan
 
-    def open(self, url):
-        """Open url, replacing any stream. -> (channel, existing, warnings); the same URL as the open one is kept."""
+    def open(self, url, rid=None):
+        """Open url as the board's stream (rid None) or that request's, replacing the one it had. -> (channel,
+        existing, warnings); the same URL as the open one is kept."""
         with self._lock:
             if self._closing:
                 raise ApiError(503, 'the board is shutting down', {'Retry-After': '5'})
-            old = self._chan
+            old = self._chans.get(rid)
             if old is not None and old.url == url:
                 old.kick()
                 return old, True, []
-            chan = StreamChannel(secrets.token_hex(6), url, ts())
-            warnings = self._save(chan)
-            self._chan = chan
+            if old is None and len(self._chans) >= STREAMS_MAX:
+                raise ApiError(409, f'the board has {STREAMS_MAX} streams open already',
+                               hint='close one first: DELETE /api/requests/<rid>/stream, or /api/stream for the board\'s own')
+            chan = StreamChannel(secrets.token_hex(6), url, ts(), rid)
+            chans = {**self._chans, rid: chan}
+            warnings = self._save(chans)
+            self._chans = chans
             if old is not None:
                 old.stop()
                 self._retire(old)
             chan.start(after=old)  # under the lock, so no one can see a channel that was not started
-        log.info('stream %s opened: %s%s', chan.id, chan.shown, f' (replacing {old.id})' if old else '')
+        log.info('stream %s opened%s: %s%s', chan.id, f' for request {rid}' if rid else '', chan.shown,
+                 f' (replacing {old.id})' if old else '')
         return chan, False, warnings
 
-    def close(self):
-        """-> (whether a stream was open, warnings)."""
+    def close(self, rid=None):
+        """Close the board's stream (rid None) or that request's. -> (whether one was open, warnings)."""
         with self._lock:
-            chan, self._chan = self._chan, None
-            warnings = self._forget()
-            if chan is not None:
-                chan.stop()
-                self._retire(chan)
-        if chan is not None:
-            log.info('stream %s closed', chan.id)
-        return chan is not None, warnings
+            chans = dict(self._chans)
+            chan = chans.pop(rid, None)
+            if chan is None:
+                return False, []
+            warnings = self._save(chans)
+            self._chans = chans
+            chan.stop()
+            self._retire(chan)
+        log.info('stream %s closed%s', chan.id, f' with request {rid}' if rid else '')
+        return True, warnings
 
     def _retire(self, chan):
         self._retired = [c for c in self._retired if c.thread is not None and c.thread.is_alive()] + [chan]
 
-    def _save(self, chan):
-        text = json.dumps({'id': chan.id, 'url': chan.url, 'opened_at': chan.opened_at}) + '\n'
+    def _save(self, chans):
+        """Write chans to the file (none: remove it). -> warnings."""
+        if not chans:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError as exc:
+                return [f'could not remove {self.path}: {exc.strerror or exc}']
+            return []
+        saved = [{'id': c.id, 'request_id': c.request_id, 'url': c.url, 'opened_at': c.opened_at}
+                 for c in sorted(chans.values(), key=lambda c: (c.opened_at, c.id))]
+        text = json.dumps({'streams': saved}) + '\n'
         temp = self.path.with_name(f'.{self.path.name}.{os.getpid()}.tmp')
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -2170,18 +2220,13 @@ class StreamHub:
             os.replace(temp, self.path)
         except OSError as exc:
             temp.unlink(missing_ok=True)
-            return [f'the stream was not saved for restarts: {exc.strerror or exc}']
+            return ['the stream was not saved for restarts: ' + (exc.strerror or str(exc))]
         return []
 
-    def _forget(self):
-        try:
-            self.path.unlink(missing_ok=True)
-        except OSError as exc:
-            return [f'could not remove {self.path}: {exc.strerror or exc}']
-        return []
-
-    def restore(self):
-        """Reopen the stream a previous run left in the file; anything wrong with the file is logged and ignored."""
+    def restore(self, running=lambda rid: True):
+        """Reopen the streams a previous run left in the file, a request's only while running(rid) says it still runs;
+        anything wrong with the file or an entry is logged and ignored. A file of an older board holds one stream,
+        the board's own, as a bare {id, url, opened_at}."""
         try:
             raw = self.path.read_bytes()  # decoded by json.loads, whose ValueError (UnicodeDecodeError too) is caught below
         except FileNotFoundError:
@@ -2191,23 +2236,49 @@ class StreamHub:
             return
         try:
             data = json.loads(raw)
-            url = clean_stream_url(data['url'])
-            sid = data.get('id')
-            opened_at = data.get('opened_at')
-        except (ValueError, KeyError, TypeError, RecursionError, ApiError) as exc:  # RecursionError: JSON nested too deep
+            entries = data['streams'] if isinstance(data, dict) and 'streams' in data else [data]
+            if not isinstance(entries, list):
+                raise TypeError('streams is not a list')
+        except (ValueError, KeyError, TypeError, RecursionError) as exc:  # RecursionError: JSON nested too deep
             log.warning('stream file %s ignored: %s', self.path, exc)
             return
-        if not (isinstance(sid, str) and re.fullmatch(r'[0-9a-f]{12}', sid)):
-            sid = secrets.token_hex(6)
-        if isinstance(opened_at, bool) or not isinstance(opened_at, (int, float)) or not math.isfinite(opened_at):
-            opened_at = ts()
+        chans, ended = {}, False  # ended: a request's stream left out because the request no longer runs
+        for entry in entries:
+            try:
+                url = clean_stream_url(entry['url'])
+                sid, opened_at, rid = entry.get('id'), entry.get('opened_at'), entry.get('request_id')
+                if rid is not None and not (isinstance(rid, str) and RID_RE.fullmatch(rid)):
+                    raise ValueError(f'request_id {rid!r} is not a request id')
+            except (KeyError, TypeError, AttributeError, ValueError, ApiError) as exc:
+                log.warning('stream file %s: an entry ignored: %s', self.path, exc)
+                continue
+            if rid in chans or len(chans) >= STREAMS_MAX:
+                log.warning('stream file %s: an entry ignored: %s', self.path,
+                            'a second stream for ' + (f'request {rid}' if rid else 'the board') if rid in chans
+                            else f'more than {STREAMS_MAX} streams')
+                continue
+            if rid is not None and not running(rid):
+                log.info('stream of request %s not reopened: the request is no longer running', rid)
+                ended = True
+                continue
+            if not (isinstance(sid, str) and re.fullmatch(r'[0-9a-f]{12}', sid)) or any(c.id == sid for c in chans.values()):
+                sid = secrets.token_hex(6)
+            if isinstance(opened_at, bool) or not isinstance(opened_at, (int, float)) or not math.isfinite(opened_at):
+                opened_at = ts()
+            chans[rid] = StreamChannel(sid, url, opened_at, rid)
         with self._lock:
-            if self._closing or self._chan is not None:
+            if self._closing or self._chans:
                 return
-            chan = self._chan = StreamChannel(sid, url, opened_at)
-            chan.start()
-        log.info('stream %s reopened after a restart: %s', chan.id, chan.shown)
-        if find_ffmpeg() is None:
+            self._chans = chans
+            if ended:
+                for warning in self._save(chans):
+                    log.warning('%s', warning)
+            for chan in chans.values():
+                chan.start()
+        for chan in chans.values():
+            log.info('stream %s reopened after a restart%s: %s', chan.id,
+                     f' for request {chan.request_id}' if chan.request_id else '', chan.shown)
+        if chans and find_ffmpeg() is None:
             log.warning('ffmpeg is not installed, so the stream cannot play (sudo apt install ffmpeg)')
 
     def shutdown(self, timeout=4):
@@ -2215,7 +2286,7 @@ class StreamHub:
         try:
             with self._lock:
                 self._closing = True
-                chans = ([self._chan] if self._chan is not None else []) + list(self._retired)
+                chans = list(self._chans.values()) + list(self._retired)
             for chan in chans:
                 chan.stop()
             deadline = time.monotonic() + timeout
@@ -2226,7 +2297,7 @@ class StreamHub:
                     except (AttributeError, RuntimeError):  # never started
                         pass
         except Exception:
-            log.exception('stopping the stream failed')
+            log.exception('stopping the streams failed')
 
 
 # Storage
@@ -2506,6 +2577,16 @@ class Store:
             counts['waiting'] = db.execute(WAITING_COUNT).fetchone()[0]
             return rows, counts
 
+    def request_row(self, rid):
+        with self._read() as db:
+            return self._request(db, rid)
+
+    def request_status(self, rid):
+        """The request's status, or None when there is no such request."""
+        with self._read() as db:
+            row = db.execute('SELECT status FROM requests WHERE id = ?', (rid,)).fetchone()
+            return row and row['status']
+
     def running_count(self):
         with self._read() as db:
             return db.execute("SELECT COUNT(*) FROM requests WHERE status = 'running'").fetchone()[0]
@@ -2772,7 +2853,7 @@ def task_json(row, now, public, stale_after):
     }
 
 
-def request_json(row, now, public, stale_after, report_base=None):
+def request_json(row, now, public, stale_after, report_base=None, stream=None):
     percent = row['avg_percent']
     if percent is None:
         percent = 100.0 if row['status'] == 'done' else 0.0
@@ -2795,6 +2876,7 @@ def request_json(row, now, public, stale_after, report_base=None):
         'url': f"{public}/r/{row['id']}",
         'attention': attention, 'waiting': waiting, 'tasks_waiting': row['tasks_waiting'],
         'report': report_json(row, public, 'report_', report_base),
+        'stream': stream,
     }
 
 
@@ -2853,6 +2935,9 @@ ROUTES = (
     _route('GET', r'/api/requests/(?P<rid>[^/]+)/report', 'get_report'),
     _route('DELETE', r'/api/requests/(?P<rid>[^/]+)/report', 'delete_report'),
     _route('GET', r'/api/requests/(?P<rid>[^/]+)/report/page', 'report_page'),
+    _route('PUT', r'/api/requests/(?P<rid>[^/]+)/stream', 'put_request_stream'),
+    _route('GET', r'/api/requests/(?P<rid>[^/]+)/stream', 'get_request_stream'),
+    _route('DELETE', r'/api/requests/(?P<rid>[^/]+)/stream', 'delete_request_stream'),
     _route('GET', r'/api/tasks/(?P<tid>[^/]+)', 'get_task'),
     _route('POST', r'/api/tasks/(?P<tid>[^/]+)/progress', 'progress'),
     _route('POST', r'/api/tasks/(?P<tid>[^/]+)/complete', 'complete_task'),
@@ -3182,10 +3267,13 @@ class Handler(BaseHTTPRequestHandler):
     def _task(self, row, now):
         return task_json(row, now, self.public_url(), self.server.stale_after)
 
+    def _request(self, row, now):
+        return request_json(row, now, self.public_url(), self.server.stale_after, self.report_base(),
+                            self.server.stream.snapshot(row['id']))
+
     def _detail(self, row, tasks, now):
         public, stale_after = self.public_url(), self.server.stale_after
-        return {**request_json(row, now, public, stale_after, self.report_base()),
-                'tasks': [task_json(task, now, public, stale_after) for task in tasks], 'now': now}
+        return {**self._request(row, now), 'tasks': [task_json(task, now, public, stale_after) for task in tasks], 'now': now}
 
     def h_index(self):
         if 'text/html' in self.headers.get('Accept', '').lower():
@@ -3239,10 +3327,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, 'status must be running, done or failed', field='status')
         limit = self._int_query('limit', 100, 1, 500)
         offset = self._int_query('offset', 0, 0, 1_000_000)
-        now, stale_after, public = ts(), self.server.stale_after, self.public_url()
+        now, stale_after = ts(), self.server.stale_after
         rows, counts = self.server.store.list_requests(status, limit, now, stale_after, offset)
         self._reply(200, {'now': now, 'stale_after': stale_after, 'counts': counts,
-                          'requests': [request_json(row, now, public, stale_after, self.report_base()) for row in rows]})
+                          'requests': [self._request(row, now) for row in rows]})
 
     def h_create_request(self):
         body, w = self._write_body({'title', 'origin', 'tasks', 'id'}), self.warnings
@@ -3268,6 +3356,7 @@ class Handler(BaseHTTPRequestHandler):
         now = ts()
         self.server.store.delete_request(rid, now)
         log.info('deleted request %s', rid)
+        self.warnings.extend(self.server.stream.close(rid)[1])
         self._reply(200, {'deleted': rid, 'now': now})
 
     def h_complete_request(self, rid):
@@ -3280,6 +3369,7 @@ class Handler(BaseHTTPRequestHandler):
         if previous != status:
             log.info('request %s %s (was %s; auto-closed %d, cancelled %d)', rid, status, previous,
                      len(auto_closed), len(cancelled))
+        self.warnings.extend(self.server.stream.close(rid)[1])  # a request's stream ends with it
         self._reply(200, {**self._detail(row, tasks, now), 'auto_closed': auto_closed, 'cancelled': cancelled})
 
     def h_add_tasks(self, rid):
@@ -3433,7 +3523,8 @@ class Handler(BaseHTTPRequestHandler):
         version = self.server.settings.current_version()
         now = ts()
         self._reply(200, {'now': now, **self.server.store.events(since, limit, now, self.server.stale_after),
-                          'settings_version': version, 'stream': self.server.stream.snapshot(), 'clock': board_clock(now)})
+                          'settings_version': version, 'stream': self.server.stream.snapshot(),
+                          'streams': self.server.stream.snapshots(), 'clock': board_clock(now)})
 
     def h_get_settings(self):
         self._reply(200, self.server.settings.snapshot(ts()))
@@ -3453,7 +3544,16 @@ class Handler(BaseHTTPRequestHandler):
         self._reply(200, self.server.settings.snapshot(ts()))
 
     def _stream_payload(self, **extra):
-        return {'now': ts(), 'stream': self.server.stream.snapshot(), 'ffmpeg': find_ffmpeg(), **extra}
+        hub = self.server.stream
+        return {'now': ts(), 'stream': hub.snapshot(), 'streams': hub.snapshots(), 'ffmpeg': find_ffmpeg(), **extra}
+
+    def _request_stream_payload(self, rid, **extra):
+        return {'now': ts(), 'request_id': rid, 'stream': self.server.stream.snapshot(rid), 'ffmpeg': find_ffmpeg(), **extra}
+
+    def _no_ffmpeg_warning(self):
+        if find_ffmpeg() is None:
+            self.warnings.append('ffmpeg is not installed on the board host; the stream starts once it is '
+                                 '(sudo apt install ffmpeg)')
 
     def h_get_stream(self):
         self._reply(200, self._stream_payload())
@@ -3462,15 +3562,48 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body({'url'})
         _, existing, warnings = self.server.stream.open(clean_stream_url(body.get('url')))
         self.warnings.extend(warnings)
-        if find_ffmpeg() is None:
-            self.warnings.append('ffmpeg is not installed on the board host; the stream starts once it is '
-                                 '(sudo apt install ffmpeg)')
+        self._no_ffmpeg_warning()
         self._reply(200 if existing else 201, self._stream_payload(existing=existing))
 
     def h_close_stream(self):
         closed, warnings = self.server.stream.close()
         self.warnings.extend(warnings)
         self._reply(200, self._stream_payload(closed=closed))
+
+    def _running_request(self, rid):
+        """The request, which must be running: a closed one is a 409, as for attention."""
+        row = self.server.store.request_row(rid)
+        if row['status'] != 'running':
+            raise ApiError(409, f"request {rid} is already {row['status']}", status=row['status'],
+                           hint='the request is closed: a stream belongs to a running request and ends with it')
+        return row
+
+    def h_get_request_stream(self, rid):
+        self.server.store.request_row(rid)
+        self._reply(200, self._request_stream_payload(rid))
+
+    def h_put_request_stream(self, rid):
+        body = self._body({'url'})
+        url = clean_stream_url(body.get('url'))
+        self._running_request(rid)
+        hub = self.server.stream
+        _, existing, warnings = hub.open(url, rid)
+        # The request may have closed (or gone) meanwhile, after its own close found no stream to end: end it here.
+        try:
+            self._running_request(rid)
+        except ApiError:
+            hub.close(rid)
+            raise
+        self.warnings.extend(warnings)
+        self._no_ffmpeg_warning()
+        self._reply(200 if existing else 201, self._request_stream_payload(rid, existing=existing))
+
+    def h_delete_request_stream(self, rid):
+        self._body(set())
+        self.server.store.request_row(rid)
+        closed, warnings = self.server.stream.close(rid)
+        self.warnings.extend(warnings)
+        self._reply(200, self._request_stream_payload(rid, closed=closed))
 
     def _stream_headers(self, mime):
         self.send_response(200)
@@ -3529,7 +3662,7 @@ def _printable(text):
 
 # Startup
 
-def maintenance_loop(store, expire_after, retention_days, stop):
+def maintenance_loop(store, expire_after, retention_days, stop, streams=None):
     interval = 600 if expire_after == 0 else min(600, expire_after / 2)
     note = f'expired: no activity for {humanise(expire_after)}'
     while True:
@@ -3538,6 +3671,10 @@ def maintenance_loop(store, expire_after, retention_days, stop):
             if expire_after:
                 for rid, auto_closed, cancelled in store.expire(now - expire_after, note, now):
                     log.info('request %s expired (auto-closed %d, cancelled %d)', rid, len(auto_closed), len(cancelled))
+            if streams is not None:  # a request's stream ends with it (expired, or closed while its stream was opening)
+                for rid in streams.request_ids():
+                    if store.request_status(rid) != 'running':
+                        streams.close(rid)
             if retention_days:
                 pruned = store.prune(now - retention_days * 86400)
                 if pruned:
@@ -3763,7 +3900,7 @@ def main(argv=None):
 
     stop = threading.Event()
     threading.Thread(target=maintenance_loop, name='maintenance', daemon=True,
-                     args=(store, args.expire_after, args.retention_days, stop)).start()
+                     args=(store, args.expire_after, args.retention_days, stop, streams)).start()
     signal.signal(signal.SIGTERM, _interrupt)
     for server in servers[1:]:
         scheme = 'https' if server.tls else 'http'
@@ -3776,7 +3913,7 @@ def main(argv=None):
     log.info('tasks server listening on %s (db %s, pid %d, public url %s, settings %s)', _shown(httpd, 'http'),
              args.db, os.getpid(), args.public_url or 'from Host header', settings.path)
     try:
-        streams.restore()
+        streams.restore(lambda rid: store.request_status(rid) == 'running')
         httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         log.info('shutting down')

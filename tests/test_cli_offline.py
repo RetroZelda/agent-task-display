@@ -197,7 +197,7 @@ check('list -h describes --all accurately', rc == 0 and 'every running request' 
 rc, out, err = tc('-h')
 check('top-level -h', rc == 0 and 'COMMAND' in out, (rc, err))
 for sub in ('new', 'add', 'start', 'progress', 'done', 'fail', 'show', 'list', 'ping', 'run', 'install-rule',
-            'ask', 'resume', 'flush', 'update', 'usage', 'changelog', 'api'):
+            'ask', 'resume', 'flush', 'update', 'usage', 'changelog', 'api', 'stream'):
     rc, out, err = tc(sub, '-h')
     check(f'taskctl {sub} -h', rc == 0 and out.startswith('usage: taskctl'), (rc, err))
 
