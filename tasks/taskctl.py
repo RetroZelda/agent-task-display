@@ -60,10 +60,12 @@ except ImportError:  # everything else
     msvcrt = None
 
 # The board replaces these placeholders when it serves the file: its address, the version of its agent
-# instructions (the skill, the templates and this CLI) and its API version.
+# instructions (the skill, the templates and this CLI), its API version and its release (MAJOR.MINOR.PATCH: the
+# instructions an agent must re-read change with it).
 BAKED_URL = "{{BASE_URL}}"
 BAKED_DOCS = "{{DOCS_VERSION}}"
 BAKED_API = "{{VERSION}}"
+BAKED_RELEASE = "{{RELEASE}}"
 DEFAULT_URL = 'http://127.0.0.1:8765'
 DEFAULT_TIMEOUT = 3.0
 
@@ -84,7 +86,9 @@ DOCS_HEADER = 'X-Tasks-Docs'
 REPLAY_HEADER = 'X-Tasks-Replay'
 DOCS_RE = re.compile(r'[0-9a-f]{4,64}')
 SERVED_DOCS_RE = re.compile(rb'^BAKED_DOCS = "([^"\r\n]*)"', re.M)
-CHANGELOG_ENTRY_RE = re.compile(r'^## v(\d+)\b', re.M)
+SERVED_RELEASE_RE = re.compile(rb'^BAKED_RELEASE = "([0-9]+\.[0-9]+\.[0-9]+)"', re.M)
+# A changelog entry's heading: a release (## 1.0.0 — date) or, before releases, an API version (## v3 — date).
+CHANGELOG_ENTRY_RE = re.compile(r'^## (?:v(\d+)|(\d+)\.(\d+)\.(\d+))\b', re.M)
 # The installed skill, as the board serves it: file name, how it must start, mode.
 SKILL_FILES = (('SKILL.md', b'---', 0o644), ('taskctl', b'#!', 0o755), ('taskctl.py', None, 0o755))
 API_PATH_RE = re.compile(r'/api/[^\s\x00-\x1f\x7f]*')
@@ -294,6 +298,11 @@ class Board:
         if not quiet:
             for message in result.get('warnings') or []:
                 warn('board: %s' % message)
+            # The first write about a request since the board restarted, and since it moved to another release.
+            for key in ('restarted', 'release_changed'):
+                notice = result.get(key)
+                if isinstance(notice, dict) and isinstance(notice.get('message'), str):
+                    note(notice['message'])
         return result
 
     def download(self, path: str) -> bytes:
@@ -764,16 +773,31 @@ def refresh_rule(board: Board, path: str) -> None:
             write_atomic(target, merged)
 
 
-def whats_new(changelog: str, since: Optional[int]) -> str:
-    """The changelog entries newer than API version `since`, or the newest one, verbatim."""
+def release_key(value) -> Optional[tuple]:
+    """A release ('1.2.3') or, before releases, an API version (3, '3', 'v3' counts as 0.3.0) as a sortable tuple."""
+    if isinstance(value, int):
+        return (0, value, 0)
+    text = str(value or '').strip()
+    m = re.fullmatch(r'v?(\d+)', text)
+    if m:
+        return (0, int(m.group(1)), 0)
+    m = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', text)
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def whats_new(changelog: str, since) -> str:
+    """The changelog entries newer than `since` (a release, or an API version from before releases), or the newest
+    one, verbatim."""
     heads = list(CHANGELOG_ENTRY_RE.finditer(changelog))
     if not heads:
         return changelog.strip()
+    floor = release_key(since) if since is not None else None
     entries = []
     for i, m in enumerate(heads):
         end = heads[i + 1].start() if i + 1 < len(heads) else len(changelog)
-        entries.append((int(m.group(1)), changelog[m.start():end].rstrip()))
-    newer = [text for version, text in entries if since is not None and version > since]
+        key = (0, int(m.group(1)), 0) if m.group(1) else tuple(int(x) for x in m.group(2, 3, 4))
+        entries.append((key, changelog[m.start():end].rstrip()))
+    newer = [text for key, text in entries if floor is not None and key > floor]
     return '\n\n'.join(newer or [entries[0][1]])
 
 
@@ -794,6 +818,8 @@ def install_skill(board: Board, here: str, old: Optional[str], new: str, force: 
             compile(source, 'taskctl.py', 'exec', dont_inherit=True)
     except (SyntaxError, ValueError) as e:
         raise ValueError('the board served a taskctl.py that does not compile here: %s' % e)
+    released = SERVED_RELEASE_RE.search(source)
+    released = released.group(1).decode('ascii') if released else None
     served = SERVED_DOCS_RE.search(source)
     served = served.group(1).decode('ascii', 'replace') if served else ''
     if DOCS_RE.fullmatch(served):
@@ -821,14 +847,21 @@ def install_skill(board: Board, here: str, old: Optional[str], new: str, force: 
         refresh_rule(board, path)
     except (BoardError, OSError, ValueError) as e:
         warn('updated the skill, but not the rule in %s: %s' % (path, e))
+    was = baked(BAKED_RELEASE)
+    if released is not None and released == was:
+        # The same release: its files were touched up, but nothing an agent must read again.
+        note('updated the skill in %s to the board\'s files (docs %s -> %s); still release %s: nothing to re-read'
+             % (here, old or 'none', new, released))
+        return True
     try:
         api = baked(BAKED_API)
         news = whats_new(board.download('/api/changelog').decode('utf-8', 'replace'),
-                         int(api) if api and api.isdigit() else None)
+                         was if release_key(was) else int(api) if api and api.isdigit() else None)
     except BoardError as e:
         news = None
         warn('cannot fetch the changelog: %s' % e)
-    note("the board's agent instructions changed (docs %s -> %s); updated the skill in %s" % (old or 'none', new, here))
+    note("the board's agent instructions changed (release %s -> %s, docs %s -> %s); updated the skill in %s"
+         % (was or 'none', released or 'unknown', old or 'none', new, here))
     if news is not None:
         note("what's new:")
         print(news, file=sys.stderr, flush=True)
@@ -1096,7 +1129,9 @@ def cmd_new(board: Board, args) -> int:
             raise
     tasks = r.get('tasks') or []
     emit_ids([r.get('id')] + [t.get('id') for t in tasks], expected)
-    note("created %s '%s'  page: %s" % (r.get('id'), r.get('title') or title, r.get('url')))
+    release = r.get('release')
+    note("created %s '%s'  page: %s%s" % (r.get('id'), r.get('title') or title, r.get('url'),
+                                          '  release: %s' % release if isinstance(release, str) and release else ''))
     for t in tasks:
         note('  %s  %s' % (t.get('id'), t.get('title')))
     return 0

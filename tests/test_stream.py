@@ -10,7 +10,7 @@ ffmpeg that remuxes it to fragmented MP4 (GET /api/stream/media). Four phases:
   fake     the media route and the supervisor against tests/lib/fake_ffmpeg.py (it plays what a URL asks
            for): body order, late joiners, audio-lead, HEAD, the 16-viewer cap, a reader that stops reading,
            replace/close leaving no process, the backoff and its reset, stalls, stubborn processes, garbage,
-           the probe ladder, audio that is silent or stops, no ffmpeg installed yet, persistence across a
+           the probe ladder, audio that is silent or stops, no ffmpeg installed yet, nothing reopened across a
            restart (mode 0600, a corrupt file), SIGTERM with viewers attached, SIGKILL of the board, polls
            with 16 viewers; the lighter qualities (?quality=light|stills) against the fake transcoder: what it
            is fed and when, sharing, the idle stop, the run ending, failures and slowness
@@ -899,11 +899,13 @@ def phase_api():
               and b['ffmpeg'] == str(srv.bin / 'ffmpeg') and abs(b['now'] - time.time()) < 5, b)
         check('...JSON, with both X-Tasks headers', h.get('content-type', '').startswith('application/json') and has_headers(h, docs), h)
         s, h, b = call('GET', '/api/events')
-        check('/api/events carries stream: null and streams: [], then the clock', s == 200 and list(b)[-3:] == ['stream', 'streams', 'clock']
+        check('/api/events carries stream: null and streams: [], then the clock and the boot id', s == 200
+              and list(b)[-4:] == ['stream', 'streams', 'clock', 'boot_id']
               and b['stream'] is None and b['streams'] == []
-              and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'streams', 'clock'], list(b))
+              and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'streams', 'clock',
+                              'boot_id'], list(b))
         s, h, b = call('GET', '/api/events?since=0')
-        check('...with a cursor too', s == 200 and list(b)[-3:] == ['stream', 'streams', 'clock'], list(b))
+        check('...with a cursor too', s == 200 and list(b)[-4:] == ['stream', 'streams', 'clock', 'boot_id'], list(b))
 
         t0, t = time.time(), time.monotonic()
         s, h, b = srv.post(f'{FAKE}/hang')
@@ -923,7 +925,7 @@ def phase_api():
         s, h, b = call('GET', '/api/stream')
         check('GET /api/stream shows the same object', s == 200 and b['stream'] == st, b)
         s, h, b = call('GET', '/api/events')
-        check('/api/events carries it, and as the one stream of streams', s == 200 and list(b)[-3] == 'stream' and b['stream'] == st
+        check('/api/events carries it, and as the one stream of streams', s == 200 and list(b)[-4] == 'stream' and b['stream'] == st
               and b['streams'] == [st], b.get('stream'))
         check('...and a hand-written spelling of the same URL is the same stream',
               srv.post('HTTP://fake.invalid/hang')[2]['stream']['id'] == st['id'])
@@ -1020,16 +1022,14 @@ def phase_api():
                   and secret not in st['error']
                   and 'user:' not in st['error'], st)
             replies += [json.dumps(call('GET', '/api/stream')[2]), json.dumps(call('GET', '/api/events')[2]), json.dumps(srv.post(secret_url)[2])]
-            check('...the state file holds the real URL (it must reopen the stream), readable by its owner only',
-                  srv.stream_file.exists() and oct(srv.stream_file.stat().st_mode & 0o777) == '0o600'
-                  and [x['url'] for x in json.loads(srv.stream_file.read_text())['streams']] == [secret_url],
-                  srv.stream_file.read_text() if srv.stream_file.exists() else 'no file')
+            check('...no file holds it: nothing is saved for a restart (no state file), and the database has no URL',
+                  not srv.stream_file.exists() and secret.encode() not in srv.db.read_bytes(), srv.stream_file.exists())
             replies.append(json.dumps(call('DELETE', '/api/stream')[2]))
             check(f'...nowhere else: not in {len(replies)} replies, and not in the board log', all(secret not in text for text in replies)
                   and secret not in srv.log_text(),
                   [t for t in replies if secret in t][:1] or srv.log_text()[-800:])
             replies.clear()
-        check('DELETE removed the state file', not srv.stream_file.exists())
+        check('no state file at any point', not srv.stream_file.exists())
 
         S.section('eight POSTs at once: one stream, one ffmpeg')
         urls = [f'{FAKE}/hang?n={i}' for i in range(8)]
@@ -2093,37 +2093,29 @@ def phase_requests():
         srv.stop()
     no_traceback(srv, 'requests')
 
-    S.section("persistence: a request's stream reopens after a restart only while its request runs")
-    srv = Board('reqpersist').start()
+    S.section("a restart: a request's stream is not reopened, and its agent's next write says so")
+    srv = Board('reqrestart').start()
     port = srv.port
     try:
-        keep, done = new_on(srv, 'keeps running'), new_on(srv, 'finishes while the board is down')
-        a = srv.call('PUT', f'/api/requests/{keep}/stream', {'url': f'{FAKE}/hang?k=1'})[2]['stream']
-        b2 = srv.call('PUT', f'/api/requests/{done}/stream', {'url': f'{FAKE}/hang?d=1'})[2]['stream']
-        own = srv.post(f'{FAKE}/hang?own=1')[2]['stream']
-        saved = json.loads(srv.stream_file.read_text())['streams']
-        check('the file holds the three, the first opened first, each with its request_id', [(x['id'], x['request_id']) for x in saved]
-              == [(a['id'], keep), (b2['id'], done), (own['id'], None)], saved)
+        keep = new_on(srv, 'keeps running')
+        srv.call('PUT', f'/api/requests/{keep}/stream', {'url': f'{FAKE}/hang?k=1'})
+        srv.post(f'{FAKE}/hang?own=1')
+        check('(two streams open, two ffmpegs, nothing on disk)', wait_until(lambda: len(srv.kids()) == 2, 5) and not srv.stream_file.exists())
         srv.stop()
-        db = sqlite3.connect(str(srv.db))   # the request finished while the board was not running
-        db.execute("UPDATE requests SET status = 'done', completed_at = updated_at WHERE id = ?", (done,))
-        db.commit()
-        db.close()
-        text = srv.stream_file.read_text()
-        srv.stream_file.write_text(text.replace(']}', ', {"id": "abcdefabcdef", "request_id": "zzzzzz", "url": "http://fake.invalid/hang?gone=1", '
-                                                      '"opened_at": 1.0}]}'))
-        again = Board('reqpersist', port=port, fresh_db=False).start()
+        ran = len(srv.spawns())     # the fake's log goes on across runs of a board of the same name
+        again = Board('reqrestart', port=port, fresh_db=False).start()
         try:
-            streams = again.call('GET', '/api/stream')[2]['streams']
-            check("the next run: the running request's stream and the board's own reopen with their ids; the finished request's and an unknown "
-                  "request's do not", [(x['id'], x['request_id']) for x in streams] == [(a['id'], keep), (own['id'], None)]
-                  and again.log_text().count('no longer running') == 2, (streams, again.log_text()[-600:]))
-            check('...and the file is rewritten without them', [x['request_id'] for x in json.loads(again.stream_file.read_text())['streams']]
-                  == [keep, None] and oct(again.stream_file.stat().st_mode & 0o777) == '0o600')
-            check('...the request carries its stream again', again.call('GET', f'/api/requests/{keep}')[2]['stream']['id'] == a['id'])
+            time.sleep(1)
+            check('the next run of the board: no stream at all (neither the request\'s nor its own), no ffmpeg, the request kept',
+                  again.call('GET', '/api/stream')[2]['streams'] == [] and again.kids() == [] and len(again.spawns()) == ran
+                  and again.call('GET', f'/api/requests/{keep}')[2]['stream'] is None, (again.call('GET', '/api/stream')[2], again.kids()))
+            s, h, b = again.call('POST', f'/api/requests/{keep}/attention', {'message': 'still there?'}, headers={'Content-Type': 'application/json'})
+            check("...the agent's next write about it says the board restarted, and how to open the stream again", s == 200
+                  and f'taskctl stream {keep} URL' in (b.get('restarted') or {}).get('message', ''), b)
+            check('...and opening it again works', again.call('PUT', f'/api/requests/{keep}/stream', {'url': f'{FAKE}/hang?k=1'})[0] == 201)
         finally:
             again.stop()
-        no_traceback(again, 'reqpersist (second run)')
+        no_traceback(again, 'reqrestart (second run)')
     finally:
         srv.stop()
 
@@ -2132,135 +2124,59 @@ def new_on(board, title):
     return board.call('POST', '/api/requests', {'title': title, 'tasks': ['one']}, headers={'Content-Type': 'application/json'})[2]['id']
 
 
-def phase_persistence():
-    S.section('persistence: the open stream is kept and reopened by the next run of the board')
-    srv = Board('persist').start()
+def phase_restart():
+    S.section('a restart reopens no stream, and nothing is ever saved for one')
+    srv = Board('restart').start()
     port = srv.port
     url = 'http://user:s3cr3t@fake.invalid/hang?keep=1'
     try:
-        s, h, b = srv.post(url)
-        first = b['stream']
-        stray = lambda: sorted(p.name for p in TMP.iterdir() if p.name.startswith('.persist') or p.name.endswith('.tmp'))  # noqa: E731
-        saved = lambda: json.loads(srv.stream_file.read_text())['streams']  # noqa: E731
-        check('a saved stream: <db>.stream.json holds {"streams": [{id, request_id: null, url (the real one), opened_at}]}, mode 0600, '
-              'nothing else beside it', srv.stream_file.exists()
-              and json.loads(srv.stream_file.read_text()) == {'streams': [{'id': first['id'], 'request_id': None, 'url': url,
-                                                                           'opened_at': first['opened_at']}]}
-              and oct(srv.stream_file.stat().st_mode & 0o777) == '0o600' and stray() == [],
-              (srv.stream_file.read_text() if srv.stream_file.exists() else None, stray()))
-        check('...it is named after the database (server.db -> server.stream.json)', srv.stream_file.name == 'persist.stream.json'
-              and srv.stream_file.parent == srv.db.parent, srv.stream_file)
-        s, h, b = srv.post(url + '&second=1')
-        second = b['stream']
-        check('a replacing stream rewrites it, still 0600', [x['id'] for x in saved()] == [second['id']]
-              and oct(srv.stream_file.stat().st_mode & 0o777) == '0o600'
-              and stray() == [], srv.stream_file.read_text())
-        s, h, b = srv.post(url + '&second=1')
-        check('the same URL again: the file is as it was', [x['id'] for x in saved()] == [second['id']])
+        srv.post(url)
+        stray = lambda: sorted(p.name for p in TMP.iterdir() if p.name.startswith('.restart') or (p.name.startswith('restart') and p.name.endswith('.tmp')))  # noqa: E731
+        check('an open stream: no file for it (no <db>.stream.json, no temp file), and its password nowhere on disk',
+              not srv.stream_file.exists() and stray() == [] and b's3cr3t' not in srv.db.read_bytes(), (srv.stream_file.exists(), stray()))
         pid = wait_until(lambda: (srv.spawns() or [{}])[-1].get('pid'), 5)
-        before_log = srv.log_text()
         code = srv.stop()
-        check('SIGTERM: exit 0, no pidfile, no ffmpeg left', code == 0 and not srv.pidfile.exists() and pid and wait_until(lambda: not alive(pid), 3),
-              (code, pid))
-        check('...and the file is still there (only DELETE removes it)', srv.stream_file.exists()
-              and [x['id'] for x in saved()] == [second['id']])
-        check('...nothing in the log about a failure', 'Traceback' not in before_log)
-
-        again = Board('persist', port=port, fresh_db=False).start()
-        st = again.stream()
-        check('the next run of the board has the same stream: id, URL (redacted), opened_at', st is not None and st['id'] == second['id']
-              and st['url'] == 'http://***@fake.invalid/hang?keep=1&second=1'
-              and st['opened_at'] == second['opened_at'] and st['state'] == 'connecting', st)
-        check('...with its ffmpeg running, and the log saying it was reopened (no password)', wait_until(lambda: len(again.kids()) == 1, 5)
-              and 'reopened after a restart' in again.log_text()
-              and 's3cr3t' not in again.log_text(), again.log_text()[-500:])
-        check('...and a newer URL still replaces it', again.post(url + '&third=1')[2]['stream']['id'] != second['id'])
-        s, h, b = again.call('DELETE', '/api/stream')
-        check('DELETE removes the file', b['closed'] is True and not again.stream_file.exists())
+        check('SIGTERM: exit 0, no pidfile, no ffmpeg left, still no file', code == 0 and not srv.pidfile.exists() and pid
+              and wait_until(lambda: not alive(pid), 3) and not srv.stream_file.exists(), (code, pid))
+        ran = len(srv.spawns())     # the fake's log goes on across runs of a board of the same name
+        again = Board('restart', port=port, fresh_db=False).start()
+        time.sleep(1)
+        check('the next run of the board starts with no stream and runs no ffmpeg', again.stream() is None
+              and again.call('GET', '/api/events')[2]['streams'] == [] and again.kids() == [] and len(again.spawns()) == ran
+              and 'reopened' not in again.log_text(), again.log_text()[-400:])
         again.stop()
-        later = Board('persist', port=port, fresh_db=False).start()
-        check('...and the next run starts with no stream', later.stream() is None and later.call('GET', '/api/events')[2]['stream'] is None)
-        later.stop()
-        no_traceback(again, 'persist (second run)')
-        no_traceback(later, 'persist (third run)')
+        no_traceback(again, 'restart (second run)')
     finally:
         srv.stop()
 
-    S.section('persistence: a file that cannot be used is ignored with a warning, the board starts')
-    good_url = f'{FAKE}/hang'
-    cases = [('not JSON', b'\x00\xff this is { not json', 'ignored'), ('empty', b'', 'ignored'), ('a JSON list', b'[1, 2]', 'ignored'),
-             ('a JSON string', b'"http://fake.invalid/hang"', 'ignored'), ('no url', json.dumps({'id': '0123456789ab'}).encode(), 'ignored'),
-             ('a url of the wrong type', json.dumps({'url': 5, 'id': '0123456789ab'}).encode(), 'ignored'),
-             ('a file: URL', json.dumps({'url': 'file:///etc/passwd', 'id': '0123456789ab', 'opened_at': 1.0}).encode(), 'ignored'),
-             ('a URL with a space', json.dumps({'url': 'http://h/a b', 'id': '0123456789ab'}).encode(), 'ignored'),
-             ('a URL over 2048 characters', json.dumps({'url': 'http://h/' + 'a' * 3000}).encode(), 'ignored')]
-    srv = Board('corrupt')
-    for label, data, warn in cases:
-        srv.stream_file.write_bytes(data)
+    S.section('a restart: the file an older board kept its streams in is removed, and opens nothing')
+    good_url = 'http://user:s3cr3t@fake.invalid/hang'
+    srv = Board('older')
+    for label, data in (('an older board\'s single stream', json.dumps({'id': '0123456789ab', 'url': good_url, 'opened_at': 1234.5})),
+                        ('a file of streams, a request\'s among them', json.dumps({'streams': [{'id': '0123456789ab', 'request_id': None, 'url': good_url,
+                                                                                               'opened_at': 1.5},
+                                                                                              {'id': 'abcdefabcdef', 'request_id': 'k3m9qa', 'url': good_url,
+                                                                                               'opened_at': 2.5}]})),
+                        ('a corrupt one', '\x00 not json {')):
+        srv.stream_file.write_text(data)
+        srv.stream_file.chmod(0o600)
         srv.fresh_db = False
         srv.start()
         try:
-            check(f'{label}: no stream, the board is up, a warning in the log', srv.stream() is None and srv.call('GET', '/api/health')[0] == 200
-                  and 'WARNING' in srv.log_text() and 'stream file' in srv.log_text() and 'Traceback' not in srv.log_text() and srv.kids() == [],
+            time.sleep(0.8)
+            check(f'{label}: removed at start (logged), no stream, no ffmpeg, the board up', not srv.stream_file.exists()
+                  and srv.stream() is None and srv.kids() == [] and srv.spawns() == [] and srv.call('GET', '/api/health')[0] == 200
+                  and f'removed {srv.stream_file}' in srv.log_text() and 's3cr3t' not in srv.log_text() and 'Traceback' not in srv.log_text(),
                   srv.log_text()[-400:])
         finally:
             srv.stop()
-    srv.stream_file.write_text(json.dumps({'url': good_url, 'id': 'zzz', 'opened_at': 'yesterday'}))
-    srv.start()
-    try:
-        st = srv.stream()
-        check('an id that is not 12 hex digits and an opened_at that is no number: the stream opens with a new id, opened_at now', st is not None
-              and ID_RE.fullmatch(st['id']) and st['id'] != 'zzz'
-              and abs(st['opened_at'] - time.time()) < 30 and st['url'] == good_url, st)
-    finally:
-        srv.stop()
-    srv.stream_file.write_text(json.dumps({'url': good_url, 'id': 'AB' * 6, 'opened_at': 1234.5}))
-    srv.start()
-    try:
-        st = srv.stream()
-        check('an id in capitals is not an id (lower-case hex only): a new one; a good opened_at is kept', st is not None and st['id'] != 'AB' * 6
-              and ID_RE.fullmatch(st['id']) and st['opened_at'] == 1234.5, st)
-    finally:
-        srv.stop()
-    srv.stream_file.write_text(json.dumps({'url': good_url, 'id': '0123456789ab', 'opened_at': 1234.5}))
+    srv.stream_file.write_text(json.dumps({'id': '0123456789ab', 'url': good_url, 'opened_at': 1234.5}))
     srv.stream_file.chmod(0o000)
     srv.start()
     try:
-        check('an unreadable file: ignored with a warning (the board runs as its owner, so this needs a non-root user)', os.geteuid() == 0
-              or (srv.stream() is None and 'cannot read it' in srv.log_text()), srv.log_text()[-300:])
+        check('one its owner cannot read is removed all the same', not srv.stream_file.exists() and srv.stream() is None, srv.log_text()[-300:])
     finally:
         srv.stop()
-    srv.stream_file.chmod(0o600)
-    srv.stream_file.write_text(json.dumps({'streams': [{'url': good_url, 'id': '0123456789ab', 'opened_at': 1.5, 'request_id': None},
-                                                       {'url': 5, 'request_id': None}, ['a list'], {'url': good_url, 'request_id': 'NOT-AN-ID'},
-                                                       {'url': good_url + '?2', 'id': '0123456789ab', 'request_id': None}]}))
-    before = srv.stream_file.read_text()
-    srv.start()
-    try:
-        st = srv.call('GET', '/api/stream')[2]
-        check('a file of streams with bad entries: the good one opens, each bad one (no usable url, not an object, an id that is not a request\'s, '
-              'a second one for the board) is a warning', st['stream'] is not None and st['stream']['id'] == '0123456789ab' and len(st['streams']) == 1
-              and srv.log_text().count('an entry ignored') == 4 and 'a second stream for the board' in srv.log_text(), (st, srv.log_text()[-900:]))
-        check('...and the file is left as it was (nothing ended: only the bad entries were skipped)', srv.stream_file.read_text() == before)
-    finally:
-        srv.stop()
-    srv.stream_file.write_text(json.dumps({'streams': 5}))
-    srv.start()
-    try:
-        check('streams that is not a list: ignored with a warning', srv.call('GET', '/api/stream')[2]['streams'] == []
-              and 'stream file' in srv.log_text() and 'Traceback' not in srv.log_text(), srv.log_text()[-300:])
-    finally:
-        srv.stop()
-    nof = Board('nofile', ffmpeg='none', port=srv.port, fresh_db=False)
-    nof.stream_file.write_text(json.dumps({'url': good_url, 'id': '0123456789ab', 'opened_at': 1234.5}))
-    nof.start()
-    try:
-        st = nof.stream()
-        check('a stream reopened with no ffmpeg installed: it is there, connecting, and the log says what is missing', st is not None
-              and st['id'] == '0123456789ab' and wait_until(lambda: nof.stream()['error'], 4)
-              and 'ffmpeg is not installed, so the stream cannot play' in nof.log_text(), nof.log_text()[-400:])
-    finally:
-        nof.stop()
 
 
 def phase_shutdown():
@@ -2279,8 +2195,8 @@ def phase_shutdown():
             code = None
         took = time.monotonic() - t
         check(f'SIGTERM: exit 0 within 5 s ({took:.2f}s), the pidfile is removed', code == 0 and took < 5 and not srv.pidfile.exists(), (code, took))
-        check('...every viewer is ended, ffmpeg is gone, the stream stays saved', all(r.wait_closed(2) for r in readers) and not alive(pid)
-              and srv.stream_file.exists(),
+        check('...every viewer is ended, ffmpeg is gone, and nothing is saved for the next run', all(r.wait_closed(2) for r in readers)
+              and not alive(pid) and not srv.stream_file.exists(),
               ([r.closed for r in readers], alive(pid)))
         check('...the log shows a clean shutdown', 'shutting down' in srv.log_text() and 'Traceback' not in srv.log_text(), srv.log_text()[-500:])
         for r in readers:
@@ -2321,7 +2237,7 @@ def phase_shutdown():
         srv.proc.wait(5)
         check('SIGKILL of the board while ffmpeg writes: ffmpeg notices its reader is gone and exits by itself (within 3 s)',
               wait_until(lambda: not alive(pid), 3), pid)
-        check('...and the saved stream is still there for the next run', srv.stream_file.exists())
+        check('...and nothing is saved for the next run', not srv.stream_file.exists())
     finally:
         srv.stop()
         if alive(pid):
@@ -2790,8 +2706,8 @@ def rc_orphans():
             took = time.monotonic() - t
             ck(f'SIGTERM with three viewers on a live stream: exit 0 within 5 s ({took:.1f}s), no pidfile', code == 0 and took < 5
                and not srv.pidfile.exists(), (code, took))
-            ck('...ffmpeg is gone, the viewers are ended, the stream is kept for the next run', pid is not None and not alive(pid)
-               and all(r.wait_closed(2) for r in readers) and srv.stream_file.exists(),
+            ck('...ffmpeg is gone, the viewers are ended, nothing is saved for the next run', pid is not None and not alive(pid)
+               and all(r.wait_closed(2) for r in readers) and not srv.stream_file.exists(),
                (pid, [r.closed for r in readers]))
             for r in readers:
                 r.close()
@@ -3007,7 +2923,7 @@ if __name__ == '__main__':
     run_group('the lighter qualities: one transcoder per quality, idle stop, the run ending, failures, slowness', sc_rend_basic, sc_rend_run,
               sc_rend_fail, sc_rend_slow, limit=150)
     phase_requests()
-    phase_persistence()
+    phase_restart()
     phase_shutdown()
     phase_https()
     phase_real()

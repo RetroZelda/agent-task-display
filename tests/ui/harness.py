@@ -67,6 +67,8 @@ The live stream (tests/ui/stream*.js, tests/lib/fake_ffmpeg.py as the board's ff
                            /__stream?raw=<json>[&src=U] injects that JSON itself as the "stream" and the one item
                            of "streams" (raw=missing: neither key, as a board older than streams answers): what a
                            page must cope with
+  GET  /__boot?id=ID|missing|off   /api/events names this boot_id (a restarted board, as the page sees it), or none
+                           (missing: an older board), or the board's own again (off)
   __shot=1                 (read by _lib.js) __t.cleanup() leaves the frames and the stream as they are, so the
                            screenshot shows them (test_ui.py passes it when UI_SHOTS_DIR is set)
 """
@@ -167,6 +169,7 @@ LOCK = threading.Lock()
 FRAME = (b'<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><title>Task Status frames</title>'
          b'<style>html, body { margin: 0; background: #9aa0a6; } iframe { position: absolute; border: 0; background: #fff; }</style>'
          b'</head><body></body></html>')
+BOOT = [None]       # /__boot: the boot_id /api/events names instead of the board's (MISSING: no key); None: the board's own
 STREAM = [None]     # the injected stream: {'obj': what /api/events carries, 'url': the fake ffmpeg URL its media is made from}
 MISSING = object()  # as 'obj': /api/events has no stream key at all (an older board)
 
@@ -214,6 +217,10 @@ class Handler(server.Handler):
                     payload['streams'] = [] if injected['obj'] is None else [injected['obj']]
             if parse_qs(split.query).get('__noclock'):
                 payload.pop('clock', None)
+            if BOOT[0] is MISSING:
+                payload.pop('boot_id', None)
+            elif BOOT[0] is not None:
+                payload['boot_id'] = BOOT[0]
         super()._reply(code, payload)
 
     def _stream_hook(self, q):
@@ -326,6 +333,10 @@ class Handler(server.Handler):
             return self._raw(204, b'', 'text/plain')
         if split.path == '/__stream':
             return self._stream_hook(q)
+        if split.path == '/__boot':
+            value = q.get('id', [''])[0]
+            BOOT[0] = None if q.get('off') else MISSING if value == 'missing' else value
+            return self._raw(200, b'{}', 'application/json')
         if split.path.startswith('/__test/'):
             name = split.path[len('/__test/'):]
             if not re.fullmatch(r'_?[a-z]+\.js', name) or not (UI / name).is_file():

@@ -1,6 +1,6 @@
 # Task status board: instructions for agents
 
-{{BASE_URL}} is a task-status board (API version {{VERSION}}, docs {{DOCS_VERSION}}). A person
+{{BASE_URL}} is a task-status board (release {{RELEASE}}, API version {{VERSION}}, docs {{DOCS_VERSION}}). A person
 watches it in a browser to follow long-running work that AI agents do for them, instead of asking for
 status. You report to it: one titled **request** per job your user gives you, one **task** per step
 (or per subagent), progress updates (a percent, a hint of what is happening right now, an optional
@@ -104,10 +104,21 @@ database busy (retry after a second) or a live stream that is not connected yet.
 Browser-style writes (POST, PUT, DELETE) with a foreign `Origin` header get 403. A success body has
 `"warnings": [...]` when something was truncated, clamped or ignored, such as a misspelled field.
 
-Every response, errors included, carries two headers: `X-Tasks-Version` (the API version, now
-{{VERSION}}) and `X-Tasks-Docs` (a hash of this text, the rule, the changelog, the skill and taskctl,
-now {{DOCS_VERSION}}). When `X-Tasks-Docs` differs from the value you read here, these instructions
-have changed: read {{BASE_URL}}/api/changelog and this page again.
+Every response, errors included, carries four headers: `X-Tasks-Version` (the API version, now
+{{VERSION}}), `X-Tasks-Release` (the board's release, now {{RELEASE}}), `X-Tasks-Docs` (a hash of this
+text, the rule, the changelog, the skill and taskctl, now {{DOCS_VERSION}}) and `X-Tasks-Boot` (new at
+every start of the board). The release is MAJOR.MINOR.PATCH (major: significant changes, minor: new
+features, patch: fixes), and these instructions change only with it: when `X-Tasks-Release` differs
+from {{RELEASE}}, read {{BASE_URL}}/api/changelog and this page again. Every request you create carries
+the `release` it began under.
+
+Restarts and updates. The board keeps its requests, tasks and reports when it restarts, but no live
+stream (below) survives a restart. The first write you make about your request (progress, complete,
+attention, tasks, report or stream) after the board restarted gains `"restarted": {boot_id, at,
+message}`: open your request's stream again if it had one. The first one after the board moved to
+another release while your request ran (an update) gains `"release_changed": {previous, release,
+message}`: read this page (and the skill, if you use it) again before you go on. Each comes once per
+request; taskctl prints both on stderr.
 
     GET    /                              the dashboard in a browser, this text otherwise
     GET    /r/<rid>                       a request's page
@@ -118,7 +129,8 @@ have changed: read {{BASE_URL}}/api/changelog and this page again.
     GET    /api/skill/taskctl             the CLI wrapper (POSIX sh)
     GET    /api/skill/taskctl.py          the CLI (Python 3.8+, this board's URL baked in)
     GET    /api/health                    {ok, service: "tasks", version, docs_version, tls_port,
-                                          config_path, pid, now, started_at, requests_running}
+                                          config_path, pid, now, started_at, requests_running, boot_id,
+                                          release}
     POST   /api/requests                  {title, origin?, tasks?: [title, ...], id?} -> 201 the request
                                           with its id, url and tasks[] (all pending); see "Request ids"
     GET    /api/requests                  ?status=running|done|failed&limit=N&offset=M -> {now, stale_after,
@@ -160,7 +172,8 @@ Fields worth knowing. A request has `id`, `title`, `status` (running, done or fa
 `tasks_done` and `tasks_total` (X/Y; cancelled tasks are not counted), `current` (the latest running
 task), `stale`, `url`, `attention` (its own flag: `{"message", "since"}` or null), `waiting` (true
 while it is running and it or one of its running tasks has a flag) and `tasks_waiting` (how many
-running tasks have one) and `stream` (its live stream, below, or null). A task has `id`, `title`, `status` (pending, running, done, failed or
+running tasks have one), `stream` (its live stream, below, or null) and `release` (the release it began
+under, or the one the last `release_changed` named). A task has `id`, `title`, `status` (pending, running, done, failed or
 cancelled), `percent`, `message`, `eta_remaining`, `elapsed`, `stale`, `url` and `attention`. The
 list's `counts` has `running`, `stale`, `done`, `failed` and `waiting`.
 
@@ -195,8 +208,8 @@ then records the write at that time (clamped to the last 24 hours and never befo
 update) and marks its events as replayed. Without the header, `at` is ignored with a warning.
 
 Events. `GET /api/events` returns `{now, cursor, events[], truncated, waiting[], stale[],
-settings_version, stream, streams}` (`stream` is the board's own live stream, or null; `streams` is every
-open one, the requests' too). Without `since`, `events` is empty and `cursor` is the newest event id (0 when
+settings_version, stream, streams, clock, boot_id}` (`stream` is the board's own live stream, or null;
+`streams` is every open one, the requests' too). Without `since`, `events` is empty and `cursor` is the newest event id (0 when
 there are none): keep it and pass it as `since` next time. With `since`, `events` holds up to `limit`
 events with a larger id, oldest first; `truncated` is true when more remain (then `cursor` is the
 last one returned) or when events after `since` were already pruned (events are kept 7 days, at most
@@ -248,7 +261,7 @@ request's stream: 201, with `{now, request_id, stream, ffmpeg}`; a newer url rep
 old one, and the url that is already open is kept (200 with `"existing": true`) and retried at once.
 `taskctl stream k3m9qa --close` (DELETE) closes it (idempotent) and `taskctl stream k3m9qa` (GET)
 shows it. It needs a running request (a closed one is a 409), and it ends by itself when the request
-is completed or deleted. The board's own stream, not tied to any request, is `taskctl api POST
+is completed or deleted, and when the board restarts (see "Restarts and updates": open it again). The board's own stream, not tied to any request, is `taskctl api POST
 /api/stream '{"url": "http://camera.lan:8554/"}'`, `taskctl api DELETE /api/stream` and `taskctl api
 GET /api/stream`. At most 8 streams are open at once (one more is a 409). `ffmpeg` in the replies is the
 program the board runs for them, or null when the board host does not have it (`apt install ffmpeg`
@@ -260,9 +273,9 @@ video, audio, width, height, viewers, media}`: `request_id` is null for the boar
 "connecting" until a keyframe has gone out and "live" after that; `error` says why the last attempt
 failed (the board retries after 1, 2, 4, 8 and then every 10 seconds); `video` and `audio` are codec
 strings such as avc1.42C028 and mp4a.40.2, null until known or when there is no such track; `url`
-shows a `user:password@` as `***@`. The same object is a request's `stream`, and in /api/events. The
-streams are saved on the board host and reopen when the board restarts (a request's only while it
-runs). `media` is the path of the stream itself, which only the dashboard needs.
+shows a `user:password@` as `***@`. The same object is a request's `stream`, and in /api/events. A
+restart of the board opens none of them again. `media` is the path of the stream itself, which only the
+dashboard needs.
 
 Examples: create a request with its tasks, report on one of the returned task ids, flag a question
 and clear it, close the task, then the request, and read it back:

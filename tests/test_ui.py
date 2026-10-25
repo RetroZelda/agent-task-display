@@ -1387,7 +1387,7 @@ def assert_panel(r, srv):
 
 STREAM_JSON = {'Content-Type': 'application/json'}
 STREAM_NAMES = ('layout', 'audio', 'held', 'swap', 'retry', 'multi', 'panel', 'hevc', 'player', 'fault', 'life', 'nav', 'offline', 'odd', 'check',
-                'layoutold', 'audioold', 'full', 'pick')
+                'layoutold', 'audioold', 'full', 'pick', 'restart')
 RESULTS_STREAM: dict = {}
 
 
@@ -1466,6 +1466,7 @@ def _stream_cases(boards, play):
              frame_case('layout', 36000), frame_case('nav', 30000), frame_case('life', 24000), frame_case('held', 30000),
              frame_case('swap', 22000), frame_case('hevc', 20000), frame_case('odd', 32000), frame_case('audio', 14000),
              frame_case('multi', 14000), frame_case('panel', 30000), frame_case('full', 70000), frame_case('pick', 40000),
+             frame_case('restart', 30000),
              # the same two scripts on boards read as a browser without dvh units reads them (Chrome before 108)
              ('streamlayoutold', boards['layoutold'].url, '/__frame', 1280, 'light', 'streamlayout', 36000, keep + '&__nodvh=1', (), 900),
              ('streamaudioold', boards['audioold'].url, '/__frame', 1280, 'light', 'streamaudio', 14000, keep + '&__nodvh=1', (), 900),
@@ -1499,6 +1500,7 @@ def _stream_cases(boards, play):
     assert_streamodd(res['streamodd'])
     assert_streamfull(res['streamfull'])
     assert_streampick(res['streampick'])
+    assert_streamrestart(res['streamrestart'])
     S.section('stream: the list and detail checks, repeated with a stream open')
     for name, theme, width, height, rows in (('stream_check_390', 'light', 390, 900, n_requests), ('stream_check_1280_dark', 'dark', 1280, 900, n_requests),
                                              ('stream_check_844x390', 'light', 844, 390, n_requests), ('stream_check_detail_390', 'light', 390, 900, wait_rows)):
@@ -1964,6 +1966,20 @@ def assert_streampick(r):
     check("pick: A completed: its stream ends with it (none in its reply, only the board's own left) and its finished row has no checkbox",
           r['doneA'] is None and r['streamsLeft'] == [None] and fa['picks']['a'] is None and fa['marker'] == 'O', (r['doneA'], r['streamsLeft'], fa['picks']))
     check('pick: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+def assert_streamrestart(r):
+    S.section('stream: the board restarting under an open page')
+    if not got('streamrestart', r):
+        return
+    check('restart: a new boot_id in the events: the page reloads by itself (a reload, not a navigation)', r['before']['streaming']
+          and r['reloaded'] and r['after']['nav'] == 'reload' and r['after']['rows'] == 1, (r['before'], r['reloaded'], r['after']))
+    check('restart: ...and starts over from the board as it is: the stream the restart dropped is gone', r['after']['streaming'] is False
+          and r['after']['hidden'] is True, r['after'])
+    check('restart: with the Settings dialog open it waits (no reload, the dialog stays), and reloads once it closes',
+          r['waited'] == {'mark': 'dialog', 'open': True} and r['closedReload'], (r['waited'], r['closedReload']))
+    check('restart: a board that names no start (an older one) never makes it reload', r['older'] == {'mark': 'older'}, r['older'])
+    check('restart: no JS errors', r['errors'] == [[]], r['errors'])
 
 
 def assert_streamoffline(r):

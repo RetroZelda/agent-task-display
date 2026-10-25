@@ -249,8 +249,8 @@ S.section('client-made ids and baked values')
 ids = {tc.new_request_id() for _ in range(300)}
 S.check('new_request_id: 6 chars of the alphabet, and random', all(tc.REQUEST_RE.fullmatch(i) for i in ids) and len(ids) > 290, sorted(ids)[:5])
 eq('baked: an unrendered value is None', (tc.baked('{{DOCS_VERSION}}'), tc.baked('abc123def456')), (None, 'abc123def456'))
-S.check('the repo file carries the three unrendered baked lines', tc.BAKED_URL == '{{BASE_URL}}' and tc.BAKED_DOCS == '{{DOCS_VERSION}}'
-        and tc.BAKED_API == '{{VERSION}}', (tc.BAKED_URL, tc.BAKED_DOCS, tc.BAKED_API))
+S.check('the repo file carries the four unrendered baked lines', tc.BAKED_URL == '{{BASE_URL}}' and tc.BAKED_DOCS == '{{DOCS_VERSION}}'
+        and tc.BAKED_API == '{{VERSION}}' and tc.BAKED_RELEASE == '{{RELEASE}}', (tc.BAKED_URL, tc.BAKED_DOCS, tc.BAKED_API, tc.BAKED_RELEASE))
 
 S.section('queued records: valid_record, write_target, coalesce')
 
@@ -465,9 +465,20 @@ eq('since 3: nothing newer, so the newest', tc.whats_new(CL, 3), '## v3 — 2026
 eq('no API version: the newest', tc.whats_new(CL, None), '## v3 — 2026-10-01\n- three')
 eq('no headings: the whole text', tc.whats_new('  just text\n', 1), 'just text')
 real = (Path(TASKCTL_PY).parent / 'templates' / 'changelog.md').read_text()
-S.check("the real changelog: a v1 CLI is told v3 and v2, not v1", tc.whats_new(real, 1).startswith('## v3 — ')
-        and '## v2 — ' in tc.whats_new(real, 1) and '## v1' not in tc.whats_new(real, 1), tc.whats_new(real, 1)[:200])
-S.check("the real changelog: a v2 CLI is told v3 alone", tc.whats_new(real, 2).startswith('## v3 — ')
-        and '## v2' not in tc.whats_new(real, 2), tc.whats_new(real, 2)[:200])
+S.check("the real changelog: a v1 CLI is told 1.0.0, v3 and v2, not v1", tc.whats_new(real, 1).startswith('## 1.0.0 — ')
+        and '## v3 — ' in tc.whats_new(real, 1) and '## v2 — ' in tc.whats_new(real, 1) and '## v1' not in tc.whats_new(real, 1),
+        tc.whats_new(real, 1)[:200])
+S.check("the real changelog: a v3 CLI is told 1.0.0 alone", tc.whats_new(real, 3).startswith('## 1.0.0 — ')
+        and '## v3' not in tc.whats_new(real, 3), tc.whats_new(real, 3)[:200])
+
+S.section('releases: MAJOR.MINOR.PATCH, and the API versions from before them')
+eq('release_key: a release, an API version (an int, a digit string or vN, as 0.N.0), anything else None',
+   [tc.release_key(x) for x in ('1.2.3', 3, '3', 'v3', '1.2', 'x', None, ' 10.0.1 ')], [(1, 2, 3), (0, 3, 0), (0, 3, 0), (0, 3, 0), None, None, None, (10, 0, 1)])
+S.check('release_key orders them as numbers, not text: 1.10.0 after 1.9.0, every release after every API version',
+        tc.release_key('1.10.0') > tc.release_key('1.9.0') > tc.release_key('1.0.0') > tc.release_key(3))
+RL = '## 1.10.0 — 2026-12-01\n- ten\n\n## 1.9.1 — 2026-11-02\n- fix\n\n## 1.0.0 — 2026-10-25\n- first\n\n## v3 — 2026-10-01\n- three\n'
+eq('since 1.9.0: 1.10.0 and 1.9.1 (numbers, not text)', tc.whats_new(RL, '1.9.0'), '## 1.10.0 — 2026-12-01\n- ten\n\n## 1.9.1 — 2026-11-02\n- fix')
+eq('since API 3 (a CLI from before releases): every release', tc.whats_new(RL, 3).count('\n## '), 2)
+eq('since the newest: nothing newer, so the newest', tc.whats_new(RL, '1.10.0'), '## 1.10.0 — 2026-12-01\n- ten')
 
 sys.exit(S.finish())

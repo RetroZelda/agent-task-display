@@ -57,6 +57,11 @@
   version, which reloads the frame, as does this device's theme (passed as ?theme=). The request's page has a
   Report button, and list rows say "report".
 
+  Restarts: /api/events names the board's start ("boot_id", new at every start). When it changes, the board restarted
+  (an update, a reboot): the page reloads, so it starts over from the board as it is now, its code included, and plays
+  whatever streams are open now (a restart opens none). A page whose Settings dialog is open waits for it to close, so
+  nothing typed there is lost.
+
   Pages: the list shows every running request, and the finished ones a page at a time (newest first), 10, 20, 50 or
   100 to a page as this device chose (kept in this browser); the page itself is kept in the history entry, so Back
   from a request returns to it. Clear deletes every finished request, on every page.
@@ -819,6 +824,8 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
     let remindSince = 0;
     let local = loadLocal();
     let boardClock = null;      // /api/events "clock" as {offset, tz}: the board host's zone now; null until the board says (or never, an older one)
+    let bootId = null;          // /api/events "boot_id": the board's start this page was built from; null until it says (or never, an older one)
+    let reloadPending = false;  // the board restarted while the Settings dialog was open: reload once it closes
     let globalSettings = DEFAULTS;
     let boardDefaults = DEFAULTS;
     // parts: the top-level keys of the board's settings, which a save sends no more than (an older board refuses "tasks")
@@ -1280,6 +1287,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         } catch (e) {
             console.error('clock failed', e);
         }
+        if (events && applyBoot(events.boot_id)) return;    // the page reloads
         if (missing) renderNotFound(missing === 404 ? (loaded ? 'deleted' : 'unknown') : 'invalid', error);
         if (notFound) {
             flashQueue = [];                // no rows to flash
@@ -1319,6 +1327,30 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         text += busy || wait <= 0 || !timer ? 'Retrying now' : 'Retrying in ' + wait + 's';
         text += lastOkAt ? ' · last update ' + fmtAgo((Date.now() - lastOkAt) / 1000) : ' · not connected yet';
         setText($('banner-text'), text);
+    }
+
+    // The board's start, from every events answer: another one than this page knows means the board restarted, and the
+    // page starts over (true: it is reloading, nothing more to do).
+    function applyBoot(id) {
+        if (typeof id !== 'string' || !id) return false;    // an older board names no start
+        if (bootId === null) bootId = id;
+        if (id === bootId) return false;
+        bootId = id;
+        return restartPage();
+    }
+
+    // Reload, so the page is built anew from the board as it is now (its code too). Not under an open Settings dialog:
+    // it waits for the dialog to close. The board's scroll position is kept in this history entry for the reload.
+    function restartPage() {
+        if ($('settings').open) {
+            reloadPending = true;
+            return false;
+        }
+        reloadPending = false;
+        saveBoardScroll();
+        stopPlayer();
+        location.reload();
+        return true;
     }
 
     // Writes carry JSON with an explicit Content-Type; the result never throws.
@@ -2508,8 +2540,11 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
 
     function closeSettings() {
         const dlg = $('settings');
-        if (typeof dlg.close === 'function') dlg.close();
-        else dlg.removeAttribute('open');
+        if (typeof dlg.close === 'function') dlg.close();      // its close event follows
+        else {
+            dlg.removeAttribute('open');
+            if (reloadPending) restartPage();
+        }
     }
 
     function selectTab(name) {
@@ -2593,6 +2628,9 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         $('settings-close').addEventListener('click', closeSettings);
         dlg.addEventListener('click', (e) => {
             if (e.target === dlg) closeSettings();  // a click on the backdrop
+        });
+        dlg.addEventListener('close', () => {       // the button, the backdrop or Escape
+            if (reloadPending) restartPage();
         });
         $('bell').addEventListener('click', () => setSound(!local.sound_enabled));
         $('tab-device').addEventListener('click', () => selectTab('device'));

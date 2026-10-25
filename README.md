@@ -27,8 +27,10 @@ one `curl` line.
   dashboard on a portrait screen and to its right on a landscape one. See [Live stream](#live-stream).
 - **Works offline**: when the board is unreachable, `taskctl` queues the reports on the agent's machine
   and replays them, with their original times, once the board is back.
-- **Keeps agents current**: when the board's agent instructions change, every installed `taskctl`
-  updates its skill on its next call and tells the agent what is new.
+- **Keeps agents current**: the board has a release number (now 1.0.0). When the agent instructions
+  change, every installed `taskctl` updates its skill on its next call, and agents re-read them only
+  when the release changed, including an agent whose request was running when the update came. See
+  [Releases and restarts](#releases-and-restarts).
 - **One-line setup** for agents on other machines, and a launcher (`tasks.sh`) for the board host.
 
 ## Contents
@@ -42,6 +44,7 @@ one `curl` line.
 - [Notifications and settings](#notifications-and-settings)
 - [Reports](#reports)
 - [Live stream](#live-stream)
+- [Releases and restarts](#releases-and-restarts)
 - [taskctl reference](#taskctl-reference)
 - [HTTP API](#http-api)
 - [Networking and security](#networking-and-security)
@@ -454,6 +457,8 @@ curl -sS --noproxy '*' -X DELETE http://<board-host>:8765/api/stream        # cl
   other tabs of that browser follow it. Going to a request and back to the list plays the pick again.
 - **A request's stream** needs a running request (a closed one is refused) and ends when the request is
   completed, by its agent, the dashboard or expiry, or deleted; reopening the request does not bring it back.
+  No stream survives a restart of the board: the agent is told on its next command and opens it again
+  (see [Releases and restarts](#releases-and-restarts)).
   One per request: a newer URL replaces it. At most 8 streams are open at once, the board's own included.
 
 A newer URL replaces the open one; sending the open URL again keeps it and retries at once. The URL is
@@ -501,11 +506,38 @@ so the name must resolve and be reachable from there.
 - **Trouble**: a run of `ffmpeg` that fails or ends starts again after 1, 2, 4, 8 and then every 10
   seconds, and the pane keeps showing *connecting* with its timer. The reason (`Connection refused`, `Server
   returned 404`, `ffmpeg is not installed on the board host`) is the `error` of `GET /api/stream`. A source that announces audio
-  but never sends it, or stops sending it, is played without audio. The open streams are saved in
-  `tasks/data/tasks.stream.json` and reopen when the board restarts (a request's only while the request runs).
+  but never sends it, or stops sending it, is played without audio. A restart of the board reopens no
+  stream.
 - **Limits**: 16 pages at a time for each stream; a tab that has been in the background for a minute lets go of the stream
   and reconnects when you come back. `ffprobe http://<board-host>:8765/api/stream/media` shows what the pages
   receive.
+
+## Releases and restarts
+
+The board has a release number, `MAJOR.MINOR.PATCH`, now **1.0.0**: the major number for significant
+changes (it should stay 1 for a long time), the minor for new features, the patch for fixes. The agent
+instructions change only with it, so agents re-read them only when it changes:
+
+- **New requests**: `taskctl new` prints the release the request begins under (`release: 1.0.0`). The
+  skill names its own release at the top, and an agent whose loaded copy names another one re-reads it.
+  A request on the same release costs no re-read.
+- **Updates during a request**: each request keeps its release. When the board moves to another release
+  while a request runs, its agent's next command about it says so, once, and the agent re-reads the
+  skill, even when another session on that machine already updated the files. A finished request is
+  never told.
+- **Self-update**: `taskctl` still updates the installed skill whenever the board's files change, but
+  says "re-read" only when the release changed; within a release it says there is nothing to re-read.
+- **Restarts**: the board keeps its database (requests, tasks, reports, history, settings) when it
+  restarts, but no live stream: a restart opens none. Every start has a new boot id (`X-Tasks-Boot`),
+  and the first command about a request that began before the restart says the board restarted, so its
+  agent opens its stream again if it had one. Open dashboards reload themselves when the board restarts
+  (a page with its Settings dialog open waits for it to close), so they show the board as it is now,
+  with its current code.
+
+**Making a release**: bump `RELEASE` in `tasks/server.py`, put a new entry for it at the top of
+`tasks/templates/changelog.md` (`## 1.1.0 — <date>`), and change the release line near the top of
+`tasks/skill/SKILL.md`. The tests check that the three agree. Every release, a patch included, makes
+running agents re-read their instructions, so bump it when something an agent should know changed.
 
 ## taskctl reference
 
@@ -609,7 +641,7 @@ shapes, validation, errors and state rules, is the module docstring of
 | GET | `/api/rule` | The `CLAUDE.md` rule block |
 | GET | `/api/changelog` | What each API version added, newest first (plain text) |
 | GET | `/api/skill/SKILL.md`, `/api/skill/taskctl`, `/api/skill/taskctl.py` | The skill and CLI files (`taskctl.py` has the board URL built in) |
-| GET | `/api/health` | `{ok, service, version, docs_version, tls_port, config_path, pid, now, started_at, requests_running}` |
+| GET | `/api/health` | `{ok, service, version, docs_version, tls_port, config_path, pid, now, started_at, requests_running, boot_id, release}` |
 | POST | `/api/requests` | Create a request: `{title, origin?, tasks?: [title], id?}` (an existing `id` with the same title returns that request) |
 | GET | `/api/requests` | List: running requests first, then finished ones (`?status=`, `?limit=`, `?offset=` to page the finished ones) |
 | GET | `/api/requests/<rid>` | One request with its tasks |
@@ -630,7 +662,7 @@ shapes, validation, errors and state rules, is the module docstring of
 | GET | `/api/stream/media` | An open stream as fragmented MP4, an endless response (`?id=`), which the dashboard plays; `&quality=light` or `stills` for a lighter copy |
 
 Requests and tasks have an `attention` field (`{message, since}` or null); a request also has
-`waiting`, `tasks_waiting` and `stream` (its open stream, or null), and the list's counts have `waiting`. A write sent with the header
+`waiting`, `tasks_waiting`, `stream` (its open stream, or null) and `release` (the release its agent is on), and the list's counts have `waiting`. A write sent with the header
 `X-Tasks-Replay: 1` and a body field `at` is recorded at that time (within the last 24 hours), which
 is how the offline queue keeps the original times.
 
@@ -669,8 +701,8 @@ curl -sS --noproxy '*' -X POST http://<board-host>:8765/api/tasks/k3m9qa-2/progr
   http(s), rtsp(s), rtmp(s), srt, udp and tcp URLs are accepted, `ffmpeg` is started with file, pipe and
   concat protocols off and without a proxy, and `udp://`, `srt://...mode=listener` and `tcp://...?listen=1`
   URLs make the board listen on a port. A `user:password@` in the URL is shown as `***@` by the API, the
-  page and the log, but `tasks/data/tasks.stream.json` (mode 600) and `ffmpeg`'s command line (`ps`) hold
-  it, and a query string is shown in full: keep secrets out of it.
+  page and the log, but `ffmpeg`'s command line (`ps`) holds it (nothing on disk does), and a query string
+  is shown in full: keep secrets out of it.
 - **Agents stay on plain http.** Over the HTTPS listener, the board address built into the usage
   text and `taskctl.py` is still the plain http one (same host name, http port), because a
   self-signed or mkcert certificate would make an agent's `curl` or Python refuse the connection.
@@ -691,8 +723,9 @@ curl -sS --noproxy '*' -X POST http://<board-host>:8765/api/tasks/k3m9qa-2/progr
 
 ## Data and retention
 
-State lives in SQLite at `tasks/data/tasks.db`, next to the pidfiles, the settings file and, while a
-live stream is open, `tasks.stream.json` (every open stream). The directory is gitignored. A database from an earlier version is upgraded in place on start.
+State lives in SQLite at `tasks/data/tasks.db`, next to the pidfiles and the settings file. Live streams
+are kept in memory only (a restart opens none; the `tasks.stream.json` an older board kept them in is
+removed at start). The directory is gitignored. A database from an earlier version is upgraded in place on start.
 `tasks.sh --bg` logs to `.logs/tasks_server.log`, which is also gitignored. These server flags
 control aging:
 

@@ -3,7 +3,8 @@
 CLAUDE_CONFIG_DIR/skills/task-status, downloaded from a scratch board): when a reply's X-Tasks-Docs
 differs from the baked BAKED_DOCS it replaces the three files atomically (modes 644/755/755, no temp
 files), refreshes the CLAUDE.md rule only where one is installed, and prints the exact notice with the
-changelog entries newer than its API version; the command's stdout and exit code never change; any
+changelog entries newer than its release when the release changed (within a release: one note that there is
+nothing to re-read); the command's stdout and exit code never change; any
 failure is one warning. Only its own board (the baked URL, whatever the spelling of its scheme's case or
 a trailing slash) updates it: a reply from another board (--url, TASKS_URL) changes nothing and says so
 in a note, and `update` refuses another board unless --force moves the skill there. TASKS_NO_UPDATE,
@@ -66,17 +67,27 @@ def served(url, name):
     return api(url, 'GET', '/api/skill/' + name, raw=True)[1]
 
 
-def notice(old, new, news):
-    return (f"taskctl: the board's agent instructions changed (docs {old} -> {new}); updated the skill in {SKILL}\n"
+def notice(old, new, news, was='1.0.0', now='1.1.0'):
+    return (f"taskctl: the board's agent instructions changed (release {was} -> {now}, docs {old} -> {new}); updated the skill in {SKILL}\n"
             "taskctl: what's new:\n" + news +
             f"\ntaskctl: re-read {SKILL}/SKILL.md before continuing; the copy loaded in your context is out of date\n")
+
+
+def release(tree, value):
+    """The tree as a board of release value: RELEASE in its server.py and the release line of its SKILL.md."""
+    for rel, old, new in (('server.py', "RELEASE = '1.0.0'", f"RELEASE = '{value}'"),
+                          ('skill/SKILL.md', "the board's release 1.0.0.", f"the board's release {value}.")):
+        text = (tree / rel).read_text()
+        assert old in text, (rel, old)
+        (tree / rel).write_text(text.replace(old, new, 1))
 
 
 def main():
     ta = tasks_copy(TMP / 'tasks_a')
     tb = tasks_copy(TMP / 'tasks_b')
     changelog = (tb / 'templates' / 'changelog.md').read_text()
-    (tb / 'templates' / 'changelog.md').write_text('## v4 — 2026-10-09\n- A newer thing.\n- And another.\n\n' + changelog)
+    (tb / 'templates' / 'changelog.md').write_text('## 1.1.0 — 2026-11-01\n- A newer thing.\n- And another.\n\n' + changelog)
+    release(tb, '1.1.0')
     rule = (tb / 'templates' / 'rule.md').read_text()
     (tb / 'templates' / 'rule.md').write_text(rule.replace('<!-- task-status:end -->', '- A new rule line for testing.\n<!-- task-status:end -->'))
     with open(tb / 'skill' / 'SKILL.md', 'a') as f:
@@ -141,12 +152,12 @@ def main():
         rc, out, err = tc('install-rule')
         check('install-rule from its own board puts the rule back', rc == 0 and (CC / 'CLAUDE.md').read_text() == md, (rc, err))
 
-        S.section('its own board serves newer instructions: the next reply updates the skill')
+        S.section('its own board serves a newer release: the next reply updates the skill and says to re-read it')
         serve(tb, 'b')
         rc, out, err = tc('ping')
         check("stdout and exit code are the command's own", rc == 0 and out == URL + '\n', (rc, out))
-        check('the exact notice ends stderr, with the changelog entries newer than its API version (v4)',
-              err.startswith('taskctl: ok: board at') and err.endswith(notice(DA, DB, '## v4 — 2026-10-09\n- A newer thing.\n- And another.')),
+        check('the exact notice ends stderr, with the changelog entries newer than its release (1.1.0 over 1.0.0)',
+              err.startswith('taskctl: ok: board at') and err.endswith(notice(DA, DB, '## 1.1.0 — 2026-11-01\n- A newer thing.\n- And another.')),
               err)
         for name in FILES:
             check(f'{name} is the board\'s copy now', (SKILL / name).read_bytes() == served(URL, name))
@@ -167,7 +178,7 @@ def main():
         serve(tb, 'b')
         rc, out, err = tc('--strict', 'show', 'zzzzzz')
         check('--strict show of an unknown id: exit 1, no stdout, the 404 error, then the notice', rc == 1 and out == ''
-              and 'error: board rejected GET /api/requests/zzzzzz: 404' in err and notice(DA, DB, '## v4').split('\n')[0] in err
+              and 'error: board rejected GET /api/requests/zzzzzz: 404' in err and notice(DA, DB, '## 1.1.0').split('\n')[0] in err
               and baked_docs() == DB, (rc, out, err))
 
         S.section('its own board under another spelling of its URL (the scheme\'s case, a trailing slash) is its own')
@@ -177,14 +188,29 @@ def main():
         rc, out, err = tc('--url', f'HTTP://127.0.0.1:{P}/', 'ping')
         check('HTTP://127.0.0.1:PORT/ ping: updated', rc == 0 and 'updated the skill in' in err and baked_docs() == DB, (rc, err))
 
-        S.section('no rule installed: CLAUDE.md untouched; nothing newer than the API version: the newest entry')
+        S.section('no rule installed: CLAUDE.md untouched; nothing newer than its release: the newest entry')
         (CC / 'CLAUDE.md').write_text('# no rule here\n')
         serve(ta, 'a')
         rc, out, err = tc('list')
-        entries = [line for line in err.splitlines() if line.startswith('## v')]
-        check("back to the older docs (API 3): what's new is its newest entry, v3, alone", rc == 0 and "taskctl: what's new:\n## v3 — " in err
-              and entries == [entries[0]] and entries[0].startswith('## v3 — ') and baked_docs() == DA, err[-800:])
+        entries = [line for line in err.splitlines() if line.startswith('## ')]
+        check("back to the older release (1.1.0 -> 1.0.0): what's new is its newest entry, 1.0.0, alone", rc == 0
+              and "taskctl: what's new:\n## 1.0.0 — " in err and entries == [entries[0]] and entries[0].startswith('## 1.0.0 — ')
+              and '(release 1.1.0 -> 1.0.0, ' in err and baked_docs() == DA, err[-800:])
         check('a CLAUDE.md without the rule is left alone', (CC / 'CLAUDE.md').read_text() == '# no rule here\n')
+
+        S.section('new files within the same release: updated, and one note that there is nothing to re-read')
+        tp = tasks_copy(TMP / 'tasks_patch')     # release 1.0.0, like A, with a line of SKILL.md touched up
+        with open(tp / 'skill' / 'SKILL.md', 'a') as f:
+            f.write('\nA wording fix, still release 1.0.0.\n')
+        serve(tp, 'p')
+        rc, out, err = tc('ping')
+        check('the files are updated, and stderr says so in one note: no "what\'s new", no "re-read"', rc == 0 and out == URL + '\n'
+              and baked_docs() == docs_version(tp) and (SKILL / 'SKILL.md').read_bytes() == served(URL, 'SKILL.md')
+              and err.endswith(f"taskctl: updated the skill in {SKILL} to the board's files (docs {DA} -> {docs_version(tp)}); still release"
+                               " 1.0.0: nothing to re-read\n") and "what's new" not in err and 're-read ' not in err, (rc, err))
+        serve(ta, 'a')
+        rc, out, err = tc('ping')
+        check('...and back to A: the same note', rc == 0 and 'still release 1.0.0: nothing to re-read' in err and baked_docs() == DA, err)
 
         S.section('TASKS_NO_UPDATE, update, update --force, and moving the skill to another board')
         serve(tb, 'b')
@@ -198,8 +224,9 @@ def main():
         check('update when current: "already current", exit 0, nothing on stdout', rc == 0 and out == ''
               and err == f'taskctl: the skill in {SKILL} is already current (docs {DB})\n', (rc, err))
         rc, out, err = tc('update', '--force')
-        check('update --force: reinstalls, the notice (docs B -> B), exit 0', rc == 0 and out == ''
-              and f'(docs {DB} -> {DB}); updated the skill in {SKILL}' in err, (rc, err))
+        check('update --force: reinstalls; the same release, so one note that there is nothing to re-read (docs B -> B), exit 0', rc == 0
+              and out == '' and err == f"taskctl: updated the skill in {SKILL} to the board's files (docs {DB} -> {DB}); still release 1.1.0:"
+                                       " nothing to re-read\n", (rc, err))
         rc, out, err = tc('install-rule')
         rc, out, err = tc('--url', OTHER, 'update', '--force')
         md = (CC / 'CLAUDE.md').read_text()
@@ -238,6 +265,7 @@ def main():
         (te / 'skill' / 'SKILL.md').write_text('no front matter here\n')
         tf = tasks_copy(TMP / 'tasks_f')
         (tf / 'templates' / 'changelog.md').unlink()
+        release(tf, '1.0.1')    # another release, so its changelog is wanted
         installed = (SKILL / 'SKILL.md').read_bytes()
         serve(td, 'd')
         rc, out, err = tc('ping')

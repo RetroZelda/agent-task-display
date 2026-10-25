@@ -356,10 +356,15 @@ def phase_headers():
         docs = docs_version(tree)
         check('the repo tree and its copy have the same docs version', docs == docs_version())
         s, h, b = call('GET', '/api/health')
-        check('health: v2 fields, in order', s == 200 and b['version'] == '3' and b['docs_version'] == docs and b['tls_port'] is None
-              and b['config_path'] == str(srv.config) and b['report_port'] is None and b['report_tls_port'] is None
-              and list(b)[-5:] == ['docs_version', 'tls_port', 'config_path', 'report_port', 'report_tls_port'], b)
-        check('health headers', h.get('x-tasks-version') == '3' and h.get('x-tasks-docs') == docs, h)
+        release = re.search(r"^RELEASE = '([0-9.]+)'", (tree / 'server.py').read_text(), re.M).group(1)
+        check('health: v2 fields, in order, then this start\'s boot_id and the release', s == 200 and b['version'] == '3' and b['docs_version'] == docs
+              and b['tls_port'] is None and b['config_path'] == str(srv.config) and b['report_port'] is None and b['report_tls_port'] is None
+              and re.fullmatch(r'[0-9a-f]{12}', b['boot_id']) and b['release'] == release == '1.0.0'
+              and list(b)[-7:] == ['docs_version', 'tls_port', 'config_path', 'report_port', 'report_tls_port', 'boot_id', 'release'], b)
+        boot = b['boot_id']
+        check('health headers: the API version, the docs, the release and the boot id', h.get('x-tasks-version') == '3' and h.get('x-tasks-docs') == docs
+              and h.get('x-tasks-release') == release and h.get('x-tasks-boot') == boot, h)
+        every = lambda h: (h.get('x-tasks-version'), h.get('x-tasks-docs'), h.get('x-tasks-release'), h.get('x-tasks-boot')) == ('3', docs, release, boot)  # noqa: E731
         routes = [('GET', '/'), ('GET', '/r/k3m9qa'), ('GET', '/api/usage'), ('GET', '/api/rule'), ('GET', '/api/changelog'),
                   ('GET', '/api/skill/SKILL.md'), ('GET', '/api/skill/taskctl'), ('GET', '/api/skill/taskctl.py'),
                   ('GET', '/favicon.ico'), ('HEAD', '/api/health'), ('GET', '/api/events'), ('GET', '/api/settings'),
@@ -370,30 +375,36 @@ def phase_headers():
         for method, path in routes:
             s, h, b = call(method, path, {} if method == 'POST' else None,
                            headers={'Accept': 'text/html'} if path == '/' else None)
-            check(f'{method} {path} ({s}): both headers', h.get('x-tasks-version') == '3' and h.get('x-tasks-docs') == docs, h)
+            check(f'{method} {path} ({s}): all four headers', every(h), h)
         s, h, b = call('POST', '/api/requests', {'title': 'x'}, headers=EVIL)
-        check('403 cross-origin: both headers', s == 403 and h.get('x-tasks-version') == '3' and h.get('x-tasks-docs') == docs, h)
+        check('403 cross-origin: all four headers', s == 403 and every(h), h)
         s, h, b = call('POST', '/api/requests', raw=b'{"title": "' + b'x' * 70000 + b'"}')
-        check('413: both headers', s == 413 and h.get('x-tasks-docs') == docs, (s, h))
+        check('413: all four headers', s == 413 and every(h), (s, h))
         for label, data in (('400 malformed request line', b'GARBAGE\r\n\r\n'), ('501 unknown method', b'FOO / HTTP/1.0\r\n\r\n'),
                             ('414 long URI', b'GET /' + b'a' * 70000 + b' HTTP/1.0\r\n\r\n'),
                             ('431 long header', b'GET / HTTP/1.0\r\nX: ' + b'a' * 70000 + b'\r\n\r\n'),
                             ('505 HTTP/2.0', b'GET / HTTP/2.0\r\n\r\n')):
             s, h, b = raw_request(P, data)
-            check(f"http.server's own {label} ({s}): both headers", h.get('x-tasks-version') == '3' and h.get('x-tasks-docs') == docs, h)
+            check(f"http.server's own {label} ({s}): all four headers", every(h), h)
 
         s, h, b = call('GET', '/api/changelog')
         want = (tree / 'templates' / 'changelog.md').read_text()
         check('/api/changelog: the file, text/plain, no-store', s == 200 and h['content-type'] == 'text/plain; charset=utf-8'
               and h.get('cache-control') == 'no-store' and b == want.replace('{{BASE_URL}}', f'http://127.0.0.1:{P}')
-              .replace('{{PUBLIC_URL}}', f'http://127.0.0.1:{P}').replace('{{VERSION}}', '3').replace('{{DOCS_VERSION}}', docs), b[:200])
+              .replace('{{PUBLIC_URL}}', f'http://127.0.0.1:{P}').replace('{{VERSION}}', '3').replace('{{RELEASE}}', release)
+              .replace('{{DOCS_VERSION}}', docs), b[:200])
         heads = [line for line in b.splitlines() if line.startswith('## ')]
-        check('changelog: newest first, one "## v<N> — <YYYY-MM-DD>" heading per entry, v3, v2, v1',
-              [line.split()[1] for line in heads] == ['v3', 'v2', 'v1'] and b.startswith('## v3 — ')
-              and all(re.fullmatch(r'## v\d+ — \d{4}-\d\d-\d\d', line) for line in heads), heads)
+        check('changelog: newest first, one "## <release> — <YYYY-MM-DD>" heading per entry (vN before releases): 1.0.0, v3, v2, v1',
+              [line.split()[1] for line in heads] == ['1.0.0', 'v3', 'v2', 'v1'] and b.startswith('## 1.0.0 — ')
+              and all(re.fullmatch(r'## (v\d+|\d+\.\d+\.\d+) — \d{4}-\d\d-\d\d', line) for line in heads), heads)
+        skill = (tree / 'skill' / 'SKILL.md').read_text()
+        check("the release agrees in its three places: RELEASE, the changelog's top entry and the release line of SKILL.md",
+              heads[0].split()[1] == release and f"These are the instructions of the board's release {release}." in skill
+              and skill.count(release) >= 2, (release, heads[0], [x for x in skill.splitlines() if 'release' in x][:3]))
         s, h, b = call('GET', '/api/skill/taskctl.py')
-        check('taskctl.py: BAKED_DOCS and BAKED_API rendered', f'BAKED_DOCS = "{docs}"' in b and 'BAKED_API = "3"' in b
-              and '{{DOCS_VERSION}}' not in b and '{{VERSION}}' not in b, [x for x in b.splitlines() if x.startswith('BAKED_')])
+        check('taskctl.py: BAKED_DOCS, BAKED_API and BAKED_RELEASE rendered', f'BAKED_DOCS = "{docs}"' in b and 'BAKED_API = "3"' in b
+              and f'BAKED_RELEASE = "{release}"' in b and '{{DOCS_VERSION}}' not in b and '{{VERSION}}' not in b and '{{RELEASE}}' not in b,
+              [x for x in b.splitlines() if x.startswith('BAKED_')])
 
         S.section('docs_version follows the agent files, and only them')
         (tree / 'static' / 'index.html').write_text('<p>another page</p>')
@@ -616,7 +627,8 @@ def phase_api():
         S.section('/api/events: baseline, limit, truncated, pruned')
         s, h, b = call('GET', '/api/events')
         check('baseline: events [], cursor = the last id, keys in order', s == 200 and b['events'] == [] and b['truncated'] is False
-              and b['cursor'] > 0 and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'streams', 'clock'], b)
+              and b['cursor'] > 0 and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'streams', 'clock',
+                                                  'boot_id'], b)
         top = b['cursor']
         s, h, b = call('GET', f'/api/events?since={top - 5}&limit=2')
         check('limit 2: two events, truncated, cursor = the last returned', [x['id'] for x in b['events']] == [top - 4, top - 3]
@@ -1030,7 +1042,8 @@ def phase_clock():
                   and isinstance(b['clock']['tz'], str) and 0 < len(b['clock']['tz']) <= 16, b['clock'])
             check(f'TZ={zone}: the board\'s local time is now + utc_offset', abs((b['now'] + b['clock']['utc_offset']) - (time.time() + want['utc_offset'])) < 5, b)
             s, h, b2 = srv.call('GET', f'/api/events?since={b["cursor"]}&limit=1')
-            check(f'TZ={zone}: every events reply carries it, a cursor one too, as the last key', s == 200 and b2['clock'] == want and list(b2)[-1] == 'clock', list(b2))
+            check(f'TZ={zone}: every events reply carries it, a cursor one too, just before the boot id', s == 200 and b2['clock'] == want
+                  and list(b2)[-2:] == ['clock', 'boot_id'], list(b2))
         check(f'TZ={zone}: no tracebacks', 'Traceback' not in srv.log_text(), srv.log_text()[-800:])
 
 
@@ -1092,7 +1105,7 @@ def phase_migration():
     with new:
         call = new.call
         log = new.log_text()
-        check('the upgrade is logged', f'database {db} upgraded from schema 1 to 3' in log, log[-800:])
+        check('the upgrade is logged', f'database {db} upgraded from schema 1 to 4' in log, log[-800:])
         for rid, old_body in before.items():
             b = call('GET', f'/api/requests/{rid}')[2]
             # (url: another port; elapsed, eta_remaining: the clock moved on)
@@ -1100,7 +1113,7 @@ def phase_migration():
             same_tasks = all(all(t[k] == o[k] for k in o if k not in ('elapsed', 'eta_remaining', 'stale', 'url'))
                              for t, o in zip(b['tasks'], old_body['tasks'], strict=True))
             check(f"v1 request {old_body['title']!r}: every v1 field as it was, the v2 fields empty", same and same_tasks
-                  and b['attention'] is None and b['waiting'] is False and b['tasks_waiting'] == 0 and b['report'] is None
+                  and b['attention'] is None and b['waiting'] is False and b['tasks_waiting'] == 0 and b['report'] is None and b['release'] is None
                   and all(t['attention'] is None for t in b['tasks']), (b, old_body))
         ev = new.events(None)
         check('the migrated database has an empty event log', ev['cursor'] == 0 and ev['waiting'] == [] and new.events(0)['events'] == [], ev)
@@ -1110,20 +1123,20 @@ def phase_migration():
                                                                                                 ('attention', f'{run_id}-3')])
         check('a migrated request reopens like any other', call('POST', f'/api/requests/{done_id}/tasks', {'title': 'more'})[2]['reopened'] is True)
     tables, indexes, version = schema_of(db)
-    check('user_version 3, with a reports table', version == 3 and tables['reports'] != [], (version, tables.get('reports')))
+    check('user_version 4, with a reports table', version == 4 and tables['reports'] != [], (version, tables.get('reports')))
     with sqlite3.connect(db) as conn:
         cols = {t: [r[1] for r in conn.execute(f'PRAGMA table_info({t})')] for t in ('requests', 'tasks')}
-        check('the attention columns were added at the end', cols['requests'][-2:] == ['attention_message', 'attention_at']
+        check('the attention columns, then the release, were added at the end', cols['requests'][-3:] == ['attention_message', 'attention_at', 'release']
               and cols['tasks'][-2:] == ['attention_message', 'attention_at'], cols)
         untouched = [tuple(r) for r in conn.execute('SELECT * FROM requests WHERE id = ?', (fail_id,))]
-        check('an untouched v1 row: byte for byte, plus two nulls', untouched == [tuple(r) + (None, None) for r in rows_before['requests']
-                                                                                if r[0] == fail_id], untouched)
+        check('an untouched v1 row: byte for byte, plus three nulls', untouched == [tuple(r) + (None, None, None) for r in rows_before['requests']
+                                                                                  if r[0] == fail_id], untouched)
     with ScratchServer(TMP, name='v1db', fresh_db=False) as again:
         check('a second start: no upgrade, the events kept', 'upgraded' not in again.log_text() and len(again.events(0)['events']) == 5,
               again.log_text()[-600:])
     fresh = ScratchServer(TMP, name='freshdb').start()
     fresh.stop()
-    check('a fresh database has exactly the upgraded schema and indexes', schema_of(fresh.db) == (tables, indexes, 3)
+    check('a fresh database has exactly the upgraded schema and indexes', schema_of(fresh.db) == (tables, indexes, 4)
           and 'upgraded' not in fresh.log_text(), (schema_of(fresh.db), (tables, indexes)))
 
     partial = TMP / 'partial.db'
@@ -1132,31 +1145,106 @@ def phase_migration():
         conn.execute('ALTER TABLE requests ADD COLUMN attention_message TEXT')
     with ScratchServer(TMP, name='partial', fresh_db=False) as srv:
         pass
-    check('a half-upgraded v1 database finishes the upgrade', schema_of(srv.db) == (tables, indexes, 3), schema_of(srv.db))
+    check('a half-upgraded v1 database finishes the upgrade', schema_of(srv.db) == (tables, indexes, 4), schema_of(srv.db))
     v2db = TMP / 'v2.db'     # a v2 database (the schema before reports): the reports table added, the rest kept
     shutil.copy2(fresh.db, v2db)
     with sqlite3.connect(v2db) as conn:
         conn.execute('DROP TABLE reports')
+        conn.execute('ALTER TABLE requests DROP COLUMN release')
         conn.execute('PRAGMA user_version=2')
     with ScratchServer(TMP, name='v2', fresh_db=False) as srv2:
-        upgraded = f'database {srv2.db} upgraded from schema 2 to 3' in srv2.log_text()
+        upgraded = f'database {srv2.db} upgraded from schema 2 to 4' in srv2.log_text()
         rid2 = srv2.call('POST', '/api/requests', {'title': 'on a v2 database'})[2]['id']
         put2 = srv2.call('PUT', f'/api/requests/{rid2}/report', {'format': 'markdown', 'content': '# Done'})
-    check('a v2 database upgrades to 3 (logged), and takes a report', upgraded and put2[0] == 201
-          and schema_of(srv2.db) == (tables, indexes, 3), (srv2.log_text()[-400:], put2))
+    check('a v2 database upgrades to 4 (logged), and takes a report', upgraded and put2[0] == 201
+          and schema_of(srv2.db) == (tables, indexes, 4), (srv2.log_text()[-400:], put2))
+    v3db = TMP / 'v3.db'     # a v3 database (the schema before releases): the release column added, its requests on none
+    shutil.copy2(fresh.db, v3db)
+    with sqlite3.connect(v3db) as conn:
+        conn.execute('ALTER TABLE requests DROP COLUMN release')
+        conn.execute("INSERT INTO requests (id, title, status, created_at, updated_at) VALUES ('v3v3v3', 'from schema 3', 'running', 1.0, 1.0)")
+        conn.execute('PRAGMA user_version=3')
+    with ScratchServer(TMP, name='v3', fresh_db=False) as srv3:
+        upgraded = f'database {srv3.db} upgraded from schema 3 to 4' in srv3.log_text()
+        old3 = srv3.call('GET', '/api/requests/v3v3v3')[2]
+        new3 = srv3.call('POST', '/api/requests', {'title': 'on a v4 database'})[2]
+    check('a v3 database upgrades to 4 (logged): its requests are on no release, a new one is on the board\'s', upgraded and old3['release'] is None
+          and new3['release'] == '1.0.0' and schema_of(srv3.db) == (tables, indexes, 4), (srv3.log_text()[-400:], old3.get('release'), new3.get('release')))
     newer = TMP / 'newer.db'
     shutil.copy2(fresh.db, newer)
     with sqlite3.connect(newer) as conn:
-        conn.execute('PRAGMA user_version = 4')
+        conn.execute('PRAGMA user_version = 5')
     res = subprocess.run([sys.executable, str(SERVER), '--port', str(free_port()), '--db', str(newer), '--pidfile', str(TMP / 'newer.pid'),
                           '--config', str(TMP / 'newer.json')], capture_output=True, text=True, timeout=15, env=clean_env())
-    check('a newer schema (4) is refused: exit 2, a clear error, the database untouched', res.returncode == 2
-          and 'schema version 4 is newer than this server supports (3)' in res.stderr
-          and schema_of(newer)[2] == 4, (res.returncode, res.stderr[-300:]))
+    check('a newer schema (5) is refused: exit 2, a clear error, the database untouched', res.returncode == 2
+          and 'schema version 5 is newer than this server supports (4)' in res.stderr
+          and schema_of(newer)[2] == 5, (res.returncode, res.stderr[-300:]))
     res = subprocess.run([sys.executable, str(v1), '--port', str(free_port()), '--db', str(fresh.db), '--pidfile', str(TMP / 'down.pid')],
                          capture_output=True, text=True, timeout=15, env=clean_env())
-    check('the v1 server refuses a v3 database (no silent downgrade)', res.returncode == 2 and 'newer than this server supports' in res.stderr,
+    check('the v1 server refuses a v4 database (no silent downgrade)', res.returncode == 2 and 'newer than this server supports' in res.stderr,
           (res.returncode, res.stderr[-300:]))
+
+
+def phase_restarts():
+    S.section('restarts and releases: a new boot id at every start, the restart and release notices once per request')
+    tree = tasks_copy(TMP / 'reltree')
+    srv = ScratchServer(TMP, script=tree / 'server.py', name='rel').start()
+    port = srv.port
+    try:
+        a = srv.call('POST', '/api/requests', {'title': 'begun on 1.0.0', 'tasks': ['one', 'two']})[2]
+        done = srv.call('POST', '/api/requests', {'title': 'finished before the update', 'tasks': ['one']})[2]['id']
+        srv.call('POST', f'/api/requests/{done}/complete', {'status': 'done'})
+        check('a new request begins on the board\'s release', a['release'] == '1.0.0', a.get('release'))
+        a = a['id']
+        s, h, b = srv.call('POST', f'/api/tasks/{a}-1/progress', {'message': 'before any restart'})
+        check('no restart, no new release: no notice', s == 200 and 'restarted' not in b and 'release_changed' not in b, b)
+        boot1 = srv.call('GET', '/api/health')[2]['boot_id']
+        srv.stop()
+
+        srv = ScratchServer(TMP, script=tree / 'server.py', name='rel', port=port, fresh_db=False).start()
+        s, h, health = srv.call('GET', '/api/health')
+        boot2 = health['boot_id']
+        check('a restart: another boot id, in the header, /api/health and /api/events', boot2 != boot1 and h.get('x-tasks-boot') == boot2
+              and srv.call('GET', '/api/events')[2]['boot_id'] == boot2, (boot1, boot2, h.get('x-tasks-boot')))
+        s, h, b = srv.call('POST', f'/api/tasks/{a}-1/progress', {'message': 'queued while it was down', 'at': time.time() - 5},
+                           headers={'X-Tasks-Replay': '1'})
+        check('a replayed write gets no notice (taskctl prints none for a replay)', s == 200 and 'restarted' not in b, b)
+        s, h, b = srv.call('POST', f'/api/requests/{a}/attention', {'message': 'from a page'}, headers={'Origin': f'http://127.0.0.1:{port}'})
+        check('a write from a page (an Origin header) gets none either', s == 200 and 'restarted' not in b, b)
+        s, h, b = srv.call('POST', f'/api/tasks/{a}-1/progress', {'message': 'the agent again'})
+        r = b.get('restarted') or {}
+        check("the agent's first live write about the request: restarted {boot_id, at, message}, naming the request and the stream to reopen",
+              s == 200 and list(r) == ['boot_id', 'at', 'message'] and r['boot_id'] == boot2 and r['at'] == health['started_at']
+              and a in r['message'] and f'taskctl stream {a} URL' in r['message'] and 'release_changed' not in b, b)
+        check('...once: the next write has none', 'restarted' not in srv.call('POST', f'/api/tasks/{a}-2/progress', {'message': 'x'})[2])
+        later = srv.call('POST', '/api/requests', {'title': 'begun after the restart', 'tasks': ['one']})[2]['id']
+        check('a request begun after the restart: none', 'restarted' not in srv.call('POST', f'/api/tasks/{later}-1/progress', {'message': 'x'})[2])
+        check('deleting a request is no write about it to notify', 'restarted' not in srv.call('DELETE', f'/api/requests/{later}')[2])
+        srv.stop()
+
+        server_py = tree / 'server.py'
+        server_py.write_text(server_py.read_text().replace("RELEASE = '1.0.0'", "RELEASE = '1.1.0'", 1))
+        srv = ScratchServer(TMP, script=server_py, name='rel', port=port, fresh_db=False).start()
+        s, h, b = srv.call('POST', f'/api/tasks/{a}-2/progress', {'message': 'after the update'})
+        rc = b.get('release_changed') or {}
+        check('a new release while the request runs: its next write has release_changed {previous, release, message}, and restarted too',
+              s == 200 and list(rc) == ['previous', 'release', 'message'] and rc['previous'] == '1.0.0' and rc['release'] == '1.1.0'
+              and 're-read' in rc['message'] and '/api/changelog' in rc['message'] and 'restarted' in b and h.get('x-tasks-release') == '1.1.0', b)
+        check('...the request is on 1.1.0 now, and the next write says nothing', srv.call('GET', f'/api/requests/{a}')[2]['release'] == '1.1.0'
+              and 'release_changed' not in srv.call('POST', f'/api/tasks/{a}-2/progress', {'message': 'y'})[2])
+        s, h, b = srv.call('PUT', f'/api/requests/{done}/report', {'format': 'markdown', 'content': '# Late'})
+        check('a finished request is never told of a release (its write still says the board restarted)', s == 201
+              and 'release_changed' not in b and 'restarted' in b and srv.call('GET', f'/api/requests/{done}')[2]['release'] == '1.0.0', b)
+        s, h, b = srv.call('POST', f'/api/requests/{done}/tasks', {'title': 'more work'})
+        rc = b.get('release_changed') or {}
+        check('...but the write that reopens it (a task added) is told: from 1.0.0 to 1.1.0, and the next one is not', s == 201
+              and b['reopened'] is True and (rc.get('previous'), rc.get('release')) == ('1.0.0', '1.1.0')
+              and 'release_changed' not in srv.call('POST', f'/api/tasks/{done}-2/progress', {'message': 'reopened'})[2], b)
+        new = srv.call('POST', '/api/requests', {'title': 'begun on 1.1.0'})[2]
+        check('a request begun now is on 1.1.0', new['release'] == '1.1.0', new.get('release'))
+        check('no tracebacks', 'Traceback' not in srv.log_text(), srv.log_text()[-800:])
+    finally:
+        srv.stop()
 
 
 if __name__ == '__main__':
@@ -1169,4 +1257,5 @@ if __name__ == '__main__':
     phase_migration()
     phase_reports()
     phase_report_port()
+    phase_restarts()
     sys.exit(S.finish())

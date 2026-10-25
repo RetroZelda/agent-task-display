@@ -22,10 +22,15 @@ Wire contract, version 3 (every component is built against it; v1 and v2 clients
 IDs: a request id is 6 chars of 23456789abcdefghjkmnpqrstuvwxyz (k3m9qa); a task id is {rid}-{seq}
 (k3m9qa-3). Case-insensitive, returned lowercase. The wrong kind of id on a route is a 400 with a hint.
 
-Every response, success or error (http.server's own included), carries X-Tasks-Version: 3 and
-X-Tasks-Docs: <docs_version>. docs_version = sha256 over skill/SKILL.md, templates/usage.md,
-templates/rule.md, templates/changelog.md, taskctl and taskctl.py, in that order, each as relpath + NUL +
-bytes + NUL (a missing file: relpath + NUL only), hex[:12]: it changes whenever the agent instructions do.
+Release 1.0.0 (RELEASE): MAJOR.MINOR.PATCH, major for significant changes, minor for new features, patch for fixes.
+Agents re-read their instructions when it changes, so every release bumps it (see Restarts and Updates).
+
+Every response, success or error (http.server's own included), carries X-Tasks-Version: 3,
+X-Tasks-Docs: <docs_version>, X-Tasks-Release: <release> and X-Tasks-Boot: <boot_id>. docs_version = sha256
+over skill/SKILL.md, templates/usage.md, templates/rule.md, templates/changelog.md, taskctl and taskctl.py, in that
+order, each as relpath + NUL +
+bytes + NUL (a missing file: relpath + NUL only), hex[:12]: it changes whenever the agent instructions do. boot_id = 12
+hex digits, new at every start of the board: a client that saw another one has met a restart (see Restarts).
 
 Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; empty body = {})
   GET    /                         static/index.html if Accept has text/html, else usage (Vary: Accept)
@@ -33,14 +38,15 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
   GET    /api, /api/usage          templates/usage.md, rendered, text/plain
   GET    /api/rule                 templates/rule.md, rendered, text/plain
   GET    /api/changelog            templates/changelog.md, rendered, text/plain: newest first, each entry a
-                                   line "## v<N> — <YYYY-MM-DD>" and its bullet lines
+                                   line "## <release> — <YYYY-MM-DD>" ("## v<N> — ..." before releases: API
+                                   versions) and its bullet lines; the first is RELEASE's
   GET    /api/skill/SKILL.md       skill/SKILL.md, text/plain
   GET    /api/skill/taskctl        taskctl (sh wrapper), text/plain
   GET    /api/skill/taskctl.py     taskctl.py, rendered, text/plain
   GET    /favicon.ico              204
   GET    /api/health               {ok, service: "tasks", version: "3", pid, now, started_at, requests_running,
                                    docs_version, tls_port (int | null), config_path, report_port (int | null),
-                                   report_tls_port (int | null)}
+                                   report_tls_port (int | null), boot_id, release}
   POST   /api/requests             {title, origin?, tasks?: [str], id?} -> 201 Request + tasks + now + existing
                                    (false). id is a client-made request id (else the server makes one; not an
                                    id -> 400): if it exists with the same title -> 200 that request + tasks +
@@ -76,7 +82,7 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
   POST   /api/tasks/{tid}/attention  {message} -> Task + now; a closed task is a 409 {error, status}
   DELETE /api/tasks/{tid}/attention  -> Task + now (idempotent)
   GET    /api/events               ?since=N&limit=1..1000 (500) -> {now, cursor, events, truncated, waiting,
-                                   stale, settings_version, stream, streams, clock} (see Events and Stream)
+                                   stale, settings_version, stream, streams, clock, boot_id} (see Events and Stream)
   GET    /api/settings             {now, path, version, exists, error, settings, defaults} (see Settings)
   PUT    /api/settings             {settings: {...}, partial} -> the GET shape
   DELETE /api/settings             removes the file (the defaults again) -> the GET shape
@@ -85,7 +91,7 @@ Routes (JSON unless noted; bodies are parsed as JSON whatever the Content-Type; 
   DELETE /api/stream               -> the GET shape + closed: bool (idempotent)
   GET    /api/stream/media?id=<id> an open stream as fragmented MP4, an endless body; &quality=light|stills: a
                                    lighter copy of it (see Stream)
-Rendering literally replaces {{BASE_URL}}, {{PUBLIC_URL}}, {{VERSION}} and {{DOCS_VERSION}}. Files are
+Rendering literally replaces {{BASE_URL}}, {{PUBLIC_URL}}, {{VERSION}}, {{RELEASE}} and {{DOCS_VERSION}}. Files are
 re-read per request; a missing one is a 500 {"error": "template missing: <path>"}. On the HTTPS listener
 BASE_URL is http://<the Host's hostname>:<http port> (agents stay on plain http, which a self-signed
 certificate cannot break), while PUBLIC_URL and every url field keep the https address.
@@ -95,7 +101,7 @@ Shapes (every key always present, null when absent; times are float epoch second
            start_inferred updated_at completed_at elapsed stale url attention
   Request  id title origin status message created_at updated_at completed_at elapsed percent tasks_total
            tasks_done tasks_failed tasks_running tasks_pending tasks_cancelled current eta_at stale url
-           attention waiting tasks_waiting report stream
+           attention waiting tasks_waiting report stream release
   Report   format title artifact_url size version created_at updated_at url page (a Request's report: this, or null)
   Event    id ts type request_id task_id request_title task_title status percent message replayed
   Task status: pending|running|done|failed|cancelled. Request status: running|done|failed.
@@ -106,7 +112,8 @@ Shapes (every key always present, null when absent; times are float epoch second
   user (a Request's is its own, not its tasks'). waiting = running and (the request's attention or a
   running task's); tasks_waiting = running tasks with attention. stale = running, silent > --stale-after,
   not within 60s past a running eta_at, and never while it has attention (task) or is waiting (request).
-  stream = the request's open stream (see Stream), or null.
+  stream = the request's open stream (see Stream), or null. release = the release its agent is on: the one it began
+  under, then the one the last "release_changed" told of (null: it began before releases).
   url = <public>/r/<rid>, plus #<tid> for a task. A Report's url is <public>/r/<rid>/report (the dashboard's view of
   it), page <public>/api/requests/<rid>/report/page; size is its content's UTF-8 bytes; version counts its writes.
 
@@ -115,7 +122,9 @@ Errors are {error, field?, hint?}: 400 validation, 403 cross-origin write, 404 u
 for PUT .../report, whose content is at most 16 MiB), 500,
 503 database busy (+Retry-After: 1), or a stream not connected yet, full or shutting down (+Retry-After).
 http.server's own rejections (malformed request line 400, 414, 431, unknown method 501) are JSON too.
-Success bodies gain "warnings": [str] only when something was truncated, clamped or ignored.
+Success bodies gain "warnings": [str] only when something was truncated, clamped or ignored, and "restarted" and
+"release_changed" only on the first live write about a request after a restart, and after a new release (see
+Restarts).
 
 State rules
   - Progress starts a pending task (running, started_at = now); on a closed task it is a 409.
@@ -150,7 +159,21 @@ are the entity's after the change (the request's for request-level events), time
   stale now; settings_version = the settings' version; stream = the board's own stream's object, or null, and
   streams = every open stream's, the board's own and the requests', the first opened first (see Stream);
   clock = {utc_offset, tz}, the board host's time zone now: seconds east of UTC, and its name (EDT, say), so the
-  board's local date and time are now + utc_offset (the dashboard's header shows them).
+  board's local date and time are now + utc_offset (the dashboard's header shows them); boot_id = this start's (the
+  dashboard reloads when it changes).
+
+Restarts: the database outlives a restart (requests, tasks, reports, events, settings), the streams do not: every
+start opens none, and removes the <db>.stream.json an older board kept them in. Each start has a new boot_id. The
+first write about a request that began before this start (POST, PUT or DELETE on a route with its id, deleting the
+request aside) gains "restarted": {boot_id, at (the start's time), message (for its agent: the board restarted, kept
+the request, and opens its stream only when asked again)}, once per request and start. A replayed write
+(X-Tasks-Replay: 1) or one from a page (an Origin header) neither gets it nor uses it up, so the agent's own next
+live write does.
+  Updates: a request keeps the release it began under (its release). The first such live write about a running
+request whose release is not RELEASE (a new release came while it ran; one from before releases has none) gains
+"release_changed": {previous (null: none), release, message (for its agent: re-read the instructions, the skill's
+SKILL.md or /api/usage, and /api/changelog for what is new)}, and the request takes the new release, so it comes once
+per release. A finished request never gets it.
 
 Replays: taskctl queues writes while the board is unreachable and replays them later with the header
 X-Tasks-Replay: 1. On create request, request and task complete, progress, attention set/clear and report put/delete such a
@@ -174,9 +197,11 @@ mtime or size changes:
 Stream: network streams the dashboard shows beside the board: the board's own and one per running request, 8 at
   most in all (one more is a 409 naming the limit). POST /api/stream {url} opens the board's own, PUT
   /api/requests/{rid}/stream {url} that request's (404 unknown, 409 closed): a newer url replaces the one open
-  there, the url already open is kept and retried at once. A request's stream ends when the request is completed
+  there, the url already open is kept and retried at once. Their reply's stream is the one that call opened or kept,
+  whatever another call opened since. A request's stream ends when the request is completed
   (done or failed, by an agent, the dashboard or expiry) or deleted; one opened while its request was closing ends
-  too (at the latest by the next maintenance pass), and reopening the request does not bring it back. url:
+  too (at the latest by the next maintenance pass), and reopening the request does not bring it back. No stream
+  outlives a restart of the board (see Restarts). url:
   http, https, rtsp, rtsps, rtmp, rtmps, srt, udp or tcp, up to 2048 characters, no spaces or controls (else
   400 with field url). DELETE closes it. The board runs one ffmpeg for each stream (found on PATH at each start, so
   installing it later needs no restart; until then error says so): video copied, audio made AAC stereo,
@@ -202,11 +227,7 @@ Stream: network streams the dashboard shows beside the board: the board's own an
   Content-Type is its own, and it ends with the run and 10 s after its last viewer left. One that failed
   (ffmpeg without libx264, say) is a 503 naming the cause for the next 10 s; one whose header has not come
   within the wait is a 503 too. Its viewers count toward the 16 and in viewers. A stream without video is
-  served as it is. HEAD starts nothing: a quality that is not running is a 503. The open streams are kept in
-  <db>.stream.json (mode 600; --db tasks/data/tasks.db gives tasks/data/tasks.stream.json) as {"streams": [{id,
-  request_id, url, opened_at}]}, the first opened first, the file removed with the last one, and reopened after a
-  restart (a request's only while it runs; an older board's file, a bare {id, url, opened_at}, is the board's own);
-  only closing them removes them.
+  served as it is. HEAD starts nothing: a quality that is not running is a 503.
 
 Reports: a request's optional document, one at most: format html (the very file an agent publishes as a Claude
   artifact, so both show the same) or markdown (rendered by the board: a GitHub-flavoured subset, raw HTML shown as
@@ -270,7 +291,11 @@ from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 
 VERSION = '3'
-SCHEMA_VERSION = 3
+# The release, MAJOR.MINOR.PATCH: major for significant changes (rare: we stay on 1), minor for new features, patch for
+# fixes. Every change to it makes agents re-read their instructions, so bump it with each release, together with the
+# changelog's top entry and the release line in skill/SKILL.md (the tests check that the three agree).
+RELEASE = '1.0.0'
+SCHEMA_VERSION = 4
 TASKS_DIR = Path(__file__).resolve().parent
 # The agent-facing files; X-Tasks-Docs hashes them so an installed skill can tell it is out of date.
 DOCS_FILES = ('skill/SKILL.md', 'templates/usage.md', 'templates/rule.md', 'templates/changelog.md',
@@ -2121,11 +2146,10 @@ class StreamRendition:
 
 class StreamHub:
     """The board's open streams: its own (key None, POST /api/stream) and at most one per running request (key: the
-    request id), STREAMS_MAX in all, saved to a file so a restart reopens them. Every change installs a new dict, so a
-    reader takes self._chans once and walks it without a lock."""
+    request id), STREAMS_MAX in all. They live in memory only: a restart starts with none, and Boot tells each agent so.
+    Every change installs a new dict, so a reader takes self._chans once and walks it without a lock."""
 
-    def __init__(self, path):
-        self.path = path
+    def __init__(self):
         self._lock = threading.Lock()  # guards the fields below; held only for quick, non-blocking work
         self._chans = {}  # key: StreamChannel, replaced whole on every change, never changed in place
         self._retired = []  # replaced or closed channels, until their threads are gone
@@ -2159,130 +2183,45 @@ class StreamHub:
 
     def open(self, url, rid=None):
         """Open url as the board's stream (rid None) or that request's, replacing the one it had. -> (channel,
-        existing, warnings); the same URL as the open one is kept."""
+        existing); the same URL as the open one is kept."""
         with self._lock:
             if self._closing:
                 raise ApiError(503, 'the board is shutting down', {'Retry-After': '5'})
             old = self._chans.get(rid)
             if old is not None and old.url == url:
                 old.kick()
-                return old, True, []
+                return old, True
             if old is None and len(self._chans) >= STREAMS_MAX:
                 raise ApiError(409, f'the board has {STREAMS_MAX} streams open already',
                                hint='close one first: DELETE /api/requests/<rid>/stream, or /api/stream for the board\'s own')
             chan = StreamChannel(secrets.token_hex(6), url, ts(), rid)
-            chans = {**self._chans, rid: chan}
-            warnings = self._save(chans)
-            self._chans = chans
+            self._chans = {**self._chans, rid: chan}
             if old is not None:
                 old.stop()
                 self._retire(old)
             chan.start(after=old)  # under the lock, so no one can see a channel that was not started
         log.info('stream %s opened%s: %s%s', chan.id, f' for request {rid}' if rid else '', chan.shown,
                  f' (replacing {old.id})' if old else '')
-        return chan, False, warnings
+        return chan, False
 
     def close(self, rid=None):
-        """Close the board's stream (rid None) or that request's. -> (whether one was open, warnings)."""
+        """Close the board's stream (rid None) or that request's. -> whether one was open."""
         with self._lock:
             chans = dict(self._chans)
             chan = chans.pop(rid, None)
             if chan is None:
-                return False, []
-            warnings = self._save(chans)
+                return False
             self._chans = chans
             chan.stop()
             self._retire(chan)
         log.info('stream %s closed%s', chan.id, f' with request {rid}' if rid else '')
-        return True, warnings
+        return True
 
     def _retire(self, chan):
         self._retired = [c for c in self._retired if c.thread is not None and c.thread.is_alive()] + [chan]
 
-    def _save(self, chans):
-        """Write chans to the file (none: remove it). -> warnings."""
-        if not chans:
-            try:
-                self.path.unlink(missing_ok=True)
-            except OSError as exc:
-                return [f'could not remove {self.path}: {exc.strerror or exc}']
-            return []
-        saved = [{'id': c.id, 'request_id': c.request_id, 'url': c.url, 'opened_at': c.opened_at}
-                 for c in sorted(chans.values(), key=lambda c: (c.opened_at, c.id))]
-        text = json.dumps({'streams': saved}) + '\n'
-        temp = self.path.with_name(f'.{self.path.name}.{os.getpid()}.tmp')
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w', encoding='utf-8') as f:
-                f.write(text)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp, self.path)
-        except OSError as exc:
-            temp.unlink(missing_ok=True)
-            return ['the stream was not saved for restarts: ' + (exc.strerror or str(exc))]
-        return []
-
-    def restore(self, running=lambda rid: True):
-        """Reopen the streams a previous run left in the file, a request's only while running(rid) says it still runs;
-        anything wrong with the file or an entry is logged and ignored. A file of an older board holds one stream,
-        the board's own, as a bare {id, url, opened_at}."""
-        try:
-            raw = self.path.read_bytes()  # decoded by json.loads, whose ValueError (UnicodeDecodeError too) is caught below
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            log.warning('stream file %s: cannot read it: %s', self.path, exc.strerror or exc)
-            return
-        try:
-            data = json.loads(raw)
-            entries = data['streams'] if isinstance(data, dict) and 'streams' in data else [data]
-            if not isinstance(entries, list):
-                raise TypeError('streams is not a list')
-        except (ValueError, KeyError, TypeError, RecursionError) as exc:  # RecursionError: JSON nested too deep
-            log.warning('stream file %s ignored: %s', self.path, exc)
-            return
-        chans, ended = {}, False  # ended: a request's stream left out because the request no longer runs
-        for entry in entries:
-            try:
-                url = clean_stream_url(entry['url'])
-                sid, opened_at, rid = entry.get('id'), entry.get('opened_at'), entry.get('request_id')
-                if rid is not None and not (isinstance(rid, str) and RID_RE.fullmatch(rid)):
-                    raise ValueError(f'request_id {rid!r} is not a request id')
-            except (KeyError, TypeError, AttributeError, ValueError, ApiError) as exc:
-                log.warning('stream file %s: an entry ignored: %s', self.path, exc)
-                continue
-            if rid in chans or len(chans) >= STREAMS_MAX:
-                log.warning('stream file %s: an entry ignored: %s', self.path,
-                            'a second stream for ' + (f'request {rid}' if rid else 'the board') if rid in chans
-                            else f'more than {STREAMS_MAX} streams')
-                continue
-            if rid is not None and not running(rid):
-                log.info('stream of request %s not reopened: the request is no longer running', rid)
-                ended = True
-                continue
-            if not (isinstance(sid, str) and re.fullmatch(r'[0-9a-f]{12}', sid)) or any(c.id == sid for c in chans.values()):
-                sid = secrets.token_hex(6)
-            if isinstance(opened_at, bool) or not isinstance(opened_at, (int, float)) or not math.isfinite(opened_at):
-                opened_at = ts()
-            chans[rid] = StreamChannel(sid, url, opened_at, rid)
-        with self._lock:
-            if self._closing or self._chans:
-                return
-            self._chans = chans
-            if ended:
-                for warning in self._save(chans):
-                    log.warning('%s', warning)
-            for chan in chans.values():
-                chan.start()
-        for chan in chans.values():
-            log.info('stream %s reopened after a restart%s: %s', chan.id,
-                     f' for request {chan.request_id}' if chan.request_id else '', chan.shown)
-        if chans and find_ffmpeg() is None:
-            log.warning('ffmpeg is not installed, so the stream cannot play (sudo apt install ffmpeg)')
-
     def shutdown(self, timeout=4):
-        """Stop every channel, ffmpeg included, and wait for them; the saved file stays, for the next start."""
+        """Stop every channel, ffmpeg included, and wait for them."""
         try:
             with self._lock:
                 self._closing = True
@@ -2298,6 +2237,66 @@ class StreamHub:
                         pass
         except Exception:
             log.exception('stopping the streams failed')
+
+
+def forget_stream_file(path):
+    """An older board kept its open streams in <db>.stream.json to reopen them after a restart. This one reopens none:
+    the file goes (it may hold a URL's password)."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log.warning('could not remove %s, the streams an older board left open: %s', path, exc.strerror or exc)
+        return
+    log.info('removed %s: a restart reopens no stream (agents are told the board restarted)', path)
+
+
+class Boot:
+    """This run of the board: an id new at every start (X-Tasks-Boot on every reply) and its start time. The first live
+    write an agent makes about a request that began before this start carries "restarted", once per request, so each
+    agent learns that the board restarted, and that its request's stream, if it had one, is gone."""
+
+    def __init__(self, started_at):
+        self.id, self.started_at = secrets.token_hex(6), started_at
+        self._lock = threading.Lock()
+        self._settled = set()  # request ids told, or begun after this start (none to tell)
+        self._releases = {}  # request id: the release its agent is known to be on
+
+    def notice(self, store, rid):
+        """The restart notice for rid's agent, the first time only; None after that or when there is none to give."""
+        with self._lock:
+            if rid in self._settled:
+                return None
+        created_at = store.request_created(rid)
+        with self._lock:
+            if rid in self._settled:
+                return None
+            self._settled.add(rid)
+        if created_at is None or created_at >= self.started_at:
+            return None
+        when = time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(self.started_at))
+        return {'boot_id': self.id, 'at': self.started_at,
+                'message': f'the board restarted at {when}, after request {rid} began: it kept the request and its tasks '
+                           f'but reopened no live stream; open its stream again if it needs one (taskctl stream {rid} URL)'}
+
+    def release_notice(self, store, rid, base):
+        """The notice that the board moved to another release after rid began (an update pushed mid-request), for its
+        agent, once per release; None when its agent is on RELEASE already, or the request is not running."""
+        with self._lock:
+            if self._releases.get(rid) == RELEASE:
+                return None
+        told, previous = store.release_seen(rid, RELEASE)  # atomic: of two writes at once, one gets the notice
+        if told is None:
+            return None
+        with self._lock:
+            self._releases[rid] = RELEASE
+        if not told:
+            return None
+        return {'previous': previous, 'release': RELEASE,
+                'message': f'the board moved to release {RELEASE} after request {rid} began (on '
+                           f'{previous or "an older one"}): re-read its agent instructions before you go on, the task-status '
+                           f'skill\'s SKILL.md (taskctl updates it by itself) or {base}/api/usage; what is new: {base}/api/changelog'}
 
 
 # Storage
@@ -2347,9 +2346,16 @@ def _migrate_3(db):
     ) STRICT""")
 
 
+def _migrate_4(db):
+    # The release a request's agent is on: the one it began under, then the one it was last told of. NULL: it began
+    # before releases, so any release is newer.
+    if 'release' not in {row[1] for row in db.execute('PRAGMA table_info(requests)')}:
+        db.execute('ALTER TABLE requests ADD COLUMN release TEXT')
+
+
 # user_version N-1 -> N. A fresh database is created at 1 and then runs them all, so a fresh and an
 # upgraded database are the same.
-MIGRATIONS = {2: _migrate_2, 3: _migrate_3}
+MIGRATIONS = {2: _migrate_2, 3: _migrate_3, 4: _migrate_4}
 
 # Aggregates live in SQL so the list and detail views can never disagree. {where} filters the
 # inner r.* rows; {order} sorts and limits the outer g.* rows. A report's columns but its content.
@@ -2358,7 +2364,7 @@ SELECT g.*, c.title AS current_title, c.message AS current_message, rp.format AS
     rp.title AS report_title, rp.artifact_url AS report_artifact_url, rp.size AS report_size,
     rp.version AS report_version, rp.created_at AS report_created_at, rp.updated_at AS report_updated_at FROM (
     SELECT r.id, r.title, r.origin, r.status, r.message, r.created_at, r.updated_at, r.completed_at,
-        r.attention_message, r.attention_at,
+        r.attention_message, r.attention_at, r.release,
         COUNT(t.id) - IFNULL(SUM(t.status = 'cancelled'), 0) AS tasks_total,
         IFNULL(SUM(t.status = 'done'), 0) AS tasks_done,
         IFNULL(SUM(t.status = 'failed'), 0) AS tasks_failed,
@@ -2551,8 +2557,8 @@ class Store:
                     return (*self._detail(db, rid), True)
             stamp = self._stamp(now, at)
             db.execute(
-                'INSERT INTO requests (id, title, origin, status, created_at, updated_at, next_seq)'
-                " VALUES (?, ?, ?, 'running', ?, ?, ?)", (rid, title, origin, stamp[0], stamp[0], len(titles) + 1))
+                'INSERT INTO requests (id, title, origin, status, created_at, updated_at, next_seq, release)'
+                " VALUES (?, ?, ?, 'running', ?, ?, ?, ?)", (rid, title, origin, stamp[0], stamp[0], len(titles) + 1, RELEASE))
             self._insert_tasks(db, rid, 1, titles, 'pending', stamp[0])
             self._event(db, stamp, 'request_created', rid, status='running')
             return (*self._detail(db, rid), False)
@@ -2580,6 +2586,25 @@ class Store:
     def request_row(self, rid):
         with self._read() as db:
             return self._request(db, rid)
+
+    def release_seen(self, rid, release):
+        """A running request's agent is told of release. -> (told, previous): told is True when its request was on
+        another release (previous: that one, None from before releases), False when on this one already, None when
+        it is not running (nothing to tell; a request reopened later still is). Never bumps updated_at: no activity."""
+        with self._write() as db:
+            row = db.execute('SELECT status, release FROM requests WHERE id = ?', (rid,)).fetchone()
+            if row is None or row['status'] != 'running':
+                return None, None
+            if row['release'] == release:
+                return False, release
+            db.execute('UPDATE requests SET release = ? WHERE id = ?', (release, rid))
+            return True, row['release']
+
+    def request_created(self, rid):
+        """The request's created_at, or None when there is no such request."""
+        with self._read() as db:
+            row = db.execute('SELECT created_at FROM requests WHERE id = ?', (rid,)).fetchone()
+            return row and row['created_at']
 
     def request_status(self, rid):
         """The request's status, or None when there is no such request."""
@@ -2876,7 +2901,7 @@ def request_json(row, now, public, stale_after, report_base=None, stream=None):
         'url': f"{public}/r/{row['id']}",
         'attention': attention, 'waiting': waiting, 'tasks_waiting': row['tasks_waiting'],
         'report': report_json(row, public, 'report_', report_base),
-        'stream': stream,
+        'stream': stream, 'release': row['release'],
     }
 
 
@@ -3039,6 +3064,7 @@ class Handler(BaseHTTPRequestHandler):
         self._error_note = ''
         self.warnings = []
         self.replay = False
+        self.about = None  # the request a live write is about, for Boot's notice
         path = self.path
         try:
             try:
@@ -3050,6 +3076,8 @@ class Handler(BaseHTTPRequestHandler):
             handler, params = self._match(method, path)
             if method in ('POST', 'PUT', 'DELETE'):
                 self._check_origin()
+                if handler != 'delete_request' and (params.get('rid') or params.get('tid')):
+                    self.about = params.get('rid') or params['tid'].split('-')[0]
             getattr(self, 'h_' + handler)(**params)
         except ApiError as exc:
             self._send_json(exc.code, exc.payload, exc.headers)
@@ -3230,6 +3258,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header('Cache-Control', cache)
             self.send_header('X-Tasks-Version', VERSION)
             self.send_header('X-Tasks-Docs', docs_version())
+            self.send_header('X-Tasks-Release', RELEASE)
+            self.send_header('X-Tasks-Boot', self.server.boot.id)
             for key, value in (headers or {}).items():
                 self.send_header(key, value)
             self.end_headers()
@@ -3253,6 +3283,14 @@ class Handler(BaseHTTPRequestHandler):
     def _reply(self, code, payload):
         if self.warnings:
             payload['warnings'] = self.warnings
+        if self.about is not None and code < 300 and not self.replay and self.headers.get('Origin') is None:
+            boot, store = self.server.boot, self.server.store
+            notice = boot.notice(store, self.about)
+            if notice is not None:
+                payload['restarted'] = notice
+            notice = boot.release_notice(store, self.about, self.agent_url())
+            if notice is not None:
+                payload['release_changed'] = notice
         self._send_json(code, payload)
 
     def log_request(self, code='-', size='-'):
@@ -3288,7 +3326,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(500, f'template missing: {rel}') from None
         if render:
             data = (data.decode('utf-8').replace('{{BASE_URL}}', self.agent_url())
-                    .replace('{{PUBLIC_URL}}', self.public_url()).replace('{{VERSION}}', VERSION)
+                    .replace('{{PUBLIC_URL}}', self.public_url()).replace('{{VERSION}}', VERSION).replace('{{RELEASE}}', RELEASE)
                     .replace('{{DOCS_VERSION}}', docs_version()).encode('utf-8'))
         html = rel.endswith('.html')
         self._send(200, data, 'text/html; charset=utf-8' if html else 'text/plain; charset=utf-8',
@@ -3303,7 +3341,7 @@ class Handler(BaseHTTPRequestHandler):
                           'requests_running': self.server.store.running_count(),
                           'docs_version': docs_version(), 'tls_port': self.server.tls_port,
                           'config_path': str(self.server.settings.path), 'report_port': self.server.report_port,
-                          'report_tls_port': self.server.report_tls_port})
+                          'report_tls_port': self.server.report_tls_port, 'boot_id': self.server.boot.id, 'release': RELEASE})
 
     def _query(self, name):
         values = self.query.get(name)
@@ -3356,7 +3394,7 @@ class Handler(BaseHTTPRequestHandler):
         now = ts()
         self.server.store.delete_request(rid, now)
         log.info('deleted request %s', rid)
-        self.warnings.extend(self.server.stream.close(rid)[1])
+        self.server.stream.close(rid)
         self._reply(200, {'deleted': rid, 'now': now})
 
     def h_complete_request(self, rid):
@@ -3369,7 +3407,7 @@ class Handler(BaseHTTPRequestHandler):
         if previous != status:
             log.info('request %s %s (was %s; auto-closed %d, cancelled %d)', rid, status, previous,
                      len(auto_closed), len(cancelled))
-        self.warnings.extend(self.server.stream.close(rid)[1])  # a request's stream ends with it
+        self.server.stream.close(rid)  # a request's stream ends with it
         self._reply(200, {**self._detail(row, tasks, now), 'auto_closed': auto_closed, 'cancelled': cancelled})
 
     def h_add_tasks(self, rid):
@@ -3524,7 +3562,8 @@ class Handler(BaseHTTPRequestHandler):
         now = ts()
         self._reply(200, {'now': now, **self.server.store.events(since, limit, now, self.server.stale_after),
                           'settings_version': version, 'stream': self.server.stream.snapshot(),
-                          'streams': self.server.stream.snapshots(), 'clock': board_clock(now)})
+                          'streams': self.server.stream.snapshots(), 'clock': board_clock(now),
+                          'boot_id': self.server.boot.id})
 
     def h_get_settings(self):
         self._reply(200, self.server.settings.snapshot(ts()))
@@ -3543,12 +3582,16 @@ class Handler(BaseHTTPRequestHandler):
         log.info('settings reset to the defaults (%s removed)', self.server.settings.path)
         self._reply(200, self.server.settings.snapshot(ts()))
 
-    def _stream_payload(self, **extra):
+    def _stream_payload(self, chan=None, **extra):
+        """GET /api/stream's shape. chan: the stream this call opened, which its reply describes whatever another call
+        opened since."""
         hub = self.server.stream
-        return {'now': ts(), 'stream': hub.snapshot(), 'streams': hub.snapshots(), 'ffmpeg': find_ffmpeg(), **extra}
+        return {'now': ts(), 'stream': chan.snapshot() if chan else hub.snapshot(), 'streams': hub.snapshots(),
+                'ffmpeg': find_ffmpeg(), **extra}
 
-    def _request_stream_payload(self, rid, **extra):
-        return {'now': ts(), 'request_id': rid, 'stream': self.server.stream.snapshot(rid), 'ffmpeg': find_ffmpeg(), **extra}
+    def _request_stream_payload(self, rid, chan=None, **extra):
+        return {'now': ts(), 'request_id': rid, 'stream': chan.snapshot() if chan else self.server.stream.snapshot(rid),
+                'ffmpeg': find_ffmpeg(), **extra}
 
     def _no_ffmpeg_warning(self):
         if find_ffmpeg() is None:
@@ -3560,15 +3603,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def h_open_stream(self):
         body = self._body({'url'})
-        _, existing, warnings = self.server.stream.open(clean_stream_url(body.get('url')))
-        self.warnings.extend(warnings)
+        chan, existing = self.server.stream.open(clean_stream_url(body.get('url')))
         self._no_ffmpeg_warning()
-        self._reply(200 if existing else 201, self._stream_payload(existing=existing))
+        self._reply(200 if existing else 201, self._stream_payload(chan, existing=existing))
 
     def h_close_stream(self):
-        closed, warnings = self.server.stream.close()
-        self.warnings.extend(warnings)
-        self._reply(200, self._stream_payload(closed=closed))
+        self._reply(200, self._stream_payload(closed=self.server.stream.close()))
 
     def _running_request(self, rid):
         """The request, which must be running: a closed one is a 409, as for attention."""
@@ -3587,23 +3627,20 @@ class Handler(BaseHTTPRequestHandler):
         url = clean_stream_url(body.get('url'))
         self._running_request(rid)
         hub = self.server.stream
-        _, existing, warnings = hub.open(url, rid)
+        chan, existing = hub.open(url, rid)
         # The request may have closed (or gone) meanwhile, after its own close found no stream to end: end it here.
         try:
             self._running_request(rid)
         except ApiError:
             hub.close(rid)
             raise
-        self.warnings.extend(warnings)
         self._no_ffmpeg_warning()
-        self._reply(200 if existing else 201, self._request_stream_payload(rid, existing=existing))
+        self._reply(200 if existing else 201, self._request_stream_payload(rid, chan, existing=existing))
 
     def h_delete_request_stream(self, rid):
         self._body(set())
         self.server.store.request_row(rid)
-        closed, warnings = self.server.stream.close(rid)
-        self.warnings.extend(warnings)
-        self._reply(200, self._request_stream_payload(rid, closed=closed))
+        self._reply(200, self._request_stream_payload(rid, closed=self.server.stream.close(rid)))
 
     def _stream_headers(self, mime):
         self.send_response(200)
@@ -3612,6 +3649,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Tasks-Version', VERSION)
         self.send_header('X-Tasks-Docs', docs_version())
+        self.send_header('X-Tasks-Release', RELEASE)
+        self.send_header('X-Tasks-Boot', self.server.boot.id)
         self.send_header('Connection', 'close')
         self.end_headers()
 
@@ -3885,15 +3924,17 @@ def main(argv=None):
 
     settings = Settings(Path(os.path.abspath(args.config or args.db.parent / 'settings.json')))
     settings.current_version()  # read it now, so a broken file is reported at startup
-    streams = StreamHub(Path(os.path.abspath(args.db)).with_suffix('.stream.json'))
+    forget_stream_file(Path(os.path.abspath(args.db)).with_suffix('.stream.json'))
+    streams = StreamHub()
     local_names = frozenset(name.lower() for name in (
         'localhost', socket.gethostname(), urlsplit(args.public_url or '').hostname) if name)
     started_at = ts()
+    boot = Boot(started_at)
     for server in servers:
         server.store, server.settings, server.stream = store, settings, streams
         server.public_url = args.public_url
         server.stale_after = args.stale_after
-        server.started_at = started_at
+        server.started_at, server.boot = started_at, boot
         server.local_names = local_names
         server.http_port, server.tls_port = args.port, args.tls_port
         server.report_port, server.report_tls_port = args.report_port, args.report_tls_port
@@ -3913,7 +3954,6 @@ def main(argv=None):
     log.info('tasks server listening on %s (db %s, pid %d, public url %s, settings %s)', _shown(httpd, 'http'),
              args.db, os.getpid(), args.public_url or 'from Host header', settings.path)
     try:
-        streams.restore(lambda rid: store.request_status(rid) == 'running')
         httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         log.info('shutting down')

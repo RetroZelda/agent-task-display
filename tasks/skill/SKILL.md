@@ -23,6 +23,8 @@ allowed-tools:
 
 # Task status board
 
+These are the instructions of the board's release 1.0.0.
+
 The user follows your long-running work on a live web page instead of asking you for status. Report
 to it with `${CLAUDE_SKILL_DIR}/taskctl`, and always call it by exactly that path: no `cd`, no
 `python3` prefix, no `~`, because the permission rules match that path. Reporting is a side channel.
@@ -48,7 +50,12 @@ k3m9qa-2
 k3m9qa-3
 ```
 
-stderr shows the page: `taskctl: created k3m9qa 'Build the app and deploy it to staging'  page: http://HOST:8765/r/k3m9qa`.
+stderr shows the page and the board's release: `taskctl: created k3m9qa 'Build the app and deploy it to
+staging'  page: http://HOST:8765/r/k3m9qa  release: 1.0.0`.
+
+- **If that release is not 1.0.0 (the release at the top of this file), re-read this file before you go
+  on**: the board was updated since you read it. Only a new release means new instructions, so a
+  request on the same release needs no re-read.
 
 - One request per user request. Its title is one short sentence saying what the user asked for.
 - Plan 2-8 tasks with `-t`: short imperative titles, each a step that actually finishes. Planning them
@@ -141,7 +148,8 @@ ${CLAUDE_SKILL_DIR}/taskctl stream k3m9qa --close
   its own host, so it must be reachable from there. stdout is the request's page; stderr says whether
   the stream is live. `stream k3m9qa` alone shows it, and `show` has a line for it.
 - One stream per request: a newer URL replaces it. It ends when the request is closed or deleted, so
-  close the stream yourself only when the user no longer wants it during the work.
+  close the stream yourself only when the user no longer wants it during the work. A restart of the
+  board ends it too, and your next command says so: then open it again (section 10).
 - It needs a running request (a closed one is refused) and is not queued while the board is unreachable.
 
 ## 7. Close everything, including on failure
@@ -208,6 +216,15 @@ taskctl: re-read DIR/SKILL.md before continuing; the copy loaded in your context
 - When you see it, read `${CLAUDE_SKILL_DIR}/SKILL.md` again with your Read tool before the next
   taskctl command, and follow the new copy from then on. The command that printed it already did its
   job: do not run it again.
+- The update notice says to re-read only when the release changed (MAJOR.MINOR.PATCH: major for
+  significant changes, minor for features, patch for fixes). An update within the same release says
+  `still release ...: nothing to re-read`.
+- Another session may have updated the skill already. So when the board moves to another release while
+  your request runs, the next command about that request also says so, once (`taskctl: the board moved
+  to release ... after request k3m9qa began`): re-read SKILL.md then too.
+- When the board restarted while your request ran, the next command about it says so, once
+  (`taskctl: the board restarted at ...`). The board kept your request and its tasks, but no live
+  stream survives a restart: if your request had one (section 6), open it again with `stream`.
 - For anything the board offers that has no command here, `${CLAUDE_SKILL_DIR}/taskctl usage` prints
   its full HTTP API reference, and `api METHOD PATH ['JSON']` calls any route and prints the response
   body, for example `${CLAUDE_SKILL_DIR}/taskctl api GET /api/requests/k3m9qa`. Put a JSON body in

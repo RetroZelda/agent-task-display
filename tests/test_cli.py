@@ -41,7 +41,7 @@ TASK_KEYS = {'id', 'request_id', 'seq', 'title', 'status', 'percent', 'message',
 REQUEST_KEYS = {'id', 'title', 'origin', 'status', 'message', 'created_at', 'updated_at', 'completed_at',
                 'elapsed', 'percent', 'tasks_total', 'tasks_done', 'tasks_failed', 'tasks_running',
                 'tasks_pending', 'tasks_cancelled', 'current', 'eta_at', 'stale', 'url', 'attention', 'waiting',
-                'tasks_waiting', 'report', 'stream'}
+                'tasks_waiting', 'report', 'stream', 'release'}
 NUDGE = ('taskctl: task was never started; its running time is approximate - run `taskctl start TID` '
          'when you begin a task')
 
@@ -157,7 +157,8 @@ def main_flow():
     rid = ids[0]
     t1, t2, t3 = ids[1:]
     errl = err.splitlines()
-    check('new: stderr created line', errl and errl[0] == f"taskctl: created {rid} 'Integration test'  page: {URL}/r/{rid}", err)
+    check('new: stderr created line, with the release the request begins under', errl
+          and errl[0] == f"taskctl: created {rid} 'Integration test'  page: {URL}/r/{rid}  release: 1.0.0", err)
     check('new: stderr task lines', errl[1:] == [f'taskctl:   {t}  {n}' for t, n in zip(ids[1:], ('alpha', 'beta', 'gamma'), strict=False)], err)
     r = verify_request(get_req(rid), 'after new')
     check('new: origin = hostname:cwd basename', r['origin'] == f'{host}:{WORK.name}', r['origin'])
@@ -292,7 +293,7 @@ def main_flow():
     rc, out, err = tc('new', "user's C:\\path request", '-t', 'one', '-t', 'two')
     rid2, s1, s2 = lines(out)
     check('new: stderr quotes the title literally', err.splitlines()[0]
-          == f"taskctl: created {rid2} 'user's C:\\path request'  page: {URL}/r/{rid2}", err)
+          == f"taskctl: created {rid2} 'user's C:\\path request'  page: {URL}/r/{rid2}  release: 1.0.0", err)
     tc('start', s2, 'working')
     rc, out, err = tc('list')
     ll = lines(out)
@@ -521,7 +522,7 @@ def main_flow():
     code, changelog, _ = api(URL, 'GET', '/api/changelog', raw=True)
     rc, out, err = tc('changelog')
     check("changelog: the board's changelog on stdout, newest first", rc == 0 and out == changelog.decode()
-          and out.startswith('## v3 — '), (rc, out[:80], err))
+          and out.startswith('## 1.0.0 — '), (rc, out[:80], err))
     rc, out, err = tc('api', 'GET', '/api/health')
     check('api GET /api/health: the JSON body on stdout', rc == 0 and json.loads(out)['version'] == '3'
           and json.loads(out)['docs_version'] == docs_version(TASKS), (rc, out, err))
@@ -877,15 +878,53 @@ def served_files():
     os.chmod(dl / 'taskctl.py', 0o755)
     rc, out, err = tc('ping', url=None, exe=dl / 'taskctl')
     check('downloaded taskctl pings its BAKED_URL', rc == 0 and out == URL + '\n' and 'ok' in err, (rc, out, err))
-    check('the repo taskctl.py keeps its three unrendered BAKED_ lines',
+    check('the repo taskctl.py keeps its four unrendered BAKED_ lines',
           [line for line in TASKCTL_PY.read_text().splitlines() if line.startswith('BAKED_')]
-          == ['BAKED_URL = "{{BASE_URL}}"', 'BAKED_DOCS = "{{DOCS_VERSION}}"', 'BAKED_API = "{{VERSION}}"'])
+          == ['BAKED_URL = "{{BASE_URL}}"', 'BAKED_DOCS = "{{DOCS_VERSION}}"', 'BAKED_API = "{{VERSION}}"', 'BAKED_RELEASE = "{{RELEASE}}"'])
+
+
+def restarts(server, env):
+    """The board restarted under a running request, then moved to a new release: what taskctl tells its agent. -> the board
+    running at the end (on the same port and database)."""
+    S.section('restarts and releases: what the next command about a request says')
+    port = server.port
+    rc, out, _ = tc('new', 'Across a restart', '-t', 'one', '-t', 'two')
+    rid = out.split()[0]
+    tc('start', f'{rid}-1', 'go')
+    tc('stream', rid, 'http://fake.invalid/hang')
+    server.stop()
+    server = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', str(STALE_AFTER), name='cli', port=port, fresh_db=False, env=env).start()
+    rc, out, err = tc('progress', f'{rid}-1', '20', 'after the restart')
+    check('the first command about the request after a restart: one note that the board restarted, naming the stream to open again',
+          rc == 0 and err.count('the board restarted at ') == 1 and f'after request {rid} began' in err and f'taskctl stream {rid} URL' in err
+          and err.splitlines()[-1] == f'taskctl: {rid}-1 running 20%', (rc, err))
+    rc, out, err = tc('stream', rid)
+    check('...and the stream is gone indeed', rc == 0 and err == f'taskctl: {rid} has no stream\n', (rc, err))
+    rc, out, err = tc('progress', f'{rid}-1', '30', 'again')
+    check('the next one says nothing more', rc == 0 and 'restarted' not in err, err)
+    tree = tasks_copy(TMP / 'cli-release')
+    server_py = tree / 'server.py'
+    server_py.write_text(server_py.read_text().replace("RELEASE = '1.0.0'", "RELEASE = '1.0.1'", 1))
+    server.stop()
+    server = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', str(STALE_AFTER), script=server_py, name='cli', port=port,
+                           fresh_db=False, env=env).start()
+    rc, out, err = tc('ask', rid, 'which one?')
+    check('after an update to a new release: one note to re-read the instructions (and one that it restarted)', rc == 0
+          and err.count('the board moved to release 1.0.1 after request') == 1 and '(on 1.0.0)' in err and 're-read' in err
+          and err.count('the board restarted at ') == 1, (rc, err))
+    rc, out, err = tc('resume', rid)
+    check('...once', rc == 0 and 'moved to release' not in err and 'restarted' not in err, err)
+    rc, out, err = tc('new', 'Begun on 1.0.1')
+    check('a request begun now prints the new release', rc == 0 and err.splitlines()[0].endswith('  release: 1.0.1'), err)
+    tc('done', rid)
+    return server
 
 
 if __name__ == '__main__':
     fakebin = fake_ffmpeg_dir(TMP)    # the stream checks: the board's ffmpeg is the fake, which reaches no host
+    board_env = clean_env(PATH=f'{fakebin}{os.pathsep}{os.environ["PATH"]}')
     server = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', str(STALE_AFTER), '--expire-after', str(EXPIRE_AFTER),
-                           name='cli', env=clean_env(PATH=f'{fakebin}{os.pathsep}{os.environ["PATH"]}')).start()
+                           name='cli', env=board_env).start()
     URL = server.url
     try:
         main_flow()
@@ -893,6 +932,7 @@ if __name__ == '__main__':
         grandchildren()
         install_rule()
         served_files()
+        server = restarts(server, board_env)
     finally:
         code = server.stop()
     check('server exits 0 on SIGTERM and removes its pidfile', code == 0 and not server.pidfile.exists(), code)
