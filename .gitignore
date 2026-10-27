@@ -7,3 +7,6 @@ tasks/data/
 # Python bytecode cache.
 __pycache__/
 *.pyc
+
+# Claude Code settings for this checkout.
+.claude/
