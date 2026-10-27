@@ -602,15 +602,16 @@ def assert_clock(name, r, kind, width):
     # the board's release, under the connection's state
     b, rel = ini['boxes'], ini['release']
     if kind == 'old':
-        check(f'{name}: a board from before releases (no X-Tasks-Release): no release under the connection\'s state', rel['hidden'] is True
+        check(f'{name}: a board from before releases (no X-Tasks-Release): no release in the header', rel['hidden'] is True
               and rel['text'] == '' and b['release'] is None, rel)
     else:
-        rb, rt, cb, tb = b['release'], b['releaseText'], b['conn'], b['connText']
-        check(f'{name}: the release, v{start["release"]}, under the connection\'s state, its tooltip saying what it is',
+        rb, cb, br = b['release'], b['conn'], b['brand']
+        check(f'{name}: the release, v{start["release"]}, between the title and the connection\'s state, its tooltip saying what it is',
               rel['hidden'] is False and rel['text'] == f'v{start["release"]}' and rel['title'] == f'The board runs release {start["release"]}', rel)
-        check(f'{name}: ...below it, lined up with its text (not its dot), both inside the bar, which keeps its height',
-              rb is not None and rb['y'] >= cb['b'] - 0.5 and abs(rt['x'] - tb['x']) <= 1 and rb['b'] <= b['top']['b'] and cb['y'] >= b['top']['y']
-              and rb['b'] - cb['y'] <= b['bell']['h'] + 0.5, (cb, tb, rb, b['bell'], b['top']))
+        check(f'{name}: ...in the title\'s row: right of the title, left of the state, on its line, inside the bar, which keeps its height',
+              rb is not None and rb['x'] >= br['r'] - 0.5 and rb['r'] <= cb['x'] + 0.5 and abs((rb['y'] + rb['h'] / 2) - (cb['y'] + cb['h'] / 2)) <= 3
+              and abs((rb['y'] + rb['h'] / 2) - (br['y'] + br['h'] / 2)) <= 3 and rb['y'] >= b['top']['y'] and rb['b'] <= b['top']['b'],
+              (br, rb, cb, b['top']))
     # where it sits in the bar
     c = ini['boxes']['clock']
     if kind != 'old':
@@ -622,7 +623,7 @@ def assert_clock(name, r, kind, width):
         else:
             check(f'{name}: one row: the clock is centred in the window ({width}px) and in the bar, clear of the brand and of the buttons',
                   abs(c['x'] + c['w'] / 2 - width / 2) <= 1.5 and abs(c['y'] + c['h'] / 2 - (b['top']['y'] + b['top']['h'] / 2)) <= 2
-                  and c['x'] >= max(b['conn']['r'], b['release']['r']) + 8 and c['r'] <= b['bell']['x'] - 8 and b['top']['h'] < 56
+                  and c['x'] >= b['conn']['r'] + 8 and c['r'] <= b['bell']['x'] - 8 and b['top']['h'] < 56
                   and ini['scroll'][0] <= ini['scroll'][1],
                   (c, b['top'], b['conn'], b['bell']))
     check(f'{name}: no JS errors', r['errors'] == [], r['errors'])

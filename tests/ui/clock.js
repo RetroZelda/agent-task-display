@@ -10,7 +10,6 @@ __t.run(async () => {
         const r = el.getBoundingClientRect();
         return { x: r.x, y: r.y, w: r.width, h: r.height, r: r.right, b: r.bottom };
     };
-    const textOf = (el) => { const range = document.createRange(); range.selectNodeContents(el); return range; };  // the text's own box
     const look = () => {
         const el = $('clock'), checked = document.querySelector('input[name=dev-clock]:checked');
         let stored = null;
@@ -21,8 +20,7 @@ __t.run(async () => {
                  radio: checked ? checked.value : null, note: $('dev-clock-note').textContent, stored,
                  release: { hidden: $('release').hidden, text: $('release').textContent, title: $('release').title },
                  boxes: { clock: el.hidden ? null : box(el), top: box(document.querySelector('.top')), brand: box(document.querySelector('.brand')), conn: box($('conn')),
-                          connText: box($('conn-text')), release: $('release').hidden ? null : box($('release')),
-                          releaseText: $('release').hidden ? null : box(textOf($('release'))),
+                          release: $('release').hidden ? null : box($('release')),
                           bell: box($('bell')), gear: box($('settings-btn')), setup: box(document.querySelector('.setup')) },
                  scroll: [document.documentElement.scrollWidth, document.documentElement.clientWidth] };
     };
