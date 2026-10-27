@@ -32,6 +32,7 @@ Hooks:
                            second board in the same browser would wipe the first one's settings)
     __skew=S               this browser's clock runs S seconds ahead of the board's (Date.now)
     __noclock=1            this page's /api/events answers carry no "clock" key, as an older board's do
+    __norelease=1          this page's replies have no X-Tasks-Release header, as those of a board from before releases
     __tune=NAME:N,...      sets page constants (const STREAM_PARK_MS = 60000; becomes 3000), so a timer
                            measured in minutes can be tested in seconds (the page's STREAM_ numbers only)
     __nodvh=1              the page's dvh units renamed to one no browser knows: the page as a browser without
@@ -119,6 +120,7 @@ try {
     var q = new URLSearchParams(location.search);
     try { if (!q.get('__keep')) localStorage.clear(); if (q.get('__local')) localStorage.setItem('taskstatus.settings.local', q.get('__local')); } catch (e) {}
     window.__rec = { notes: [], instances: [], closes: [], tones: [], nodes: 0, perms: 0, contexts: 0, gesture: false };
+    if (q.get('__norelease')) { var getHeader = XMLHttpRequest.prototype.getResponseHeader; XMLHttpRequest.prototype.getResponseHeader = function (name) { return /^x-tasks-release$/i.test(name) ? null : getHeader.apply(this, arguments); }; }
     if (q.get('__noclock')) { var xhrOpen = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function (method, url) { if (/^\/api\/events/.test(url)) url += (url.indexOf('?') < 0 ? '?' : '&') + '__noclock=1'; return xhrOpen.apply(this, [method, url].concat([].slice.call(arguments, 2))); }; }
     if (Number(q.get('__skew'))) { var realNow = Date.now, skew = Number(q.get('__skew')) * 1000; Date.now = function () { return realNow() + skew; }; }
     if (q.get('__insecure')) Object.defineProperty(window, 'isSecureContext', { configurable: true, get: function () { return false; } });

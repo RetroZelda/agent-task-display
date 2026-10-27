@@ -277,6 +277,8 @@ The full wording, including the template for agents that register themselves, is
   row of its own under the rest). It runs on the board's clock as the page last heard it, so a device whose
   clock is wrong still shows the right time. Hover it for the zone. **Settings > This device > Clock** can
   switch a device to its own clock and zone. A board too old to report its zone shows no board clock.
+- **The release** the board runs (`v1.0.1`) is under the connection's state (*live*) at the left of the
+  header, read from the `X-Tasks-Release` header of the board's replies. A board from before releases shows none.
 - While a [live stream](#live-stream) plays, the dashboard shares the window with it and scrolls on its own. A
   request that has one shows a *Stream* checkbox on its row; the checked one plays beside the list.
 

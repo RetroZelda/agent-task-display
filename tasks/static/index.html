@@ -60,6 +60,9 @@
   version, which reloads the frame, as does this device's theme (passed as ?theme=). The request's page has a
   Report button, and list rows say "report".
 
+  Release: the header shows the board's release (vMAJOR.MINOR.PATCH, the X-Tasks-Release of its replies) under the
+  connection's state; a board from before releases shows none.
+
   Restarts: /api/events names the board's start ("boot_id", new at every start). When it changes, the board restarted
   (an update, a reboot): the page reloads, so it starts over from the board as it is now, its code included, and plays
   whatever streams are open now (a restart opens none). A page whose Settings dialog is open waits for it to close, so
@@ -119,6 +122,10 @@ code, pre, .mono { font-family: var(--mono); }
 .conn[data-state=live] .dot { background: var(--done); }
 .conn[data-state=reconnecting] .dot { background: var(--stale); }
 .conn[data-state=offline] .dot { background: var(--failed); }
+/* The board's release (X-Tasks-Release) under the connection's state, lined up with its text; the pair is no taller
+   than the buttons beside it, so the bar keeps its height. */
+.conn-stack { display: inline-flex; flex-direction: column; align-items: flex-start; line-height: 1.2; }
+.release { padding-left: 14px; font: 11px/1.2 var(--mono); color: var(--muted); white-space: nowrap; }
 .spacer { flex: 1; }
 .setup { font-size: 13px; color: var(--muted); text-decoration: none; border: 1px solid var(--border);
     border-radius: 6px; padding: 4px 10px; white-space: nowrap; }
@@ -496,7 +503,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
 <div id="board">
 <header class="top"><div class="wrap">
     <a class="brand" href="/">Task Status</a>
-    <span id="conn" class="conn" data-state="connecting" role="status"><span class="dot"></span><span id="conn-text">connecting</span></span>
+    <span class="conn-stack"><span id="conn" class="conn" data-state="connecting" role="status"><span class="dot"></span><span id="conn-text">connecting</span></span><span id="release" class="release" hidden></span></span>
     <span class="spacer"></span>
     <button type="button" class="icon-btn" id="bell" aria-pressed="false" aria-label="Sound on this device" title="Sound on this device: off">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 6 2.5 8 2.5 8h-17S6 15 6 9"/><path d="M10 20.5a2.2 2.2 0 0 0 4 0"/><path class="slash" d="M3.5 3.5l17 17"/></svg>
@@ -1184,7 +1191,10 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         xhr.responseType = 'json';
         xhr.timeout = FETCH_TIMEOUT_MS;
         xhr.setRequestHeader('Accept', 'application/json');
-        xhr.onload = () => done(xhr.status, xhr.response, '', t0, Date.now());
+        xhr.onload = () => {
+            applyRelease(xhr.getResponseHeader('X-Tasks-Release'));
+            done(xhr.status, xhr.response, '', t0, Date.now());
+        };
         xhr.onerror = () => done(0, null, 'network error');
         xhr.ontimeout = () => done(0, null, 'timed out');
         xhr.onabort = () => done(0, null, 'aborted');
@@ -1333,6 +1343,15 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         setHidden($('banner'), state !== 'offline');
         updateBanner();
         updateAttention();
+    }
+
+    // The board's release, from every reply's X-Tasks-Release, under the connection's state; a board from before
+    // releases sends none, and shows none.
+    function applyRelease(value) {
+        const ok = /^\d+\.\d+\.\d+$/.test(value || ''), el = $('release');
+        setHidden(el, !ok);
+        setText(el, ok ? 'v' + value : '');
+        setAttr(el, 'title', ok ? 'The board runs release ' + value : null);
     }
 
     function updateBanner() {
