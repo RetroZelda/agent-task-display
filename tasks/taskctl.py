@@ -1234,11 +1234,12 @@ def cmd_show(board: Board, args) -> int:
         emit([task_line(t, t.get('now'))] + waiting_lines(t, ''))
         return 0
     r = board.call('GET', '/api/requests/%s' % v)
-    report, stream = r.get('report'), r.get('stream')
+    report, stream, failed = r.get('report'), r.get('stream'), r.get('stream_failed')
     emit([request_line(r)] + waiting_lines(r, '') + ['page: %s' % r.get('url')]
          + (['report: %s (%s, %s, version %s)' % (report.get('url'), report.get('format'), size_text(report.get('size')),
                                                   report.get('version'))] if isinstance(report, dict) else [])
-         + (['stream: %s' % stream_text(stream)] if isinstance(stream, dict) else []))
+         + (['stream: %s' % stream_text(stream)] if isinstance(stream, dict)
+            else ['stream: %s' % stream_failed_text(failed, v)] if isinstance(failed, dict) else []))
     for t in r.get('tasks') or []:
         emit(['  ' + task_line(t, r.get('now'))] + waiting_lines(t, '    '))
     return 0
@@ -1324,6 +1325,15 @@ def stream_text(s: dict) -> str:
     return '%s, %s' % (s.get('url'), state)
 
 
+def stream_failed_text(f: dict, rid: str) -> str:
+    """A stream_failed object as one line: the stream the board closed because it could not connect, and why."""
+    since, at = f.get('since'), f.get('failed_at')
+    took = ' for %s' % fmt_dur(at - since) if isinstance(since, (int, float)) and isinstance(at, (int, float)) else ''
+    why = ': %s' % f.get('error') if f.get('error') else ''
+    return '%s, failed (closed by the board after no connection%s%s); open it again with: taskctl stream %s URL' % (
+        f.get('url'), took, why, rid)
+
+
 def cmd_stream(board: Board, args) -> int:
     v = need_id(args.rid, 'request')
     path = '/api/requests/%s/stream' % v
@@ -1351,6 +1361,8 @@ def cmd_stream(board: Board, args) -> int:
                                      stream_text(s) if isinstance(s, dict) else '?'))
     elif isinstance(s, dict):
         emit([stream_text(s)])
+    elif isinstance(r.get('stream_failed'), dict):
+        emit([stream_failed_text(r['stream_failed'], v)])
     else:
         note('%s has no stream' % v)
     return 0

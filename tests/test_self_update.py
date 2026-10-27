@@ -67,7 +67,7 @@ def served(url, name):
     return api(url, 'GET', '/api/skill/' + name, raw=True)[1]
 
 
-def notice(old, new, news, was='1.0.0', now='1.1.0'):
+def notice(old, new, news, was='1.0.1', now='1.1.0'):
     return (f"taskctl: the board's agent instructions changed (release {was} -> {now}, docs {old} -> {new}); updated the skill in {SKILL}\n"
             "taskctl: what's new:\n" + news +
             f"\ntaskctl: re-read {SKILL}/SKILL.md before continuing; the copy loaded in your context is out of date\n")
@@ -75,8 +75,8 @@ def notice(old, new, news, was='1.0.0', now='1.1.0'):
 
 def release(tree, value):
     """The tree as a board of release value: RELEASE in its server.py and the release line of its SKILL.md."""
-    for rel, old, new in (('server.py', "RELEASE = '1.0.0'", f"RELEASE = '{value}'"),
-                          ('skill/SKILL.md', "the board's release 1.0.0.", f"the board's release {value}.")):
+    for rel, old, new in (('server.py', "RELEASE = '1.0.1'", f"RELEASE = '{value}'"),
+                          ('skill/SKILL.md', "the board's release 1.0.1.", f"the board's release {value}.")):
         text = (tree / rel).read_text()
         assert old in text, (rel, old)
         (tree / rel).write_text(text.replace(old, new, 1))
@@ -156,7 +156,7 @@ def main():
         serve(tb, 'b')
         rc, out, err = tc('ping')
         check("stdout and exit code are the command's own", rc == 0 and out == URL + '\n', (rc, out))
-        check('the exact notice ends stderr, with the changelog entries newer than its release (1.1.0 over 1.0.0)',
+        check('the exact notice ends stderr, with the changelog entries newer than its release (1.1.0 over 1.0.1)',
               err.startswith('taskctl: ok: board at') and err.endswith(notice(DA, DB, '## 1.1.0 — 2026-11-01\n- A newer thing.\n- And another.')),
               err)
         for name in FILES:
@@ -193,24 +193,24 @@ def main():
         serve(ta, 'a')
         rc, out, err = tc('list')
         entries = [line for line in err.splitlines() if line.startswith('## ')]
-        check("back to the older release (1.1.0 -> 1.0.0): what's new is its newest entry, 1.0.0, alone", rc == 0
-              and "taskctl: what's new:\n## 1.0.0 — " in err and entries == [entries[0]] and entries[0].startswith('## 1.0.0 — ')
-              and '(release 1.1.0 -> 1.0.0, ' in err and baked_docs() == DA, err[-800:])
+        check("back to the older release (1.1.0 -> 1.0.1): what's new is its newest entry, 1.0.1, alone", rc == 0
+              and "taskctl: what's new:\n## 1.0.1 — " in err and entries == [entries[0]] and entries[0].startswith('## 1.0.1 — ')
+              and '(release 1.1.0 -> 1.0.1, ' in err and baked_docs() == DA, err[-800:])
         check('a CLAUDE.md without the rule is left alone', (CC / 'CLAUDE.md').read_text() == '# no rule here\n')
 
         S.section('new files within the same release: updated, and one note that there is nothing to re-read')
-        tp = tasks_copy(TMP / 'tasks_patch')     # release 1.0.0, like A, with a line of SKILL.md touched up
+        tp = tasks_copy(TMP / 'tasks_patch')     # release 1.0.1, like A, with a line of SKILL.md touched up
         with open(tp / 'skill' / 'SKILL.md', 'a') as f:
-            f.write('\nA wording fix, still release 1.0.0.\n')
+            f.write('\nA wording fix, still release 1.0.1.\n')
         serve(tp, 'p')
         rc, out, err = tc('ping')
         check('the files are updated, and stderr says so in one note: no "what\'s new", no "re-read"', rc == 0 and out == URL + '\n'
               and baked_docs() == docs_version(tp) and (SKILL / 'SKILL.md').read_bytes() == served(URL, 'SKILL.md')
               and err.endswith(f"taskctl: updated the skill in {SKILL} to the board's files (docs {DA} -> {docs_version(tp)}); still release"
-                               " 1.0.0: nothing to re-read\n") and "what's new" not in err and 're-read ' not in err, (rc, err))
+                               " 1.0.1: nothing to re-read\n") and "what's new" not in err and 're-read ' not in err, (rc, err))
         serve(ta, 'a')
         rc, out, err = tc('ping')
-        check('...and back to A: the same note', rc == 0 and 'still release 1.0.0: nothing to re-read' in err and baked_docs() == DA, err)
+        check('...and back to A: the same note', rc == 0 and 'still release 1.0.1: nothing to re-read' in err and baked_docs() == DA, err)
 
         S.section('TASKS_NO_UPDATE, update, update --force, and moving the skill to another board')
         serve(tb, 'b')
@@ -265,7 +265,7 @@ def main():
         (te / 'skill' / 'SKILL.md').write_text('no front matter here\n')
         tf = tasks_copy(TMP / 'tasks_f')
         (tf / 'templates' / 'changelog.md').unlink()
-        release(tf, '1.0.1')    # another release, so its changelog is wanted
+        release(tf, '1.0.2')    # another release, so its changelog is wanted
         installed = (SKILL / 'SKILL.md').read_bytes()
         serve(td, 'd')
         rc, out, err = tc('ping')

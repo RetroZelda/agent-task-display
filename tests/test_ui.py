@@ -1387,7 +1387,7 @@ def assert_panel(r, srv):
 
 STREAM_JSON = {'Content-Type': 'application/json'}
 STREAM_NAMES = ('layout', 'audio', 'held', 'swap', 'retry', 'multi', 'panel', 'hevc', 'player', 'fault', 'life', 'nav', 'offline', 'odd', 'check',
-                'layoutold', 'audioold', 'full', 'pick', 'restart')
+                'layoutold', 'audioold', 'full', 'pick', 'restart', 'failed')
 RESULTS_STREAM: dict = {}
 
 
@@ -1410,7 +1410,9 @@ def stream_cases():
     try:
         for name in STREAM_NAMES:
             env = clean_env(UI_RESULTS_DIR=RESULTS, PATH=f'{fakebin}{os.pathsep}{os.environ["PATH"]}', FAKE_FFMPEG_LOG=TMP / f'fake-{name}.log')
-            boards[name] = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', '600', script=UI / 'harness.py', name=f'ui-s{name}', env=env).start()
+            extra = ('--stream-give-up', '3') if name == 'failed' else ()  # the case that waits for the board to give up
+            boards[name] = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', '600', *extra, script=UI / 'harness.py', name=f'ui-s{name}',
+                                         env=env).start()
         play = streamplay_setup()
         if os.environ.get('UI_STREAM_URL'):     # a real source, only when asked for: a board of its own, the real ffmpeg
             real = real_ffmpeg_dir(TMP)
@@ -1466,7 +1468,7 @@ def _stream_cases(boards, play):
              frame_case('layout', 36000), frame_case('nav', 30000), frame_case('life', 24000), frame_case('held', 30000),
              frame_case('swap', 22000), frame_case('hevc', 20000), frame_case('odd', 32000), frame_case('audio', 14000),
              frame_case('multi', 14000), frame_case('panel', 30000), frame_case('full', 70000), frame_case('pick', 40000),
-             frame_case('restart', 30000),
+             frame_case('restart', 30000), frame_case('failed', 50000),
              # the same two scripts on boards read as a browser without dvh units reads them (Chrome before 108)
              ('streamlayoutold', boards['layoutold'].url, '/__frame', 1280, 'light', 'streamlayout', 36000, keep + '&__nodvh=1', (), 900),
              ('streamaudioold', boards['audioold'].url, '/__frame', 1280, 'light', 'streamaudio', 14000, keep + '&__nodvh=1', (), 900),
@@ -1501,6 +1503,7 @@ def _stream_cases(boards, play):
     assert_streamfull(res['streamfull'])
     assert_streampick(res['streampick'])
     assert_streamrestart(res['streamrestart'])
+    assert_streamfailed(res['streamfailed'])
     S.section('stream: the list and detail checks, repeated with a stream open')
     for name, theme, width, height, rows in (('stream_check_390', 'light', 390, 900, n_requests), ('stream_check_1280_dark', 'dark', 1280, 900, n_requests),
                                              ('stream_check_844x390', 'light', 844, 390, n_requests), ('stream_check_detail_390', 'light', 390, 900, wait_rows)):
@@ -1980,6 +1983,38 @@ def assert_streamrestart(r):
           r['waited'] == {'mark': 'dialog', 'open': True} and r['closedReload'], (r['waited'], r['closedReload']))
     check('restart: a board that names no start (an older one) never makes it reload', r['older'] == {'mark': 'older'}, r['older'])
     check('restart: no JS errors', r['errors'] == [[]], r['errors'])
+
+
+def assert_streamfailed(r):
+    S.section('stream: a stream the board gives up on (--stream-give-up 3)')
+    if not got('streamfailed', r):
+        return
+    red = 'rgb({}, {}, {})'.format(*(int(r['failedVar'][i:i + 2], 16) for i in (1, 3, 5))) if re.fullmatch(r'#[0-9a-f]{6}', r['failedVar'] or '') else None
+    c, fl = r['connecting'], r['failed']
+    check('failed: while it connects, the row has its stream checkbox and no note', r['put'] == 201 and c['pick'] and not c['failed']['shown'], c)
+    check('failed: once the board closes it, the checkbox goes and a red "Stream failed" takes its place', r['failedAfter'] is not None
+          and not fl['pick'] and fl['failed']['shown'] and fl['failed']['text'] == 'Stream failed' and red is not None and fl['failed']['color'] == red,
+          (r['failedAfter'], fl, r['failedVar']))
+    title = fl['failed']['title'] or ''
+    check('failed: ...its tooltip names the stream (no password), when, how long and why, and that a new stream clears it',
+          title.startswith('The board closed the stream http://***@fake.invalid/refuse?for=A at ') and 'no connection for 3s: ' in title
+          and 'Connection refused' in title and title.endswith('This goes when a new stream opens.') and 's3cr3t' not in title, title)
+    check("failed: ...the list plays nothing, and the request's stream_failed is what the page shows", r['listPane']['streaming'] is False
+          and (r['api'] or {}).get('url') == 'http://***@fake.invalid/refuse?for=A', (r['listPane']['streaming'], r['api']))
+    pg = r['page']
+    check("failed: A's page says it too, in red, with how long and why in the note itself, and plays nothing", pg['shown'] and pg['color'] == red
+          and pg['text'].startswith('Stream failed') and pg['why'].startswith('no connection for 3s: ') and 'Connection refused' in pg['why']
+          and pg['pane']['streaming'] is False, pg)
+    check('failed: a new stream for A: the note goes and the pane plays it', r['again'] == 201 and r['cleared'] == {'note': False, 'streaming': True},
+          r['cleared'])
+    oc, of, ok = r['ownConnecting'], r['ownFailed'], r['ownCleared']
+    check("failed: the board's own: its checkbox above the list while it connects, then a red \"Board stream failed\" in its place",
+          r['own'] == 201 and oc['bar'] and oc['label'] and not oc['failed']['shown'] and of['bar'] and not of['label'] and of['failed']['shown']
+          and of['failed']['text'] == 'Board stream failed' and of['failed']['color'] == red and of['pane']['streaming'] is False, (oc, of))
+    check("failed: ...A's row, its new stream closed by hand (DELETE), shows neither a checkbox nor a note", of['row'] is not None
+          and of['row']['pick'] is False and of['row']['failed']['shown'] is False, of['row'])
+    check("failed: ...a new stream of the board's own clears it", r['ownAgain'] == 201 and ok['label'] and not ok['failed']['shown'], ok)
+    check('failed: no JS errors', all(e == [] for e in r['errors']), r['errors'])
 
 
 def assert_streamoffline(r):

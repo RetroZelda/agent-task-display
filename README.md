@@ -27,7 +27,7 @@ one `curl` line.
   dashboard on a portrait screen and to its right on a landscape one. See [Live stream](#live-stream).
 - **Works offline**: when the board is unreachable, `taskctl` queues the reports on the agent's machine
   and replays them, with their original times, once the board is back.
-- **Keeps agents current**: the board has a release number (now 1.0.0). When the agent instructions
+- **Keeps agents current**: the board has a release number (now 1.0.1). When the agent instructions
   change, every installed `taskctl` updates its skill on its next call, and agents re-read them only
   when the release changed, including an agent whose request was running when the update came. See
   [Releases and restarts](#releases-and-restarts).
@@ -508,17 +508,25 @@ so the name must resolve and be reachable from there.
   returned 404`, `ffmpeg is not installed on the board host`) is the `error` of `GET /api/stream`. A source that announces audio
   but never sends it, or stops sending it, is played without audio. A restart of the board reopens no
   stream.
+- **Giving up**: a stream that cannot connect for 5 minutes, since it opened or was last live, is closed
+  by the board (its `ffmpeg` too) rather than retried for good. Its request then shows a red *Stream
+  failed* where its checkbox was, and on its page with how long and why; the board's own shows *Board
+  stream failed* above the list. It stays until a new stream opens there (or a `DELETE` of that stream
+  dismisses it); the request itself carries on. Over the API it is the request's `stream_failed`
+  (`{id, url, opened_at, since, failed_at, error}`), and the board's own is in `GET /api/stream` and
+  `/api/events`; `taskctl stream RID` and `show` print it. Sending the open URL again starts the 5
+  minutes over. `--stream-give-up SECONDS` on the server changes the wait (`0`: never give up).
 - **Limits**: 16 pages at a time for each stream; a tab that has been in the background for a minute lets go of the stream
   and reconnects when you come back. `ffprobe http://<board-host>:8765/api/stream/media` shows what the pages
   receive.
 
 ## Releases and restarts
 
-The board has a release number, `MAJOR.MINOR.PATCH`, now **1.0.0**: the major number for significant
+The board has a release number, `MAJOR.MINOR.PATCH`, now **1.0.1**: the major number for significant
 changes (it should stay 1 for a long time), the minor for new features, the patch for fixes. The agent
 instructions change only with it, so agents re-read them only when it changes:
 
-- **New requests**: `taskctl new` prints the release the request begins under (`release: 1.0.0`). The
+- **New requests**: `taskctl new` prints the release the request begins under (`release: 1.0.1`). The
   skill names its own release at the top, and an agent whose loaded copy names another one re-reads it.
   A request on the same release costs no re-read.
 - **Updates during a request**: each request keeps its release. When the board moves to another release
@@ -656,13 +664,13 @@ shapes, validation, errors and state rules, is the module docstring of
 | POST | `/api/tasks/<tid>/progress` | `{message, percent?, eta_seconds?}` |
 | POST | `/api/tasks/<tid>/complete` | `{status?: done\|failed, message?}` |
 | POST, DELETE | `/api/tasks/<tid>/attention` | Flag one task as waiting for input: `{message}`; clear it |
-| GET | `/api/events` | The event log since a cursor, plus what is waiting, what is stale, the open streams (`stream`, the board's own, and `streams`, all of them) and the board host's time zone (`clock`: `utc_offset` in seconds and `tz`; `?since=`, `?limit=`) |
+| GET | `/api/events` | The event log since a cursor, plus what is waiting, what is stale, the open streams (`stream`, the board's own, `stream_failed`, its failure, and `streams`, all of them) and the board host's time zone (`clock`: `utc_offset` in seconds and `tz`; `?since=`, `?limit=`) |
 | GET, PUT, DELETE | `/api/settings` | The board-wide notification settings and task order: read, change (`{settings: {...}}`), reset |
 | GET, POST, DELETE | `/api/stream` | The board's own [live stream](#live-stream): read it (with every open stream), open it (`{url}`, replacing the open one), close it |
 | GET | `/api/stream/media` | An open stream as fragmented MP4, an endless response (`?id=`), which the dashboard plays; `&quality=light` or `stills` for a lighter copy |
 
 Requests and tasks have an `attention` field (`{message, since}` or null); a request also has
-`waiting`, `tasks_waiting`, `stream` (its open stream, or null) and `release` (the release its agent is on), and the list's counts have `waiting`. A write sent with the header
+`waiting`, `tasks_waiting`, `stream` (its open stream, or null), `stream_failed` (the stream the board closed because it could not connect, or null) and `release` (the release its agent is on), and the list's counts have `waiting`. A write sent with the header
 `X-Tasks-Replay: 1` and a body field `at` is recorded at that time (within the last 24 hours), which
 is how the offline queue keeps the original times.
 
@@ -734,10 +742,11 @@ control aging:
 | `--stale-after` | `600` (10 min) | Seconds without an update before running work shows as stale |
 | `--expire-after` | `86400` (24 h) | Seconds without activity before a running request is closed as failed ("expired: no activity for 24h"). `0` disables it. Waiting requests never expire. |
 | `--retention-days` | `30` | Days to keep finished requests before deleting them. `0` keeps them forever. |
+| `--stream-give-up` | `300` (5 min) | Seconds a [live stream](#live-stream) may go without connecting before the board closes it and its request shows *Stream failed*. `0` never gives up. |
 
 The event log behind the notifications keeps 7 days, and at most the newest 10000 events. A
 maintenance pass runs at startup and then every 10 minutes or less. `tasks.sh` does not pass these
-three flags through, so to change them, run the server directly, for example
+flags through, so to change them, run the server directly, for example
 `python3 tasks/server.py --retention-days 7`. See `python3 tasks/server.py --help`.
 
 On agent machines, `taskctl` keeps only its [offline queue](#offline-queue), and only while there is

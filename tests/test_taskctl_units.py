@@ -465,11 +465,13 @@ eq('since 3: nothing newer, so the newest', tc.whats_new(CL, 3), '## v3 — 2026
 eq('no API version: the newest', tc.whats_new(CL, None), '## v3 — 2026-10-01\n- three')
 eq('no headings: the whole text', tc.whats_new('  just text\n', 1), 'just text')
 real = (Path(TASKCTL_PY).parent / 'templates' / 'changelog.md').read_text()
-S.check("the real changelog: a v1 CLI is told 1.0.0, v3 and v2, not v1", tc.whats_new(real, 1).startswith('## 1.0.0 — ')
-        and '## v3 — ' in tc.whats_new(real, 1) and '## v2 — ' in tc.whats_new(real, 1) and '## v1' not in tc.whats_new(real, 1),
-        tc.whats_new(real, 1)[:200])
-S.check("the real changelog: a v3 CLI is told 1.0.0 alone", tc.whats_new(real, 3).startswith('## 1.0.0 — ')
-        and '## v3' not in tc.whats_new(real, 3), tc.whats_new(real, 3)[:200])
+S.check("the real changelog: a v1 CLI is told 1.0.1, 1.0.0, v3 and v2, not v1", tc.whats_new(real, 1).startswith('## 1.0.1 — ')
+        and '\n## 1.0.0 — ' in tc.whats_new(real, 1) and '## v3 — ' in tc.whats_new(real, 1) and '## v2 — ' in tc.whats_new(real, 1)
+        and '## v1' not in tc.whats_new(real, 1), tc.whats_new(real, 1)[:200])
+S.check("the real changelog: a v3 CLI is told 1.0.1 and 1.0.0 alone", tc.whats_new(real, 3).startswith('## 1.0.1 — ')
+        and '\n## 1.0.0 — ' in tc.whats_new(real, 3) and '## v3' not in tc.whats_new(real, 3), tc.whats_new(real, 3)[:200])
+S.check("the real changelog: a 1.0.0 CLI is told 1.0.1 alone", tc.whats_new(real, '1.0.0').startswith('## 1.0.1 — ')
+        and '## 1.0.0' not in tc.whats_new(real, '1.0.0'), tc.whats_new(real, '1.0.0')[:200])
 
 S.section('releases: MAJOR.MINOR.PATCH, and the API versions from before them')
 eq('release_key: a release, an API version (an int, a digit string or vN, as 0.N.0), anything else None',
@@ -480,5 +482,13 @@ RL = '## 1.10.0 — 2026-12-01\n- ten\n\n## 1.9.1 — 2026-11-02\n- fix\n\n## 1.
 eq('since 1.9.0: 1.10.0 and 1.9.1 (numbers, not text)', tc.whats_new(RL, '1.9.0'), '## 1.10.0 — 2026-12-01\n- ten\n\n## 1.9.1 — 2026-11-02\n- fix')
 eq('since API 3 (a CLI from before releases): every release', tc.whats_new(RL, 3).count('\n## '), 2)
 eq('since the newest: nothing newer, so the newest', tc.whats_new(RL, '1.10.0'), '## 1.10.0 — 2026-12-01\n- ten')
+
+S.section('stream_failed_text: a stream the board closed because it could not connect')
+eq('the URL, how long, why, and the command that opens it again',
+   tc.stream_failed_text({'url': 'rtsp://***@cam/live', 'since': 100.0, 'failed_at': 400.2, 'error': 'Connection refused'}, 'k3m9qa'),
+   'rtsp://***@cam/live, failed (closed by the board after no connection for 5m00s: Connection refused); '
+   'open it again with: taskctl stream k3m9qa URL')
+eq('no times and no error: just that it failed', tc.stream_failed_text({'url': 'http://h/x', 'since': None, 'error': None}, 'k3m9qa'),
+   'http://h/x, failed (closed by the board after no connection); open it again with: taskctl stream k3m9qa URL')
 
 sys.exit(S.finish())

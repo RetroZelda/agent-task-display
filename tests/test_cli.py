@@ -41,7 +41,7 @@ TASK_KEYS = {'id', 'request_id', 'seq', 'title', 'status', 'percent', 'message',
 REQUEST_KEYS = {'id', 'title', 'origin', 'status', 'message', 'created_at', 'updated_at', 'completed_at',
                 'elapsed', 'percent', 'tasks_total', 'tasks_done', 'tasks_failed', 'tasks_running',
                 'tasks_pending', 'tasks_cancelled', 'current', 'eta_at', 'stale', 'url', 'attention', 'waiting',
-                'tasks_waiting', 'report', 'stream', 'release'}
+                'tasks_waiting', 'report', 'stream', 'stream_failed', 'release'}
 NUDGE = ('taskctl: task was never started; its running time is approximate - run `taskctl start TID` '
          'when you begin a task')
 
@@ -158,7 +158,7 @@ def main_flow():
     t1, t2, t3 = ids[1:]
     errl = err.splitlines()
     check('new: stderr created line, with the release the request begins under', errl
-          and errl[0] == f"taskctl: created {rid} 'Integration test'  page: {URL}/r/{rid}  release: 1.0.0", err)
+          and errl[0] == f"taskctl: created {rid} 'Integration test'  page: {URL}/r/{rid}  release: 1.0.1", err)
     check('new: stderr task lines', errl[1:] == [f'taskctl:   {t}  {n}' for t, n in zip(ids[1:], ('alpha', 'beta', 'gamma'), strict=False)], err)
     r = verify_request(get_req(rid), 'after new')
     check('new: origin = hostname:cwd basename', r['origin'] == f'{host}:{WORK.name}', r['origin'])
@@ -293,7 +293,7 @@ def main_flow():
     rc, out, err = tc('new', "user's C:\\path request", '-t', 'one', '-t', 'two')
     rid2, s1, s2 = lines(out)
     check('new: stderr quotes the title literally', err.splitlines()[0]
-          == f"taskctl: created {rid2} 'user's C:\\path request'  page: {URL}/r/{rid2}  release: 1.0.0", err)
+          == f"taskctl: created {rid2} 'user's C:\\path request'  page: {URL}/r/{rid2}  release: 1.0.1", err)
     tc('start', s2, 'working')
     rc, out, err = tc('list')
     ll = lines(out)
@@ -522,7 +522,7 @@ def main_flow():
     code, changelog, _ = api(URL, 'GET', '/api/changelog', raw=True)
     rc, out, err = tc('changelog')
     check("changelog: the board's changelog on stdout, newest first", rc == 0 and out == changelog.decode()
-          and out.startswith('## 1.0.0 — '), (rc, out[:80], err))
+          and out.startswith('## 1.0.1 — '), (rc, out[:80], err))
     rc, out, err = tc('api', 'GET', '/api/health')
     check('api GET /api/health: the JSON body on stdout', rc == 0 and json.loads(out)['version'] == '3'
           and json.loads(out)['docs_version'] == docs_version(TASKS), (rc, out, err))
@@ -640,6 +640,27 @@ def main_flow():
     rc, out, err = tc('stream', srid, 'http://fake.invalid/hang', url='http://127.0.0.1:9', strict=False)
     check('stream to an unreachable board: a warning, exit 0, nothing queued (it is not one of the queued writes)', rc == 0
           and 'unreachable' in err and 'queued' not in err and out == '', (rc, err))
+
+    S.section('stream: one the board gave up on (a board of its own, --stream-give-up 2)')
+    quick = ScratchServer(TMP, '--host', '127.0.0.1', '--stream-give-up', '2', name='cli-giveup', env=board_env).start()
+    try:
+        rc, out, _ = tc('new', 'A camera that is off', '-t', 'watch', url=quick.url)
+        grid = out.split()[0]
+        tc('stream', grid, 'http://user:s3cr3t@fake.invalid/refuse', url=quick.url)
+        gone = wait_until(lambda: api(quick.url, 'GET', f'/api/requests/{grid}')[1]['stream'] is None, 8)
+        rc, out, err = tc('stream', grid, url=quick.url)
+        check('stream RID: one line, the URL without its password, failed, how long and why, and how to open it again', gone and rc == 0
+              and re.fullmatch(r'http://\*\*\*@fake\.invalid/refuse, failed \(closed by the board after no connection for [23]s: '
+                               r'.*Connection refused\); open it again with: taskctl stream ' + grid + r' URL\n', out) is not None and err == '',
+              (rc, out, err))
+        rc, out2, err = tc('show', grid, url=quick.url)
+        check('show: the same as its stream line', rc == 0 and 'stream: ' + out.strip() in lines(out2), out2)
+        tc('stream', grid, 'http://fake.invalid/hang', url=quick.url)
+        rc, out, err = tc('stream', grid, url=quick.url)
+        check('...a new stream: the failure is gone', rc == 0 and out == 'http://fake.invalid/hang, connecting\n', (rc, out, err))
+        tc('done', grid, url=quick.url)
+    finally:
+        quick.stop()
 
 
 def run_signals():
@@ -904,18 +925,18 @@ def restarts(server, env):
     check('the next one says nothing more', rc == 0 and 'restarted' not in err, err)
     tree = tasks_copy(TMP / 'cli-release')
     server_py = tree / 'server.py'
-    server_py.write_text(server_py.read_text().replace("RELEASE = '1.0.0'", "RELEASE = '1.0.1'", 1))
+    server_py.write_text(server_py.read_text().replace("RELEASE = '1.0.1'", "RELEASE = '1.0.2'", 1))
     server.stop()
     server = ScratchServer(TMP, '--host', '127.0.0.1', '--stale-after', str(STALE_AFTER), script=server_py, name='cli', port=port,
                            fresh_db=False, env=env).start()
     rc, out, err = tc('ask', rid, 'which one?')
     check('after an update to a new release: one note to re-read the instructions (and one that it restarted)', rc == 0
-          and err.count('the board moved to release 1.0.1 after request') == 1 and '(on 1.0.0)' in err and 're-read' in err
+          and err.count('the board moved to release 1.0.2 after request') == 1 and '(on 1.0.1)' in err and 're-read' in err
           and err.count('the board restarted at ') == 1, (rc, err))
     rc, out, err = tc('resume', rid)
     check('...once', rc == 0 and 'moved to release' not in err and 'restarted' not in err, err)
-    rc, out, err = tc('new', 'Begun on 1.0.1')
-    check('a request begun now prints the new release', rc == 0 and err.splitlines()[0].endswith('  release: 1.0.1'), err)
+    rc, out, err = tc('new', 'Begun on 1.0.2')
+    check('a request begun now prints the new release', rc == 0 and err.splitlines()[0].endswith('  release: 1.0.2'), err)
     tc('done', rid)
     return server
 

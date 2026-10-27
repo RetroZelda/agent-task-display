@@ -26,7 +26,7 @@ __t.run(async () => {
         const o = {};
         for (const [k, id] of Object.entries(ids)) { const p = pickOf(f, id); o[k] = p ? { on: p.querySelector('input').checked, text: p.textContent, state: p.dataset.state || null } : null; }
         const own = doc(f).getElementById('board-pick');
-        o.own = own.hidden ? null : { on: doc(f).getElementById('board-pick-box').checked, text: own.textContent };
+        o.own = own.hidden ? null : { on: doc(f).getElementById('board-pick-box').checked, text: doc(f).getElementById('board-pick-label').textContent };
         return o;
     };
     // The marker of the fragments the frame's player was given last (the stream it plays), and the stored pick.

@@ -23,7 +23,7 @@ allowed-tools:
 
 # Task status board
 
-These are the instructions of the board's release 1.0.0.
+These are the instructions of the board's release 1.0.1.
 
 The user follows your long-running work on a live web page instead of asking you for status. Report
 to it with `${CLAUDE_SKILL_DIR}/taskctl`, and always call it by exactly that path: no `cd`, no
@@ -51,9 +51,9 @@ k3m9qa-3
 ```
 
 stderr shows the page and the board's release: `taskctl: created k3m9qa 'Build the app and deploy it to
-staging'  page: http://HOST:8765/r/k3m9qa  release: 1.0.0`.
+staging'  page: http://HOST:8765/r/k3m9qa  release: 1.0.1`.
 
-- **If that release is not 1.0.0 (the release at the top of this file), re-read this file before you go
+- **If that release is not 1.0.1 (the release at the top of this file), re-read this file before you go
   on**: the board was updated since you read it. Only a new release means new instructions, so a
   request on the same release needs no re-read.
 
@@ -150,6 +150,9 @@ ${CLAUDE_SKILL_DIR}/taskctl stream k3m9qa --close
 - One stream per request: a newer URL replaces it. It ends when the request is closed or deleted, so
   close the stream yourself only when the user no longer wants it during the work. A restart of the
   board ends it too, and your next command says so: then open it again (section 10).
+- A stream that cannot connect for 5 minutes is closed by the board, and the request's page shows
+  "Stream failed" in red until a new stream opens; `stream k3m9qa` and `show` say so too. Tell your
+  user, and open it again once the source is up and reachable from the board host.
 - It needs a running request (a closed one is refused) and is not queued while the board is unreachable.
 
 ## 7. Close everything, including on failure

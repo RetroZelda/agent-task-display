@@ -31,7 +31,7 @@ TASK_KEYS = ['id', 'request_id', 'seq', 'title', 'status', 'percent', 'message',
 REQ_KEYS = ['id', 'title', 'origin', 'status', 'message', 'created_at', 'updated_at', 'completed_at', 'elapsed',
             'percent', 'tasks_total', 'tasks_done', 'tasks_failed', 'tasks_running', 'tasks_pending',
             'tasks_cancelled', 'current', 'eta_at', 'stale', 'url', 'attention', 'waiting', 'tasks_waiting', 'report',
-            'stream', 'release']
+            'stream', 'stream_failed', 'release']
 CRAFTED = 'x";rm -rf'
 FILE_ROUTES = (('/', 'static/index.html', 'text/html,*/*'), ('/', 'templates/usage.md', '*/*'),
                ('/api', 'templates/usage.md', None), ('/api/usage', 'templates/usage.md', None),

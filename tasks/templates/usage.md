@@ -150,8 +150,8 @@ request; taskctl prints both on stderr.
     DELETE /api/requests/<rid>/report     {deleted, request_id, now}
     GET    /api/requests/<rid>/report/page  the report as a web page (what the dashboard shows)
     PUT    /api/requests/<rid>/stream     {url} -> 201 the request's live stream (below), replacing its old one
-    GET    /api/requests/<rid>/stream     {now, request_id, stream, ffmpeg}
-    DELETE /api/requests/<rid>/stream     close it
+    GET    /api/requests/<rid>/stream     {now, request_id, stream, stream_failed, ffmpeg}
+    DELETE /api/requests/<rid>/stream     close it (or dismiss its stream_failed)
     POST   /api/requests/<rid>/tasks      {title, start?: true} -> 201 one task, running unless start is false
                                           {titles: [title, ...]} -> 201 {tasks[]}, all pending
     GET    /api/tasks/<tid>               one task
@@ -163,7 +163,7 @@ request; taskctl prints both on stderr.
     GET    /api/settings                  the board-wide notification settings (below)
     PUT    /api/settings                  {settings: {...}} change some of them
     DELETE /api/settings                  back to the defaults
-    GET    /api/stream                    the board's own live stream (below): {now, stream, streams, ffmpeg}
+    GET    /api/stream                    the board's own live stream (below): {now, stream, stream_failed, streams, ffmpeg}
     POST   /api/stream                    {url} -> 201 open it, replacing the one open
     DELETE /api/stream                    close it
     GET    /api/stream/media?id=<id>      a stream itself as fragmented MP4, for the dashboard
@@ -172,7 +172,8 @@ Fields worth knowing. A request has `id`, `title`, `status` (running, done or fa
 `tasks_done` and `tasks_total` (X/Y; cancelled tasks are not counted), `current` (the latest running
 task), `stale`, `url`, `attention` (its own flag: `{"message", "since"}` or null), `waiting` (true
 while it is running and it or one of its running tasks has a flag) and `tasks_waiting` (how many
-running tasks have one), `stream` (its live stream, below, or null) and `release` (the release it began
+running tasks have one), `stream` (its live stream, below, or null), `stream_failed` (the one the board
+closed because it could not connect, below, or null) and `release` (the release it began
 under, or the one the last `release_changed` named). A task has `id`, `title`, `status` (pending, running, done, failed or
 cancelled), `percent`, `message`, `eta_remaining`, `elapsed`, `stale`, `url` and `attention`. The
 list's `counts` has `running`, `stale`, `done`, `failed` and `waiting`.
@@ -208,7 +209,8 @@ then records the write at that time (clamped to the last 24 hours and never befo
 update) and marks its events as replayed. Without the header, `at` is ignored with a warning.
 
 Events. `GET /api/events` returns `{now, cursor, events[], truncated, waiting[], stale[],
-settings_version, stream, streams, clock, boot_id}` (`stream` is the board's own live stream, or null;
+settings_version, stream, stream_failed, streams, clock, boot_id}` (`stream` is the board's own live stream, or null,
+and `stream_failed` its failure (below);
 `streams` is every open one, the requests' too). Without `since`, `events` is empty and `cursor` is the newest event id (0 when
 there are none): keep it and pass it as `since` next time. With `since`, `events` holds up to `limit`
 events with a larger id, oldest first; `truncated` is true when more remain (then `cursor` is the
@@ -257,7 +259,7 @@ portrait screen, to its right on a landscape one): one per running request, on t
 and one of the board's own; the request list marks the requests that have one and lets each viewer
 pick which stream plays there. Do this only when your user asks. `taskctl stream k3m9qa
 'rtsp://camera.lan:8554/live'` (or `PUT /api/requests/<rid>/stream` with `{"url": "..."}`) opens your
-request's stream: 201, with `{now, request_id, stream, ffmpeg}`; a newer url replaces the request's
+request's stream: 201, with `{now, request_id, stream, stream_failed, ffmpeg}`; a newer url replaces the request's
 old one, and the url that is already open is kept (200 with `"existing": true`) and retried at once.
 `taskctl stream k3m9qa --close` (DELETE) closes it (idempotent) and `taskctl stream k3m9qa` (GET)
 shows it. It needs a running request (a closed one is a 409), and it ends by itself when the request
@@ -275,7 +277,12 @@ failed (the board retries after 1, 2, 4, 8 and then every 10 seconds); `video` a
 strings such as avc1.42C028 and mp4a.40.2, null until known or when there is no such track; `url`
 shows a `user:password@` as `***@`. The same object is a request's `stream`, and in /api/events. A
 restart of the board opens none of them again. `media` is the path of the stream itself, which only the
-dashboard needs.
+dashboard needs. A stream that cannot connect for 5 minutes (since it opened or was last live; sending its
+url again starts the count over) is closed by the board, and its request then has `stream_failed`
+`{id, url, opened_at, since, failed_at, error}` (the board's own: in GET /api/stream and /api/events), which
+the dashboard shows in red as "Stream failed" until a new stream opens there or DELETE dismisses it. The
+request itself goes on. When your user still wants the stream, check that the source is up and reachable
+from the board host, then open it again.
 
 Examples: create a request with its tasks, report on one of the returned task ids, flag a question
 and clear it, close the task, then the request, and read it back:

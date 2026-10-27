@@ -34,7 +34,10 @@
   pane cover the whole window, in either orientation, and back (or Escape). It is this page's alone, never stored, so a
   reload starts in the split, and it lasts only while the stream it plays goes on: one closed, replaced, another one
   picked, whose run ended, or live again as a new run (another since) comes back in the split. This page's own
-  reconnects keep it.
+  reconnects keep it. A stream the board closed because it could not connect for 5 minutes (--stream-give-up; the
+  request's stream_failed, and /api/events' for the board's own) is a red "Stream failed" where its pick was (its
+  request's row, the board's own bar above the list) and on its request's page, there with how long and why, until a
+  new stream opens there.
 
   Theme: the colours follow the system's light or dark setting unless this device chose one (Settings > This
   device > Appearance: System, Light or Dark, kept in this browser). A choice is the data-theme attribute on
@@ -252,6 +255,15 @@ body.offline .fill { background-position: 0 0 !important; }
 .req .pick { display: flex; width: fit-content; }
 .pick-bar { margin: 8px 0 0; }
 .pick-bar .pick { margin: 0; }
+/* A stream the board closed after it went --stream-give-up seconds (5 minutes) without a connection: red, where its pick was
+   (on its request's row, or the board's own above the list) and on its request's page, until a new stream opens there. */
+.stream-failed { display: flex; align-items: baseline; gap: 6px; width: fit-content; max-width: 100%; margin: 5px 0 0; padding: 2px 9px 2px 5px;
+    border: 1px solid color-mix(in srgb, var(--failed) 45%, var(--border)); border-radius: 999px; font: 600 12.5px/1.45 var(--sans);
+    color: var(--failed); background: color-mix(in srgb, var(--failed) 8%, var(--surface)); }
+.stream-failed::before { content: ""; flex: none; align-self: center; width: 8px; height: 8px; border-radius: 50%; background: var(--failed); }
+.stream-failed .why { min-width: 0; font-weight: 400; color: var(--muted); overflow-wrap: anywhere; }
+.pick-bar .stream-failed { margin: 0; }
+.card .stream-failed { margin-top: 10px; padding-left: 7px; border-radius: 6px; font-size: 13.5px; }
 .row.target { box-shadow: 0 0 0 2px var(--running); animation: flash 1.8s ease-out 1; }
 @keyframes flash { from { background: color-mix(in srgb, var(--running) 22%, var(--surface)); } to { background: var(--surface); } }
 
@@ -506,7 +518,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
 
     <section id="view-list" hidden>
         <p id="summary" class="summary dots"><span data-status="waiting" data-ref="waiting" hidden></span><span data-status="running" data-ref="running"></span><span data-status="stale" data-ref="stale"></span><span data-status="done" data-ref="done"></span><span data-status="failed" data-ref="failed"></span></p>
-        <div id="board-pick" class="pick-bar" hidden><label class="pick" id="board-pick-label"><input type="checkbox" id="board-pick-box"><span class="pick-dot"></span><span class="pick-text" id="board-pick-text"></span></label></div>
+        <div id="board-pick" class="pick-bar" hidden><label class="pick" id="board-pick-label"><input type="checkbox" id="board-pick-box"><span class="pick-dot"></span><span class="pick-text" id="board-pick-text"></span></label><span class="stream-failed" id="board-failed" hidden>Board stream failed</span></div>
         <div id="list-empty" class="empty" hidden>
             <p class="big">No requests yet.</p>
             <p>Agents create requests and report progress over HTTP. Try it:</p>
@@ -536,6 +548,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             <div class="line1"><span class="badge" data-ref="badge"></span><h1 data-ref="title"></h1><span class="pct" data-ref="pct"></span></div>
             <div class="bar" data-ref="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Request progress"><div class="fill" data-ref="fill"></div></div>
             <div class="meta"><span data-ref="asks" class="ask-n"></span><span data-ref="tasks"></span><span data-ref="failed" class="bad"></span><span data-ref="cancelled"></span><span data-ref="time"></span><span data-ref="eta"></span><span data-ref="started"></span><span data-ref="updated"></span><span data-ref="origin"></span></div>
+            <div class="stream-failed" data-ref="streamFailed" hidden>Stream failed<span class="why" data-ref="streamFailedWhy"></span></div>
             <div class="ask" data-ref="ask" hidden><div class="ask-head dots"><span class="ask-label">Question</span><span data-ref="askWho"></span><span data-ref="askWhen"></span><span data-ref="askMore"></span></div><div class="ask-q" data-ref="askQ"></div></div>
             <div class="message" data-ref="message" hidden></div>
             <div class="foot">
@@ -675,6 +688,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         <div class="hint" data-ref="hint"><span class="ht" data-ref="ht"></span><span class="hm" data-ref="hm"></span></div>
         <div class="meta"><span data-ref="tasks"></span><span data-ref="failed" class="bad"></span><span data-ref="time"></span><span data-ref="eta"></span><span data-ref="updated"></span><span data-ref="report"></span><span data-ref="origin"></span><span data-ref="rid"></span></div>
         <span class="pick" data-ref="pick" hidden><input type="checkbox" data-ref="pickBox"><span class="pick-dot"></span><span class="pick-text" data-ref="pickText"></span></span>
+        <span class="stream-failed" data-ref="streamFailed" hidden>Stream failed</span>
     </a>
 </template>
 <template id="tpl-task">
@@ -839,6 +853,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
 
     // Live stream state
     let streamList = [];        // every open stream (checked), the first opened first: /api/events "streams"
+    let boardFailed = null;     // the board's own stream_failed (/api/events), or null
     let stream = null;          // the one this page plays (viewedStream), or null: none
     let splitLayout = false;    // html and body carry .streaming: the board is an inner scroller beside the pane
     let streamFull = null;      // full screen: the live run it began on (liveRun); null: the split. This page's alone, never stored
@@ -1531,6 +1546,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
                                             : fmtStamp(r.created_at) + ' → ' + fmtStamp(r.completed_at));
         setAttr(refs.updated, 'title', fmtStamp(running ? r.updated_at : r.completed_at ?? r.updated_at));
         setRowPick(row, viewedStream());
+        setStreamFailed(refs.streamFailed, r.stream ? null : r.stream_failed);
     }
 
     // The question a waiting request row shows: its own (request-level), else its first waiting task's
@@ -1707,6 +1723,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         setAsk(h, headAsk);
         setText(h.message, r.message || '');
         setHidden(h.message, !r.message);
+        setStreamFailed(h.streamFailed, r.stream ? null : r.stream_failed, h.streamFailedWhy);
         setText(h.rid, r.id);
         setHidden(h.report, !r.report);
         if (r.report) {
@@ -2924,6 +2941,7 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
             }
         }
         if (!Array.isArray(events.streams)) for (const s of streamList) s.owner = null;
+        boardFailed = events.stream_failed && typeof events.stream_failed === 'object' ? events.stream_failed : null;
         showPicked();
     }
 
@@ -2959,7 +2977,9 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         const shown = viewedStream();
         for (const row of rows.values()) setRowPick(row, shown);
         const own = streamOf(null), on = !!own && shown === own;
-        setHidden($('board-pick'), !own);
+        setHidden($('board-pick'), !own && !boardFailed);
+        setHidden($('board-pick-label'), !own);
+        setStreamFailed($('board-failed'), own ? null : boardFailed);
         if (!own) return;
         $('board-pick-box').checked = on;
         setPickLabel($('board-pick-label'), $('board-pick-text'), own, on, 'Board stream', "the board's own stream");
@@ -2981,6 +3001,20 @@ html.stream-full #stream[data-state] { position: fixed; inset: 0; z-index: 2; wi
         setAttr(box, 'aria-label', (on ? 'Playing ' : 'Play ') + what + ' beside the list');
         setAttr(label, 'title', (on ? 'Playing beside the list; uncheck to hide it' : 'Play it beside the list') + ' (' + s.url
                                 + (s.state === 'connecting' && s.error ? ': ' + s.error : '') + ')');
+    }
+
+    // A stream the board closed after it went too long without a connection (a stream_failed object, or null: none): the
+    // red note, until a new stream opens there. Its tooltip says when and why; why (the request's page) says it in the note.
+    function setStreamFailed(el, f, why) {
+        const failed = !!f && typeof f === 'object';
+        setHidden(el, !failed);
+        if (!failed) return;
+        const num = (v) => typeof v === 'number' && isFinite(v);
+        const text = 'no connection' + (num(f.failed_at) && num(f.since) ? ' for ' + fmtDur(f.failed_at - f.since) : '')
+                     + (typeof f.error === 'string' && f.error ? ': ' + f.error : '');
+        if (why) setText(why, text);
+        setAttr(el, 'title', 'The board closed the stream ' + (typeof f.url === 'string' ? f.url + ' ' : '')
+                             + (num(f.failed_at) ? 'at ' + fmtStamp(f.failed_at) + ', ' : '') + text + '. This goes when a new stream opens.');
     }
 
     // A click on a row's stream checkbox, or on its label. The row is a link, so the click is never left to the browser

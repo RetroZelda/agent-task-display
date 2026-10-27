@@ -24,6 +24,7 @@ Slow scenarios (a watchdog that needs 15 s of silence, say) run side by side in 
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -894,18 +895,19 @@ def phase_api():
     call, docs = srv.call, docs_version()
     try:
         s, h, b = call('GET', '/api/stream')
-        check('GET /api/stream, nothing open: {now, stream: null, streams: [], ffmpeg: the path of ffmpeg}', s == 200
-              and list(b) == ['now', 'stream', 'streams', 'ffmpeg'] and b['stream'] is None and b['streams'] == []
+        check('GET /api/stream, nothing open: {now, stream: null, stream_failed: null, streams: [], ffmpeg: the path of ffmpeg}', s == 200
+              and list(b) == ['now', 'stream', 'stream_failed', 'streams', 'ffmpeg'] and b['stream'] is None and b['stream_failed'] is None
+              and b['streams'] == []
               and b['ffmpeg'] == str(srv.bin / 'ffmpeg') and abs(b['now'] - time.time()) < 5, b)
         check('...JSON, with both X-Tasks headers', h.get('content-type', '').startswith('application/json') and has_headers(h, docs), h)
         s, h, b = call('GET', '/api/events')
-        check('/api/events carries stream: null and streams: [], then the clock and the boot id', s == 200
-              and list(b)[-4:] == ['stream', 'streams', 'clock', 'boot_id']
-              and b['stream'] is None and b['streams'] == []
-              and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'streams', 'clock',
-                              'boot_id'], list(b))
+        check('/api/events carries stream: null, stream_failed: null and streams: [], then the clock and the boot id', s == 200
+              and list(b)[-5:] == ['stream', 'stream_failed', 'streams', 'clock', 'boot_id']
+              and b['stream'] is None and b['stream_failed'] is None and b['streams'] == []
+              and list(b) == ['now', 'cursor', 'events', 'truncated', 'waiting', 'stale', 'settings_version', 'stream', 'stream_failed',
+                              'streams', 'clock', 'boot_id'], list(b))
         s, h, b = call('GET', '/api/events?since=0')
-        check('...with a cursor too', s == 200 and list(b)[-4:] == ['stream', 'streams', 'clock', 'boot_id'], list(b))
+        check('...with a cursor too', s == 200 and list(b)[-5:] == ['stream', 'stream_failed', 'streams', 'clock', 'boot_id'], list(b))
 
         t0, t = time.time(), time.monotonic()
         s, h, b = srv.post(f'{FAKE}/hang')
@@ -913,7 +915,7 @@ def phase_api():
         st = b.get('stream') or {}
         check('POST /api/stream: 201 at once, whatever the source does', s == 201 and took < 0.5, (s, took))
         check('...the reply is {now, stream, streams, ffmpeg, existing: false}; the stream has the thirteen keys in order',
-              list(b) == ['now', 'stream', 'streams', 'ffmpeg', 'existing'] and b['streams'] == [st]
+              list(b) == ['now', 'stream', 'stream_failed', 'streams', 'ffmpeg', 'existing'] and b['streams'] == [st]
               and b['existing'] is False and list(st) == STREAM_KEYS, (list(b), list(st)))
         check('...12 hex digits of id, no request (the board\'s own), the URL, connecting, the timer base, nothing known yet, no viewers, the media path',
               bool(ID_RE.fullmatch(st.get('id', ''))) and st['request_id'] is None and st['url'] == f'{FAKE}/hang' and st['state'] == 'connecting'
@@ -925,7 +927,7 @@ def phase_api():
         s, h, b = call('GET', '/api/stream')
         check('GET /api/stream shows the same object', s == 200 and b['stream'] == st, b)
         s, h, b = call('GET', '/api/events')
-        check('/api/events carries it, and as the one stream of streams', s == 200 and list(b)[-4] == 'stream' and b['stream'] == st
+        check('/api/events carries it, and as the one stream of streams', s == 200 and list(b)[-5] == 'stream' and b['stream'] == st
               and b['streams'] == [st], b.get('stream'))
         check('...and a hand-written spelling of the same URL is the same stream',
               srv.post('HTTP://fake.invalid/hang')[2]['stream']['id'] == st['id'])
@@ -935,7 +937,7 @@ def phase_api():
         time.sleep(0.3)
         check('the same URL again: 200, existing true, the same stream, nothing restarted', s == 200 and b['existing'] is True
               and b['stream']['id'] == st['id']
-              and list(b) == ['now', 'stream', 'streams', 'ffmpeg', 'existing'] and len(srv.spawns()) == 1 and srv.kids() == [srv.spawns()[0]['pid']],
+              and list(b) == ['now', 'stream', 'stream_failed', 'streams', 'ffmpeg', 'existing'] and len(srv.spawns()) == 1 and srv.kids() == [srv.spawns()[0]['pid']],
               (s, b.get('existing'), srv.spawns()))
         s, h, b = srv.post(f'{FAKE}/hang?other=1')
         new = b.get('stream') or {}
@@ -949,7 +951,7 @@ def phase_api():
 
         s, h, b = call('DELETE', '/api/stream')
         check('DELETE: 200 {now, stream: null, streams: [], ffmpeg, closed: true}', s == 200
-              and list(b) == ['now', 'stream', 'streams', 'ffmpeg', 'closed'] and b['streams'] == []
+              and list(b) == ['now', 'stream', 'stream_failed', 'streams', 'ffmpeg', 'closed'] and b['streams'] == []
               and b['stream'] is None and b['closed'] is True and has_headers(h, docs), b)
         s, h, b = call('DELETE', '/api/stream')
         check('DELETE again: 200, closed false (idempotent)', s == 200 and b['closed'] is False and b['stream'] is None, b)
@@ -1677,6 +1679,119 @@ def sc_nofmpeg():
     no_traceback(srv, 'broken ffmpeg')
 
 
+FAILED_KEYS = ['id', 'url', 'opened_at', 'since', 'failed_at', 'error']
+
+
+def sc_giveup():
+    ck = tagged('give up')
+    srv = Board('giveup', '--stream-give-up', '4').start()
+    call = srv.call
+    J = {'Content-Type': 'application/json'}
+    put = lambda rid, url: call('PUT', f'/api/requests/{rid}/stream', {'url': url})  # noqa: E731
+    req = lambda rid: call('GET', f'/api/requests/{rid}')[2]  # noqa: E731
+    try:
+        rid = new_on(srv, 'watch a camera that is off')
+        ck('a request without a stream: stream_failed null', req(rid)['stream_failed'] is None, req(rid))
+        t = time.monotonic()
+        s, h, b = put(rid, 'http://user:s3cr3t@fake.invalid/refuse?g=1')
+        st = b['stream']
+        ck('a source that refuses: opened (201), connecting, nothing failed yet', s == 201 and st['state'] == 'connecting'
+           and b['stream_failed'] is None, b)
+        time.sleep(2.5)
+        ck('...still open, and retried, before the 4 s are up', (req(rid)['stream'] or {}).get('id') == st['id'] and len(srv.spawns()) >= 2,
+           (req(rid)['stream'], len(srv.spawns())))
+        closed = wait_until(lambda: req(rid)['stream'] is None, 6, 0.1)
+        took = time.monotonic() - t
+        ck(f'4 s without a connection (--stream-give-up 4): the board closes it ({took:.1f}s)', closed and 3.8 <= took <= 7, took)
+        r = req(rid)
+        f = r['stream_failed'] or {}
+        ck('the request keeps stream_failed {id, url, opened_at, since, failed_at, error}: the stream, the URL without its password, why',
+           list(f) == FAILED_KEYS and f['id'] == st['id'] and f['url'] == 'http://***@fake.invalid/refuse?g=1'
+           and f['opened_at'] == st['opened_at'] and f['since'] == st['since'] and 'Connection refused' in (f['error'] or '')
+           and 's3cr3t' not in json.dumps(r) and 4 <= f['failed_at'] - f['opened_at'] <= 7, f)
+        ck('...the request itself goes on running', r['status'] == 'running', r['status'])
+        lst = call('GET', '/api/requests')[2]['requests']
+        s, h, b = call('GET', f'/api/requests/{rid}/stream')
+        ck('...the list has it too, and GET .../stream answers stream null with the same stream_failed',
+           [x['stream_failed'] for x in lst if x['id'] == rid] == [f] and b['stream'] is None and b['stream_failed'] == f, (lst, b))
+        ev = call('GET', '/api/events')[2]
+        ck('...it is gone from /api/events streams; the board\'s own stream_failed stays null', ev['streams'] == [] and ev['stream_failed'] is None,
+           ev['streams'])
+        ck('...its media: a 404 now, no stream being open', call('GET', f'/api/stream/media?id={st["id"]}')[0] == 404)
+        n = len(srv.spawns())
+        time.sleep(2)
+        ck('...no ffmpeg left, none started again', srv.kids() == [] and len(srv.spawns()) == n, (srv.kids(), n, len(srv.spawns())))
+        ck('...and the log says why', re.search(f'stream {st["id"]} of request {rid} closed: no connection for 4s \\(.*Connection refused',
+                                                srv.log_text()) is not None, srv.log_text()[-600:])
+
+        s, h, b = put(rid, f'{FAKE}/live?g=2')
+        ck('a new stream for the request: stream_failed goes at once (the reply and the request)', s == 201 and b['stream_failed'] is None
+           and req(rid)['stream_failed'] is None, b)
+        live = wait_until(lambda: (req(rid)['stream'] or {}).get('state') == 'live', 8)
+        time.sleep(5)
+        ck('a live stream is never given up: still open 5 s on', live and (req(rid)['stream'] or {}).get('state') == 'live', req(rid)['stream'])
+
+        t = time.monotonic()
+        st = put(rid, f'{FAKE}/refuse?g=3')[2]['stream']
+        time.sleep(2.5)
+        s, h, b = put(rid, f'{FAKE}/refuse?g=3')
+        ck('the same URL posted again while connecting: kept (200, existing)', s == 200 and b['existing'] is True and b['stream']['id'] == st['id'], b)
+        time.sleep(5.2 - (time.monotonic() - t))
+        ck('...and given another 4 s: still open 5 s after it opened', (req(rid)['stream'] or {}).get('id') == st['id'], req(rid)['stream'])
+        closed = wait_until(lambda: req(rid)['stream'] is None, 6, 0.1)
+        ck(f'...closed 4 s after the retry ({time.monotonic() - t:.1f}s after it opened)', closed and req(rid)['stream_failed']['id'] == st['id'],
+           req(rid))
+
+        s, h, b = call('POST', f'/api/requests/{rid}/complete', {'status': 'done'}, headers=J)
+        ck('completing the request keeps its stream_failed', s == 200 and (b['stream_failed'] or {}).get('id') == st['id'], b.get('stream_failed'))
+        call('POST', f'/api/requests/{rid}/tasks', {'title': 'again'}, headers=J)
+        s, h, b = call('DELETE', f'/api/requests/{rid}/stream')
+        ck('DELETE .../stream dismisses it: closed false (none open), stream_failed null', s == 200 and b['closed'] is False
+           and b['stream_failed'] is None and req(rid)['stream_failed'] is None, b)
+
+        s, h, b = srv.post(f'{FAKE}/refuse?own=1')
+        own = b['stream']
+        gone = wait_until(lambda: srv.stream() is None, 9, 0.1)
+        s, h, b = call('GET', '/api/stream')
+        ev = call('GET', '/api/events')[2]
+        ck("the board's own gives up too: GET /api/stream and /api/events carry its stream_failed", gone and b['stream'] is None
+           and (b['stream_failed'] or {}).get('id') == own['id'] and ev['stream_failed'] == b['stream_failed'], (b, ev.get('stream_failed')))
+        s, h, b = srv.post(f'{FAKE}/hang?own=2')
+        ck("...a new one of its own clears it", s == 201 and b['stream_failed'] is None and call('GET', '/api/events')[2]['stream_failed'] is None, b)
+        srv.call('DELETE', '/api/stream')
+        srv.post(f'{FAKE}/refuse?own=3')
+        wait_until(lambda: srv.stream() is None, 9, 0.1)
+        s, h, b = call('DELETE', '/api/stream')
+        ck('...and DELETE /api/stream dismisses one', s == 200 and b['closed'] is False and b['stream_failed'] is None
+           and call('GET', '/api/stream')[2]['stream_failed'] is None, b)
+
+        other = new_on(srv, 'deleted with its failure')
+        put(other, f'{FAKE}/refuse?d=1')
+        wait_until(lambda: req(other)['stream'] is None, 9, 0.1)
+        ck('(a second request with a failed stream)', req(other)['stream_failed'] is not None)
+        ck('deleting it: 200, nothing left over', call('DELETE', f'/api/requests/{other}')[0] == 200
+           and call('GET', f'/api/requests/{other}')[0] == 404)
+    finally:
+        srv.stop()
+    no_traceback(srv, 'give up')
+
+
+def sc_giveup_never():
+    ck = tagged('never give up')
+    srv = Board('nogiveup', '--stream-give-up', '0').start()
+    try:
+        rid = new_on(srv, 'a camera worth waiting for')
+        st = srv.call('PUT', f'/api/requests/{rid}/stream', {'url': f'{FAKE}/refuse?n=1'})[2]['stream']
+        time.sleep(7)
+        r = srv.call('GET', f'/api/requests/{rid}')[2]
+        ck('--stream-give-up 0: a source that refuses is retried for good', (r['stream'] or {}).get('id') == st['id']
+           and r['stream_failed'] is None and len(srv.spawns()) >= 3, (r['stream'], len(srv.spawns())))
+        srv.call('DELETE', f'/api/requests/{rid}/stream')
+    finally:
+        srv.stop()
+    no_traceback(srv, 'never give up')
+
+
 def sc_media503():
     ck = tagged('not connected yet')
     srv = Board('m503').start()
@@ -1986,14 +2101,15 @@ def phase_requests():
     try:
         rid = new('watch the printer')
         s, h, b = call('GET', f'/api/requests/{rid}/stream')
-        check('GET, none open: {now, request_id, stream: null, ffmpeg}', s == 200 and list(b) == ['now', 'request_id', 'stream', 'ffmpeg']
+        check('GET, none open: {now, request_id, stream: null, stream_failed: null, ffmpeg}', s == 200
+              and list(b) == ['now', 'request_id', 'stream', 'stream_failed', 'ffmpeg'] and b['stream_failed'] is None
               and b['request_id'] == rid and b['stream'] is None and b['ffmpeg'] == str(srv.bin / 'ffmpeg') and has_headers(h, docs), b)
         check('the request carries stream: null', call('GET', f'/api/requests/{rid}')[2]['stream'] is None)
         t = time.monotonic()
         s, h, b = put(rid, f'{FAKE}/live?marker=R')
         st = b.get('stream') or {}
         check('PUT: 201 at once {now, request_id, stream, ffmpeg, existing: false}; the stream names its request', s == 201
-              and time.monotonic() - t < 0.5 and list(b) == ['now', 'request_id', 'stream', 'ffmpeg', 'existing'] and b['existing'] is False
+              and time.monotonic() - t < 0.5 and list(b) == ['now', 'request_id', 'stream', 'stream_failed', 'ffmpeg', 'existing'] and b['existing'] is False
               and list(st) == STREAM_KEYS and st['request_id'] == rid and st['url'] == f'{FAKE}/live?marker=R' and st['state'] == 'connecting', b)
         live = wait_until(lambda: (call('GET', f'/api/requests/{rid}/stream')[2]['stream'] or {}).get('state') == 'live', 8)
         check('...it goes live with its own ffmpeg', live and len(srv.kids()) == 1, srv.kids())
@@ -2048,7 +2164,7 @@ def phase_requests():
         S.section("a request's stream ends with the request")
         s, h, b = call('DELETE', f'/api/requests/{rid}/stream')
         check('DELETE: 200 {now, request_id, stream: null, ffmpeg, closed: true}; its ffmpeg goes, the board\'s own stays', s == 200
-              and list(b) == ['now', 'request_id', 'stream', 'ffmpeg', 'closed'] and b['closed'] is True and b['stream'] is None
+              and list(b) == ['now', 'request_id', 'stream', 'stream_failed', 'ffmpeg', 'closed'] and b['closed'] is True and b['stream'] is None
               and wait_until(lambda: len(srv.kids()) == 1, 5) and srv.stream()['id'] == own['id'], (b, srv.kids()))
         check('DELETE again: closed false (idempotent)', call('DELETE', f'/api/requests/{rid}/stream')[2]['closed'] is False)
         put(rid, f'{FAKE}/hang?a=1')
@@ -2774,6 +2890,24 @@ def rc_renditions():
 # ---------------------------------------------------------------- units: the classes behind the route
 
 def phase_units_channel():
+    S.section('giving up: the default, and a channel with no one to close it')
+    check('--stream-give-up defaults to STREAM_GIVE_UP, 300 s', server.parse_args([]).stream_give_up == server.STREAM_GIVE_UP == 300,
+          server.STREAM_GIVE_UP)
+    try:
+        with open(os.devnull, 'w') as quiet, contextlib.redirect_stderr(quiet):
+            server.parse_args(['--stream-give-up', '-1'])
+        refused = False
+    except SystemExit:
+        refused = True
+    check('...takes 0 (never) and refuses a negative number', server.parse_args(['--stream-give-up', '0']).stream_give_up == 0 and refused)
+    lone = server.StreamChannel('cccccccccccc', 'http://h/c', 1.0, give_up=5)
+    check('a channel without on_give_up never gives up (give_up_in None)', lone.give_up == 0 and lone.give_up_in() is None)
+    timed = server.StreamChannel('dddddddddddd', 'http://h/d', 1.0, give_up=5, on_give_up=lambda chan: True)
+    left = timed.give_up_in()
+    check('...one with it counts down from its opening while it is not live', left is not None and 4.5 < left <= 5, left)
+    timed.state = 'live'
+    check('...and not while it is live', timed.give_up_in() is None)
+
     S.section('StreamViewer: a bounded queue the supervisor never waits for')
     v = server.StreamViewer()
     check('empty: next() times out with b"" (not None, which means closed)', v.next(0) == b'' and v.next(0.05) == b'')
@@ -2917,9 +3051,11 @@ if __name__ == '__main__':
     phase_units_channel()
     phase_api()
     phase_media()
-    run_group('the supervisor: backoff and its reset, stalls, stubborn processes, garbage, the probe ladder, audio, no ffmpeg', sc_backoff, sc_die,
+    run_group('the supervisor: backoff and its reset, stalls, stubborn processes, garbage, the probe ladder, audio, no ffmpeg, giving up',
+              sc_backoff, sc_die,
               sc_healthy, sc_stall,
-              sc_stubborn, sc_garbage, sc_probe, sc_silent, sc_dropaudio, sc_firstkey, sc_nofmpeg, sc_media503, sc_schemes)
+              sc_stubborn, sc_garbage, sc_probe, sc_silent, sc_dropaudio, sc_firstkey, sc_nofmpeg, sc_media503, sc_schemes,
+              sc_giveup, sc_giveup_never)
     run_group('the lighter qualities: one transcoder per quality, idle stop, the run ending, failures, slowness', sc_rend_basic, sc_rend_run,
               sc_rend_fail, sc_rend_slow, limit=150)
     phase_requests()
